@@ -431,6 +431,30 @@ def _tools_schema(
                 },
             },
         })
+        schema.append({
+            "type": "function",
+            "function": {
+                "name": "debate",
+                "description": "Start a structured multi-round debate/discussion between two AI perspectives. "
+                    "USE THIS when the user says: 'diskutiere mit subworker', 'halte eine Diskussion', 'debattiere', "
+                    "'lass zwei Modelle diskutieren', 'hole zwei Meinungen ein', or similar. "
+                    "Both sides are argued by subagent(s). Transcript saved to Markdown file. "
+                    "Between rounds, arguments are summarized so small models keep context.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "topic": {"type": "string", "description": "The debate topic or question"},
+                        "perspective_a": {"type": "string", "description": "Position/viewpoint of side A (e.g. 'Pro Kernenergie')"},
+                        "perspective_b": {"type": "string", "description": "Position/viewpoint of side B (e.g. 'Contra Kernenergie')"},
+                        "model": {"type": "string", "description": "Subagent model for side A (and B if model_b not set)"},
+                        "model_b": {"type": "string", "description": "Optional: different subagent model for side B. Defaults to model."},
+                        "rounds": {"type": "integer", "description": "Number of back-and-forth rounds (1-10, default 3)"},
+                        "language": {"type": "string", "description": "Response language (default: Deutsch)"},
+                    },
+                    "required": ["topic", "perspective_a", "perspective_b", "model"],
+                },
+            },
+        })
     return schema
 
 

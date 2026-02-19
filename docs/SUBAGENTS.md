@@ -47,6 +47,18 @@ The message to the subagent must be self-contained — the subagent has no conve
 
 Keep messages concise — subagents run small models with limited context.
 
+## Debate tool
+
+The `debate` tool uses subagents to run structured multi-round debates between two AI perspectives. Both sides are argued by subagent(s) — the main agent only kicks it off.
+
+Key features:
+- Automatic **summarization between rounds** (small models keep context)
+- Full transcript saved to a **Markdown file** in the workspace
+- **Cancellation** support (`/stop`, `/abort`)
+- **Max 10 rounds** hard limit (prevents endless loops)
+
+See `docs/DEBATE.md` for full documentation and examples.
+
 ## Error reporting
 
 Subagents can report problems and suggest plan changes in their response. If a subagent includes a `## Suggested plan changes` section, the main agent reviews it and decides whether to update the plan. See `docs/PLANNING.md` for details.

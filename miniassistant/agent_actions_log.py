@@ -100,6 +100,36 @@ def log_image_received(config: dict[str, Any], num_images: int, mime_types: list
     _write(path, "".join(lines))
 
 
+def log_debate_start(config: dict[str, Any], topic: str, perspective_a: str, perspective_b: str, model_a: str, model_b: str, rounds: int) -> None:
+    """Loggt den Start einer Debatte."""
+    path = _log_path(config)
+    if not path:
+        return
+    _write(path, (
+        f"\n---\n[{_ts()}] DEBATE_START  topic={topic[:200]}\n"
+        f"  A: {perspective_a[:100]} (model={model_a})\n"
+        f"  B: {perspective_b[:100]} (model={model_b})\n"
+        f"  rounds={rounds}\n"
+    ))
+
+
+def log_debate_round(config: dict[str, Any], round_num: int, side: str, model: str, argument: str) -> None:
+    """Loggt eine einzelne Debattenrunde (Seite A oder B)."""
+    path = _log_path(config)
+    if not path:
+        return
+    arg = argument if len(argument) <= 1500 else argument[:1500] + "…"
+    _write(path, f"[{_ts()}] DEBATE_ROUND {round_num} side={side} model={model}\n  {arg}\n")
+
+
+def log_debate_end(config: dict[str, Any], topic: str, rounds_completed: int, file_path: str) -> None:
+    """Loggt das Ende einer Debatte."""
+    path = _log_path(config)
+    if not path:
+        return
+    _write(path, f"[{_ts()}] DEBATE_END  topic={topic[:200]}  rounds={rounds_completed}  file={file_path}\n")
+
+
 def log_subagent_start(config: dict[str, Any], model: str, message: str) -> None:
     """Loggt den Start eines Subagent-Aufrufs."""
     path = _log_path(config)

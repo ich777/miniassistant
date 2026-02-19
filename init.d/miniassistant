@@ -27,7 +27,17 @@ RUN_AS=""
 
 # PATH setzen damit start-stop-daemon den Daemon findet
 PATH=/sbin:/usr/sbin:/bin:/usr/bin
-export MINIASSISTANT_CONFIG_DIR="${CONFIG_DIR:-}"
+
+# HOME explizit setzen (start-stop-daemon erbt kein HOME;
+# ohne HOME expandiert Python ~ zu / statt /root)
+if [ -n "$RUN_AS" ]; then
+    export HOME=$(getent passwd "$RUN_AS" | cut -d: -f6)
+else
+    export HOME="${HOME:-/root}"
+fi
+
+# Config-Verzeichnis nur exportieren wenn explizit gesetzt
+[ -n "${CONFIG_DIR:-}" ] && export MINIASSISTANT_CONFIG_DIR="$CONFIG_DIR"
 
 # Pruefungen
 [ -d "$INSTALL_DIR" ] || { echo "$DESC: INSTALL_DIR nicht gefunden: $INSTALL_DIR" >&2; exit 1; }

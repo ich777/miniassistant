@@ -1233,7 +1233,7 @@ async def onboarding_page(request: Request):
     <div class="chat-footer"><a href="/{token_q}">Startseite</a></div>
     </div>
     <script>
-    const token = new URLSearchParams(window.location.search).get("token") || "";
+    const token = new URLSearchParams(window.location.search).get("token") || (document.cookie.match(/(?:^|;\\s*)ma_token=([^;]*)/) || [])[1] || "";
     const log = document.getElementById("log");
     const saveBox = document.getElementById("saveBox");
     const btnSave = document.getElementById("btnSave");
@@ -1335,6 +1335,10 @@ async def onboarding_page(request: Request):
         sessionId = data.session_id || sessionId;
         hideThinking();
         addAssistantWithThinking(data.response || data.error || "—", data.thinking || null, content);
+        if (data.saved) {{
+          // Fallback-Save via Bot-Nachricht erfolgreich — nach kurzer Pause zum Chat
+          setTimeout(function() {{ window.location.href = "/chat" + (token ? "?token=" + encodeURIComponent(token) : "") + (token ? "&" : "?") + "onboarding_saved=1"; }}, 2000);
+        }}
         if (data.suggested_files) {{ pendingFiles = data.suggested_files; saveBox.style.display = "block"; }}
         if (data._debug) {{
           const d = document.createElement("details");
@@ -1349,19 +1353,19 @@ async def onboarding_page(request: Request):
       }}
     }});
     btnSave.addEventListener("click", async () => {{
-      if (!pendingFiles || !token) return;
+      if (!pendingFiles) return;
       btnSave.disabled = true;
       saveStatus.textContent = "Speichere…";
       try {{
         const r = await fetch("/api/onboarding/save" + (token ? "?token=" + encodeURIComponent(token) : ""), {{
-          method: "POST", headers: {{ "Content-Type": "application/json" }}, body: JSON.stringify(pendingFiles)
+          method: "POST", headers: {{ "Content-Type": "application/json" }}, credentials: "same-origin", body: JSON.stringify(pendingFiles)
         }});
         const data = await r.json();
         if (data.ok) {{
           saveStatus.textContent = "Gespeichert.";
           pendingFiles = null;
           saveBox.style.display = "none";
-          window.location.href = "/chat?token=" + encodeURIComponent(token) + "&onboarding_saved=1";
+          window.location.href = "/chat" + (token ? "?token=" + encodeURIComponent(token) : "") + (token ? "&" : "?") + "onboarding_saved=1";
           return;
         }} else {{ saveStatus.textContent = data.error || "Fehler"; }}
       }} catch (err) {{ saveStatus.textContent = err.message; }}
@@ -1396,6 +1400,35 @@ async def onboarding_page(request: Request):
     return HTMLResponse(html)
 
 
+def _is_save_request(message: str) -> bool:
+    """Erkennt ob der User im Onboarding-Chat um manuelles Speichern bittet."""
+    msg = message.lower().strip()
+    _SAVE_KEYWORDS = [
+        "speicher", "speichere", "bitte speichern", "config speichern", "dateien speichern",
+        "save", "please save", "save config", "save the config", "save files",
+        "button funktioniert nicht", "button geht nicht", "knopf funktioniert nicht",
+        "knopf geht nicht", "speichern geht nicht", "speichern funktioniert nicht",
+        "save button", "kann nicht speichern", "can't save", "cannot save",
+    ]
+    return any(kw in msg for kw in _SAVE_KEYWORDS)
+
+
+def _save_onboarding_files(files: dict[str, str], config: dict[str, Any]) -> dict[str, Any]:
+    """Speichert die vier Agent-Dateien und setzt onboarding_complete. Returns {'ok': True} oder {'error': ...}."""
+    agent_dir = Path(config.get("agent_dir") or "")
+    if not agent_dir:
+        return {"error": "agent_dir not configured"}
+    agent_dir = Path(agent_dir).expanduser().resolve()
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("SOUL.md", "IDENTITY.md", "TOOLS.md", "USER.md"):
+        content = files.get(name)
+        if content is not None:
+            (agent_dir / name).write_text(content if isinstance(content, str) else str(content), encoding="utf-8")
+    config["onboarding_complete"] = True
+    save_config(config)
+    return {"ok": True}
+
+
 @app.post("/api/onboarding")
 async def api_onboarding(request: Request):
     """Onboarding-Chat: eine Runde mit Onboarding-System-Prompt, keine Tools. Gibt ggf. suggested_files zurück."""
@@ -1413,6 +1446,25 @@ async def api_onboarding(request: Request):
         session_id = str(uuid.uuid4())
         messages = []
         _onboarding_sessions[session_id] = {"messages": messages}
+
+    # Fallback-Save: User bittet um manuelles Speichern weil Button nicht geht
+    if _is_save_request(message):
+        pending = _onboarding_sessions[session_id].get("suggested_files")
+        if pending:
+            result = _save_onboarding_files(pending, config)
+            if result.get("ok"):
+                _onboarding_sessions[session_id].pop("suggested_files", None)
+                return JSONResponse({
+                    "response": "✅ Dateien wurden gespeichert! Du kannst jetzt zum [Chat](/chat) wechseln.",
+                    "session_id": session_id,
+                    "saved": True,
+                })
+            else:
+                return JSONResponse({
+                    "response": f"❌ Fehler beim Speichern: {result.get('error', 'Unbekannter Fehler')}",
+                    "session_id": session_id,
+                })
+
     try:
         response_text, new_messages, suggested_files, debug_info, thinking, content = await asyncio.to_thread(
             run_onboarding_round, config, messages, message
@@ -1421,6 +1473,9 @@ async def api_onboarding(request: Request):
         _log.exception("Onboarding-Fehler: %s", exc)
         return JSONResponse({"error": str(exc), "session_id": session_id}, status_code=500)
     _onboarding_sessions[session_id]["messages"] = new_messages
+    # suggested_files in Session merken für Fallback-Save
+    if suggested_files:
+        _onboarding_sessions[session_id]["suggested_files"] = suggested_files
     # Antwort nur als Content (ohne [Thinking]-Präfix); Denkvorgang getrennt
     out = {"response": content if content else response_text, "session_id": session_id}
     if thinking:
@@ -1772,15 +1827,7 @@ async def api_onboarding_save(request: Request):
     _require_token(request)
     body = await request.json()
     config = load_config()
-    agent_dir = Path(config.get("agent_dir") or "")
-    if not agent_dir:
-        raise HTTPException(status_code=400, detail="agent_dir not configured")
-    agent_dir = Path(agent_dir).expanduser().resolve()
-    agent_dir.mkdir(parents=True, exist_ok=True)
-    for name in ("SOUL.md", "IDENTITY.md", "TOOLS.md", "USER.md"):
-        content = body.get(name)
-        if content is not None:
-            (agent_dir / name).write_text(content if isinstance(content, str) else str(content), encoding="utf-8")
-    config["onboarding_complete"] = True
-    save_config(config)
+    result = _save_onboarding_files(body, config)
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result["error"])
     return JSONResponse({"ok": True})

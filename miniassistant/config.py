@@ -20,10 +20,18 @@ CONFIG_FILENAME = "config.yaml"
 
 
 def get_config_dir() -> str:
-    """Config-Verzeichnis (zur Laufzeit aus MINIASSISTANT_CONFIG_DIR oder Default)."""
-    return os.environ.get("MINIASSISTANT_CONFIG_DIR") or os.path.join(
-        os.path.expanduser("~"), ".config", "miniassistant"
-    )
+    """Config-Verzeichnis (zur Laufzeit aus MINIASSISTANT_CONFIG_DIR oder Default).
+    Absicherung: wenn HOME='/' (typisch für root via sysvinit/start-stop-daemon),
+    wird /root als Fallback verwendet."""
+    env_dir = (os.environ.get("MINIASSISTANT_CONFIG_DIR") or "").strip()
+    if env_dir:
+        return env_dir
+    home = os.path.expanduser("~")
+    # Auf manchen Systemen (Devuan sysvinit) ist root's HOME in /etc/passwd '/'
+    # statt '/root'. Fallback damit Config nicht unter /.config/ landet.
+    if not home or home == "/":
+        home = os.environ.get("HOME", "").strip() or "/root"
+    return os.path.join(home, ".config", "miniassistant")
 
 
 def _default_agent_dir() -> str:
@@ -173,15 +181,27 @@ def _default_config() -> dict[str, Any]:
 
 
 def _normalize_matrix(matrix: Any) -> dict[str, Any] | None:
-    """Matrix-Config: enabled, homeserver, bot_name, user_id, token, device_id (optional), encrypted_rooms (bool)."""
+    """Matrix-Config: enabled, homeserver, bot_name, user_id, token, device_id (optional), encrypted_rooms (bool).
+    Akzeptiert auch häufige Alias-Feldnamen (access_token → token, homeserver_url → homeserver, enable_e2ee → encrypted_rooms)."""
     if not matrix or not isinstance(matrix, dict):
         return None
     m = matrix
-    homeserver = (m.get("homeserver") or "").strip()
-    token = (m.get("token") or "").strip()
+    # Alias-Migration: häufige falsche Feldnamen akzeptieren
+    homeserver = (m.get("homeserver") or m.get("homeserver_url") or "").strip()
+    token = (m.get("token") or m.get("access_token") or "").strip()
     if not homeserver or not token:
         return None
     user_id = (m.get("user_id") or "").strip() or None
+    # encrypted_rooms: auch enable_e2ee / e2ee / encryption akzeptieren
+    encrypted_rooms = m.get("encrypted_rooms")
+    if encrypted_rooms is None:
+        encrypted_rooms = m.get("enable_e2ee")
+    if encrypted_rooms is None:
+        encrypted_rooms = m.get("e2ee")
+    if encrypted_rooms is None:
+        encrypted_rooms = m.get("encryption")
+    if encrypted_rooms is None:
+        encrypted_rooms = True
     return {
         "enabled": bool(m.get("enabled", True)),
         "homeserver": homeserver,
@@ -189,7 +209,7 @@ def _normalize_matrix(matrix: Any) -> dict[str, Any] | None:
         "user_id": user_id,
         "token": token,
         "device_id": (m.get("device_id") or "").strip() or None,
-        "encrypted_rooms": bool(m.get("encrypted_rooms", True)),
+        "encrypted_rooms": bool(encrypted_rooms),
     }
 
 

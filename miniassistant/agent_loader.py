@@ -264,7 +264,7 @@ def _planning_section(config: dict[str, Any], project_dir: str | None) -> str:
         f"read the plan file from `{ws}/`, summarize the status, and continue with the next open step.",
     ]
     if planning_md:
-        lines.append(f"For format details and examples: `exec: cat \"{planning_md}\"`")
+        lines.append(f"For format details and examples: `cat \"{planning_md}\"`")
     lines.append("")
     return "\n".join(lines)
 
@@ -289,12 +289,17 @@ def _docs_reference_section(project_dir: str | None) -> str:
     return (
         "## Docs reference (read only when needed)\n"
         f"Documentation directory: `{d}/`\n"
-        f"Each topic is a separate file. **Read only the file you need** (`exec: cat \"{d}/FILE\"`), never all of them.\n"
+        f"Each topic is a separate file. **Read only the file you need** (`cat \"{d}/FILE\"`), never all of them.\n"
         "When a topic is relevant, **read the file yourself and follow the instructions** — do not tell the user to read it.\n\n"
+        "**MANDATORY read-first rules:**\n"
+        "- **Matrix/Discord setup:** When the user asks to set up Matrix or Discord, this means configuring **YOUR OWN** `chat_clients` section in the config so that YOU (the bot) can be reached via that platform. "
+        "It does **NOT** mean installing a Matrix server, Synapse, Element, or any other software. "
+        f"**ALWAYS** read `{d}/MATRIX.md` or `{d}/DISCORD.md` FIRST (before any action), then use `save_config` with the correct field names from the doc.\n"
+        f"- **Any config change:** Read `{d}/CONFIG_REFERENCE.md` before calling `save_config`.\n\n"
         "| File | Topic |\n"
         "|------|-------|\n"
-        "| `MATRIX.md` | Matrix bot setup (homeserver, token, device_id, E2EE) |\n"
-        "| `DISCORD.md` | Discord bot setup (bot_token, intents, invite) |\n"
+        "| `MATRIX.md` | **Read first before any Matrix action.** Configuring YOUR bot connection (chat_clients.matrix: homeserver, token, device_id, encrypted_rooms) |\n"
+        "| `DISCORD.md` | **Read first before any Discord action.** Configuring YOUR bot connection (chat_clients.discord: bot_token) |\n"
         "| `CONFIG_REFERENCE.md` | **Read before any save_config call.** Complete config structure, save_config rules, YAML examples |\n"
         "| `PROVIDERS.md` | Multiple Ollama instances, Ollama Online, Anthropic, fallbacks |\n"
         "| `CONTEXT_SIZE.md` | num_ctx, per-model context, model_options |\n"
@@ -304,6 +309,7 @@ def _docs_reference_section(project_dir: str | None) -> str:
         "| `SUBAGENTS.md` | Worker models, invoke_model |\n"
         "| `VISION.md` | Image analysis, vision models |\n"
         "| `IMAGE_GENERATION.md` | Image generation, upload to Matrix/Discord |\n"
+        "| `DEBATE.md` | Structured multi-round AI debate, context management, parameters |\n"
         "| `AVATARS.md` | Bot profile picture on Matrix/Discord |\n\n"
     )
 
@@ -366,10 +372,10 @@ def _tools_section(config: dict[str, Any]) -> str:
     if sched_cfg in (None, False) or sched_cfg is True or (isinstance(sched_cfg, dict) and sched_cfg.get("enabled", True)):
         lines.append("- **Always use `schedule` instead of cron/crontab.** prompt = work instruction (not a pre-written answer).")
     lines.append(
-        "- `save_config`: **only for system config.** Pass only keys to change (deep-merged). Tell user to restart.\n"
+        "- `save_config`: **only for system config.** Pass only keys to change (deep-merged). After saving, tell the user to restart **miniassistant** (YOUR service, not matrix-synapse or any other program).\n"
         "  Each provider has a `type` field (ollama, openai, etc.). Per-model options → `providers.<name>.model_options.\"model:tag\"` (NOT under models!). Quote `:` in YAML keys. think=bool, default=string.\n"
         "  Valid options: temperature, top_p, top_k, num_ctx, num_predict, seed, min_p, stop, repeat_penalty, repetition_penalty, repeat_last_n, think.\n"
-        "  Read `docs/CONFIG_REFERENCE.md` (exec: cat) for examples before any save_config call. **NEVER use save_config for user preferences** — prefs/*.md via exec."
+        "  Read `docs/CONFIG_REFERENCE.md` (`cat` the file) for examples before any save_config call. **NEVER use save_config for user preferences** — prefs/*.md via exec."
     )
     lines.append("- `check_url`: only when user explicitly asks to verify/check links.")
     # Subagents: global config (subagents: [list]) oder per-provider subagents: true
@@ -399,11 +405,23 @@ def _tools_section(config: dict[str, Any]) -> str:
             "  **On timeout or error: retry the same subagent once with the same message. Then report to user.**\n"
             "  Do NOT do the work yourself after a subagent failure — ask the user how to proceed.\n"
             "  If result is incomplete: re-invoke with a continuation instruction, or ask the user.\n"
+            "  **Sanity-check results:** If a subagent found concrete data (links, prices, products) but then concludes 'doesn't exist' or 'not available' — that is contradictory. Present the actual findings, not the wrong conclusion. Subagents may have outdated training data.\n"
             "  Present the subagent's result directly — never redo it yourself."
         )
         if sub_display:
             lines.append(f"  **Available subagents (use ONLY these exact names):** {', '.join(sub_display)}.\n"
                          f"  Do NOT invent, abbreviate, or modify model names. Use EXACTLY one of the names listed above.")
+        lines.append(
+            "- `debate`: Start a **structured multi-round debate/discussion** between two AI perspectives.\n"
+            "  **IMPORTANT: Use this tool when the user says things like:** 'diskutiere mit einem Subworker', 'halte eine Diskussion', "
+            "'debattiere über', 'lass zwei Modelle diskutieren', 'hole zwei Meinungen ein', 'Diskussion mit Subagent'.\n"
+            "  Do NOT just do a web_search and answer yourself — use the `debate` tool to let subagents argue both sides.\n"
+            "  Both sides are argued by subagent(s) — the full transcript is saved to a Markdown file in the workspace.\n"
+            "  Between rounds, previous arguments are automatically summarized so small models keep context.\n"
+            "  Parameters: `topic`, `perspective_a`, `perspective_b`, `model` (required), `model_b` (optional), `rounds` (1-10, default 3), `language`.\n"
+            "  You choose the perspectives — e.g. for weather: 'Wetter wird besser' vs. 'Wetter bleibt schlecht'.\n"
+            "  Read `docs/DEBATE.md` for details."
+        )
     cc = config.get("chat_clients") or {}
     clients = []
     for k in ("matrix", "discord"):
@@ -461,9 +479,9 @@ def _vision_section(config: dict[str, Any]) -> str:
     docs = _docs_dir_path(None)
     avatars_md = str(docs / "AVATARS.md") if docs else "docs/AVATARS.md"
     lines.append(
-        f"- **When asked to set/change avatar:** First `exec: ls -la \"{avatar_file}\"`. "
-        f"Then `exec: cat \"{avatars_md}\"` for the steps. "
-        f"Get credentials with `exec: grep -A20 'matrix:' \"{cfg_path}\"` (or `discord:`, or any other chat client section). "
+        f"- **When asked to set/change avatar:** First `ls -la \"{avatar_file}\"`. "
+        f"Then `cat \"{avatars_md}\"` for the steps. "
+        f"Get credentials with `grep -A20 'matrix:' \"{cfg_path}\"` (or `discord:`, or any other chat client section). "
         "Use the real values in curl — never placeholders. Execute step by step."
     )
     lines.append("")

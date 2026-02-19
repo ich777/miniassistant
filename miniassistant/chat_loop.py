@@ -986,6 +986,17 @@ def _run_tool(
             return "schedule requires 'command' and/or 'prompt'"
         ok, msg = add_scheduled_job(when, command=cmd, prompt=prompt, client=client, once=bool(once), model=sched_model)
         return f"Scheduled: {msg}" if ok else f"Schedule failed: {msg}"
+    if name == "debate":
+        topic = arguments.get("topic", "").strip()
+        perspective_a = arguments.get("perspective_a", "").strip()
+        perspective_b = arguments.get("perspective_b", "").strip()
+        sub_model = arguments.get("model", "").strip()
+        if not topic or not perspective_a or not perspective_b or not sub_model:
+            return "debate requires 'topic', 'perspective_a', 'perspective_b', and 'model'"
+        model_b = arguments.get("model_b", "").strip() or sub_model
+        rounds = max(1, min(10, int(arguments.get("rounds", 3) or 3)))
+        language = arguments.get("language", "").strip() or "Deutsch"
+        return _run_debate(config, topic, perspective_a, perspective_b, sub_model, model_b, rounds, language)
     if name == "invoke_model":
         # Subagents: global config oder per-provider subagents: true
         subagent_list = config.get("subagents") or []
@@ -1011,6 +1022,14 @@ def _run_tool(
             "You are a subagent of MiniAssistant. Answer the task precisely and concisely. "
             "If you cannot answer, say so clearly. Stay on topic."
         )
+        # Datum + Knowledge-Cutoff-Warnung an Subagent weitergeben
+        # (ohne das halluziniert der Subagent veraltete Infos, z.B. "Produkt X existiert noch nicht")
+        from datetime import datetime as _dt_sub
+        _today_sub = _dt_sub.now().strftime("%B %d, %Y")
+        sub_system += f"\n\nToday is **{_today_sub}**. Your training data has a cutoff — anything after that may be outdated."
+        _kv_rule = _get_sub_rule("knowledge_verification.md")
+        if _kv_rule:
+            sub_system += f"\n{_kv_rule}"
         # Runtime-Info an Subagent weitergeben (root/sudo)
         from miniassistant.agent_loader import _is_root
         if _is_root():
@@ -1068,6 +1087,299 @@ def _run_tool(
             _aal.log_subagent_result(config, resolved, err, "")
             return err
     return f"Unknown tool: {name}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Debate: Structured multi-round discussion between two AI perspectives
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _append_to_file(path, text: str) -> None:
+    """Hängt Text an eine Datei an (UTF-8)."""
+    from pathlib import Path as _P
+    _P(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(text)
+
+
+def _send_debate_status(config: dict[str, Any], message: str) -> None:
+    """Sendet ein Status-Update an den aktuellen Chat (Matrix/Discord), falls verfügbar."""
+    chat_ctx = config.get("_chat_context") or {}
+    platform = chat_ctx.get("platform")
+    room_id = chat_ctx.get("room_id")
+    channel_id = chat_ctx.get("channel_id")
+    try:
+        if platform == "matrix" and room_id:
+            from miniassistant.matrix_bot import send_message_to_room
+            send_message_to_room(room_id, message)
+        elif platform == "discord" and channel_id:
+            from miniassistant.discord_bot import send_message_to_channel
+            send_message_to_channel(channel_id, message)
+    except Exception:
+        pass
+
+
+def _debate_call(
+    config: dict[str, Any],
+    model_name: str,
+    system: str,
+    message: str,
+) -> str:
+    """Einzelner Debattenzug: ruft ein Subagent-Modell MIT Tools (web_search, exec, check_url) auf.
+
+    Nutzt die gleiche Dispatch-Logik wie invoke_model, damit Debattierer
+    bei aktuellen Themen (Wetter, News, …) eine Web-Suche machen können.
+    """
+    from datetime import datetime as _dt_sub
+    from miniassistant.agent_loader import _is_root
+
+    # Datum an System-Prompt anhängen (damit Modell Web-Ergebnisse zeitlich einordnen kann)
+    _today = _dt_sub.now().strftime("%B %d, %Y")
+    enriched_system = system + f"\n\nToday is **{_today}**. Use `web_search` if you need current facts."
+    if _is_root():
+        enriched_system += "\nRunning as **root** — no sudo needed."
+    _ws = (config.get("workspace") or "").strip()
+    if _ws:
+        enriched_system += f"\nWorking directory: `{_ws}`."
+
+    provider_type = get_provider_type(config, model_name)
+    _, api_model = get_provider_config(config, model_name)
+    api_model = api_model or model_name
+
+    try:
+        if provider_type == "claude-code":
+            return _run_subagent_claude_code(config, api_model, enriched_system, message, model_name)
+        elif provider_type == "anthropic":
+            base_url = get_base_url_for_model(config, model_name)
+            api_key = get_api_key_for_model(config, model_name)
+            think = get_think_for_model(config, model_name)
+            return _run_subagent_anthropic(config, api_model, enriched_system, message, api_key, base_url, think, model_name)
+        elif provider_type == "google":
+            return _run_subagent_google(config, api_model, enriched_system, message, model_name)
+        elif provider_type in ("openai", "deepseek"):
+            return _run_subagent_openai(config, api_model, enriched_system, message, model_name)
+        else:
+            # Ollama (default)
+            base_url = get_base_url_for_model(config, model_name)
+            api_key = get_api_key_for_model(config, model_name)
+            think = get_think_for_model(config, model_name)
+            options = get_options_for_model(config, model_name)
+            from miniassistant.ollama_client import get_subagent_tools_schema
+            sub_tools = get_subagent_tools_schema(config)
+            if not model_supports_tools(base_url, api_model):
+                _log.info("Debate model %s: no tool support, calling without tools", model_name)
+                sub_tools = []
+            return _run_subagent_with_tools(
+                config, base_url, api_model, enriched_system, message,
+                sub_tools, think, options, api_key, model_name,
+            )
+    except Exception as e:
+        _log.warning("Debate call failed (%s): %s", model_name, e)
+        return f"(Fehler: {e})"
+
+
+def _debate_summarize(
+    config: dict[str, Any],
+    model_name: str,
+    text: str,
+    language: str = "Deutsch",
+) -> str:
+    """Fasst einen Debattenverlauf kurz zusammen (für Kontextweitergabe an kleine Modelle)."""
+    system = (
+        f"Du bist ein neutraler Zusammenfasser. Fasse den Debattenverlauf kurz und präzise zusammen. "
+        f"Max 150 Wörter. Nur die Zusammenfassung, keine Einleitung. Sprache: {language}"
+    )
+    try:
+        r = _dispatch_chat(
+            config, model_name,
+            [{"role": "user", "content": text}],
+            system=system,
+            timeout=60.0,
+        )
+        return ((r.get("message") or {}).get("content") or "").strip() or "(Keine Zusammenfassung)"
+    except Exception as e:
+        _log.warning("Debate summary failed: %s", e)
+        return f"(Zusammenfassung fehlgeschlagen: {e})"
+
+
+def _run_debate(
+    config: dict[str, Any],
+    topic: str,
+    perspective_a: str,
+    perspective_b: str,
+    model_a_name: str,
+    model_b_name: str,
+    rounds: int,
+    language: str,
+) -> str:
+    """Führt eine strukturierte Debatte zwischen zwei KI-Perspektiven durch.
+
+    Ablauf pro Runde:
+      1. Seite A argumentiert (bekommt Zusammenfassung + letztes B-Argument)
+      2. Seite B antwortet (bekommt Zusammenfassung + A-Argument)
+      3. Runde wird zusammengefasst → Kontext für nächste Runde
+    Alles wird in eine Markdown-Datei geschrieben. Am Ende: Fazit.
+    """
+    import re as _re
+    from pathlib import Path as _Path
+
+    workspace = (config.get("workspace") or "").strip()
+    if not workspace:
+        return "debate requires a configured workspace directory"
+
+    # Modelle auflösen
+    resolved_a = resolve_model(config, model_a_name) or model_a_name
+    resolved_b = resolve_model(config, model_b_name) or model_b_name
+
+    # Debattendatei anlegen
+    slug = _re.sub(r'[^a-z0-9]+', '-', topic.lower().strip())[:40].strip('-') or "debate"
+    ts = int(time.time())
+    debate_file = _Path(workspace) / f"debate-{slug}-{ts}.md"
+
+    header = (
+        f"# Debatte: {topic}\n\n"
+        f"- **Seite A:** {perspective_a} (Modell: `{resolved_a}`)\n"
+        f"- **Seite B:** {perspective_b} (Modell: `{resolved_b}`)\n"
+        f"- **Runden:** {rounds}\n"
+        f"- **Sprache:** {language}\n\n---\n\n"
+    )
+    debate_file.write_text(header, encoding="utf-8")
+
+    _aal.log_debate_start(config, topic, perspective_a, perspective_b, resolved_a, resolved_b, rounds)
+
+    # System-Prompts für die Debattierer
+    system_a = (
+        f"Du bist Debattierer A in einer strukturierten Debatte.\n"
+        f"Deine Position: **{perspective_a}**\n"
+        f"Thema: {topic}\n\n"
+        f"Regeln:\n"
+        f"- Argumentiere überzeugend für deine Position mit Fakten und Logik\n"
+        f"- Wenn Gegenargumente gegeben werden, gehe direkt darauf ein\n"
+        f"- Bringe in jeder Runde mindestens ein neues Argument\n"
+        f"- Bleibe beim Thema, keine Abschweifungen\n"
+        f"- Maximal 300 Wörter pro Argument\n"
+        f"- Sprache: {language}\n"
+        f"- Gib NUR dein Argument aus, keine Meta-Kommentare wie 'Als Debattierer A...'"
+    )
+    system_b = (
+        f"Du bist Debattierer B in einer strukturierten Debatte.\n"
+        f"Deine Position: **{perspective_b}**\n"
+        f"Thema: {topic}\n\n"
+        f"Regeln:\n"
+        f"- Argumentiere überzeugend für deine Position mit Fakten und Logik\n"
+        f"- Wenn Gegenargumente gegeben werden, gehe direkt darauf ein\n"
+        f"- Bringe in jeder Runde mindestens ein neues Argument\n"
+        f"- Bleibe beim Thema, keine Abschweifungen\n"
+        f"- Maximal 300 Wörter pro Argument\n"
+        f"- Sprache: {language}\n"
+        f"- Gib NUR dein Argument aus, keine Meta-Kommentare wie 'Als Debattierer B...'"
+    )
+
+    summary_so_far = ""
+    last_b_argument = ""
+    rounds_completed = 0
+
+    for round_num in range(1, rounds + 1):
+        # Cancellation prüfen
+        cancel_user = (config.get("_chat_context") or {}).get("user_id")
+        if cancel_user:
+            from miniassistant.cancellation import check_cancel
+            if check_cancel(cancel_user):
+                _append_to_file(debate_file, f"\n---\n\n*Debatte abgebrochen in Runde {round_num}.*\n")
+                _aal.log_debate_end(config, topic, rounds_completed, str(debate_file))
+                return f"Debatte abgebrochen in Runde {round_num}. Datei: `{debate_file}`"
+
+        # Status-Update senden
+        _send_debate_status(config, f"🗣️ Debatte Runde {round_num}/{rounds} …")
+
+        # --- Seite A argumentiert ---
+        if round_num == 1:
+            msg_a = (
+                f"Eröffne die Debatte zum Thema: {topic}\n"
+                f"Deine Position: {perspective_a}\n"
+                f"Bringe dein stärkstes Eröffnungsargument."
+            )
+        else:
+            msg_a = (
+                f"Debatte Runde {round_num}/{rounds}.\n"
+                f"Bisheriger Verlauf (Zusammenfassung):\n{summary_so_far}\n\n"
+                f"Letzte Antwort von Seite B ({perspective_b}):\n{last_b_argument}\n\n"
+                f"Antworte auf die Argumente von Seite B und bringe neue Punkte für deine Position."
+            )
+
+        response_a = _debate_call(config, resolved_a, system_a, msg_a)
+        _append_to_file(debate_file, f"## Runde {round_num} — Seite A: {perspective_a}\n\n{response_a}\n\n")
+        _aal.log_debate_round(config, round_num, "A", resolved_a, response_a)
+
+        # Cancellation zwischen A und B prüfen
+        if cancel_user:
+            from miniassistant.cancellation import check_cancel
+            if check_cancel(cancel_user):
+                _append_to_file(debate_file, f"\n---\n\n*Debatte abgebrochen nach Seite A, Runde {round_num}.*\n")
+                _aal.log_debate_end(config, topic, rounds_completed, str(debate_file))
+                return f"Debatte abgebrochen in Runde {round_num}. Datei: `{debate_file}`"
+
+        # --- Seite B antwortet ---
+        msg_b = f"Debatte Runde {round_num}/{rounds}.\n"
+        if summary_so_far:
+            msg_b += f"Bisheriger Verlauf (Zusammenfassung):\n{summary_so_far}\n\n"
+        msg_b += (
+            f"Aktuelles Argument von Seite A ({perspective_a}):\n{response_a}\n\n"
+            f"Antworte auf die Argumente von Seite A und bringe Punkte für deine Position."
+        )
+
+        response_b = _debate_call(config, resolved_b, system_b, msg_b)
+        _append_to_file(debate_file, f"## Runde {round_num} — Seite B: {perspective_b}\n\n{response_b}\n\n---\n\n")
+        _aal.log_debate_round(config, round_num, "B", resolved_b, response_b)
+
+        last_b_argument = response_b
+        rounds_completed = round_num
+
+        # --- Runde zusammenfassen (immer — wird auch fürs Fazit benötigt) ---
+        round_text = (
+            f"Runde {round_num}:\n"
+            f"Seite A ({perspective_a}): {response_a[:600]}\n"
+            f"Seite B ({perspective_b}): {response_b[:600]}"
+        )
+        round_summary = _debate_summarize(config, resolved_a, round_text, language)
+        summary_so_far = (summary_so_far + f"\n{round_summary}").strip() if summary_so_far else round_summary
+
+    # --- Fazit generieren ---
+    _send_debate_status(config, "📝 Debatte abgeschlossen — erstelle Fazit …")
+    # Fazit bekommt Zusammenfassung UND die letzten Original-Argumente
+    conclusion_prompt = (
+        f"Fasse diese Debatte zusammen und bewerte die Argumente beider Seiten neutral.\n"
+        f"Was waren die stärksten Argumente? Wo gab es Übereinstimmungen, wo Differenzen?\n"
+        f"Sprache: {language}\n\n"
+        f"Thema: {topic}\n"
+        f"Seite A ({perspective_a}) vs. Seite B ({perspective_b})\n\n"
+        f"Debattenverlauf:\n{summary_so_far}\n\n"
+        f"Letzte Argumente (Runde {rounds_completed}):\n"
+        f"Seite A: {response_a[:800]}\n"
+        f"Seite B: {last_b_argument[:800]}"
+    )
+    conclusion_system = (
+        f"Du bist ein neutraler Moderator. Fasse die Debatte fair zusammen. "
+        f"Bewerte die Qualität der Argumente beider Seiten. Sprache: {language}"
+    )
+    try:
+        r = _dispatch_chat(
+            config, resolved_a,
+            [{"role": "user", "content": conclusion_prompt}],
+            system=conclusion_system,
+            timeout=90.0,
+        )
+        conclusion = ((r.get("message") or {}).get("content") or "").strip() or "(Kein Fazit generiert)"
+    except Exception as e:
+        conclusion = f"(Fazit-Generierung fehlgeschlagen: {e})"
+
+    _append_to_file(debate_file, f"## Fazit\n\n{conclusion}\n")
+    _aal.log_debate_end(config, topic, rounds_completed, str(debate_file))
+
+    return (
+        f"Debatte abgeschlossen ({rounds_completed} Runden).\n"
+        f"Transkript: `{debate_file}`\n\n"
+        f"## Zusammenfassung\n{conclusion}"
+    )
 
 
 def _run_subagent_claude_code(
@@ -2358,7 +2670,7 @@ def _onboarding_system_prompt(detected_system: dict[str, str]) -> str:
 **Fixed questions (ask in this order, do not invent):**
 1. **IDENTITY:** What should the assistant be called? **Which language should the assistant use for its replies?** (e.g. Deutsch, English) (optional: emoji e.g. 🤖; optional: vibe in one sentence)
 2. **SOUL:** Use default limits? (Run harmless commands without asking; answer briefly and factually; never expose tokens/passwords/private data) – or add/change something?
-3. **USER:** What should I call you? (Name, nickname), pronouns (Du/Sie or you/they), timezone, optional preferences?
+3. **USER:** What should I call you? (Name, nickname), pronouns (Du/Sie or you/they), timezone, optional preferences? Also ask: Would you like to tell me something about yourself? (hobbies, interests, job – anything that helps the assistant understand you better). **Important: USER.md has a 500 character limit.** Keep it concise.
 4. **AVATAR (optional):** Do you have a profile picture/avatar for the bot? (PNG file path or URL, e.g. `~/avatar.png` or `https://example.org/bot.png`). Best format: PNG, square (256x256 or 512x512). If provided as URL, validate with `check_url` first, then download to `agent_dir/avatar.png`. If a file path, copy to `agent_dir/avatar.png`. Save path in config via `save_config({{avatar: "<path>"}})`. If skipped, the default logo is used.
 
 Optional: Any special paths or hints for the environment (TOOLS)? Otherwise the detected system above is enough.
