@@ -116,6 +116,25 @@ def send_image_to_room(room_id: str, image_path: str, caption: str = "") -> bool
         return False
 
 
+def set_typing(room_id: str, typing: bool = True) -> bool:
+    """Thread-safe: Setzt den Typing-Indikator in einem Matrix-Raum.
+    Wird z.B. vom Debate-Tool aufgerufen, um zwischen Runden den Typing-Status zu halten."""
+    if not _bot_client or not _bot_loop:
+        return False
+
+    async def _do_typing() -> bool:
+        room_typing = getattr(_bot_client, "room_typing", None)
+        if callable(room_typing):
+            await room_typing(room_id, typing)
+        return True
+
+    try:
+        future = asyncio.run_coroutine_threadsafe(_do_typing(), _bot_loop)
+        return future.result(timeout=10)
+    except Exception:
+        return False
+
+
 def send_image_to_user(target_user_id: str, image_path: str, caption: str = "") -> bool:
     """Thread-safe: Sendet ein Bild an einen User (sucht passenden Raum)."""
     if not _bot_client or not _bot_loop or not _bot_send_image_fn:

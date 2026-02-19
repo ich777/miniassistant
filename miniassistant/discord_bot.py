@@ -57,6 +57,25 @@ def send_message_to_channel(channel_id: str, message: str) -> bool:
         return False
 
 
+def set_channel_typing(channel_id: str) -> bool:
+    """Thread-safe: Triggert den Typing-Indikator in einem Discord-Channel.
+    Wird z.B. vom Debate-Tool aufgerufen, um zwischen Runden den Typing-Status zu halten."""
+    if not _discord_client or not _discord_loop:
+        return False
+
+    async def _do_typing() -> bool:
+        ch = _discord_client.get_channel(int(channel_id))
+        if ch:
+            await ch.trigger_typing()
+        return True
+
+    try:
+        future = asyncio.run_coroutine_threadsafe(_do_typing(), _discord_loop)
+        return future.result(timeout=10)
+    except Exception:
+        return False
+
+
 def _get_chat_response(
     config: dict[str, Any],
     discord_user_id: str,

@@ -1118,6 +1118,24 @@ def _send_debate_status(config: dict[str, Any], message: str) -> None:
         pass
 
 
+def _set_debate_typing(config: dict[str, Any]) -> None:
+    """Setzt den Typing-Indikator für Matrix/Discord während der Debatte.
+    Wird vor jedem Subagent-Call aufgerufen, damit der User sieht dass gearbeitet wird."""
+    chat_ctx = config.get("_chat_context") or {}
+    platform = chat_ctx.get("platform")
+    room_id = chat_ctx.get("room_id")
+    channel_id = chat_ctx.get("channel_id")
+    try:
+        if platform == "matrix" and room_id:
+            from miniassistant.matrix_bot import set_typing
+            set_typing(room_id, True)
+        elif platform == "discord" and channel_id:
+            from miniassistant.discord_bot import set_channel_typing
+            set_channel_typing(channel_id)
+    except Exception:
+        pass
+
+
 def _debate_call(
     config: dict[str, Any],
     model_name: str,
@@ -1306,6 +1324,7 @@ def _run_debate(
                 f"Antworte auf die Argumente von Seite B und bringe neue Punkte für deine Position."
             )
 
+        _set_debate_typing(config)
         response_a = _debate_call(config, resolved_a, system_a, msg_a)
         _append_to_file(debate_file, f"## Runde {round_num} — Seite A: {perspective_a}\n\n{response_a}\n\n")
         _aal.log_debate_round(config, round_num, "A", resolved_a, response_a)
@@ -1327,6 +1346,7 @@ def _run_debate(
             f"Antworte auf die Argumente von Seite A und bringe Punkte für deine Position."
         )
 
+        _set_debate_typing(config)
         response_b = _debate_call(config, resolved_b, system_b, msg_b)
         _append_to_file(debate_file, f"## Runde {round_num} — Seite B: {perspective_b}\n\n{response_b}\n\n---\n\n")
         _aal.log_debate_round(config, round_num, "B", resolved_b, response_b)
@@ -1345,6 +1365,7 @@ def _run_debate(
 
     # --- Fazit generieren ---
     _send_debate_status(config, "📝 Debatte abgeschlossen — erstelle Fazit …")
+    _set_debate_typing(config)
     # Fazit bekommt Zusammenfassung UND die letzten Original-Argumente
     conclusion_prompt = (
         f"Fasse diese Debatte zusammen und bewerte die Argumente beider Seiten neutral.\n"
