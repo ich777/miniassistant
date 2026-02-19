@@ -2669,17 +2669,56 @@ def handle_user_input(
 
 # --- Onboarding: guided first-time setup of agent files ---
 
+def _detect_timezone() -> tuple[str, str]:
+    """Detect system timezone. Returns (tz_name, current_time_str)."""
+    from datetime import datetime
+    now = datetime.now().astimezone()
+    tz_name = now.strftime("%Z") or now.strftime("%z") or "UTC"
+    # Try to get the IANA name (e.g. Europe/Vienna) from /etc/timezone or timedatectl
+    iana_tz = ""
+    try:
+        from pathlib import Path
+        etc_tz = Path("/etc/timezone")
+        if etc_tz.exists():
+            iana_tz = etc_tz.read_text().strip()
+    except Exception:
+        pass
+    if not iana_tz:
+        try:
+            from pathlib import Path
+            localtime = Path("/etc/localtime")
+            if localtime.is_symlink():
+                target = str(localtime.resolve())
+                # e.g. /usr/share/zoneinfo/Europe/Vienna
+                if "zoneinfo/" in target:
+                    iana_tz = target.split("zoneinfo/", 1)[1]
+        except Exception:
+            pass
+    display = iana_tz or tz_name
+    current_time = now.strftime("%H:%M:%S")
+    return display, current_time
+
+
 def _onboarding_system_prompt(detected_system: dict[str, str]) -> str:
     """Build onboarding system prompt with detected system and fixed questions."""
+    tz_display, current_time = _detect_timezone()
     sys_line = (
         f"System (detected – **do not ask**): "
         f"{detected_system.get('os', '')}, {detected_system.get('distro', '') or detected_system.get('os', '')}, "
         f"Package manager: {detected_system.get('package_manager', '')}, Init: {detected_system.get('init_system', '')}. "
         "Use this for TOOLS.md. Do NOT ask for the OS."
     )
+    tz_line = (
+        f"Detected timezone: **{tz_display}** (current time: {current_time}). "
+        "Use this as the default timezone for USER.md. "
+        "Confirm with the user — if they want a different timezone, write their preferred one into USER.md "
+        "and tell them to run: `sudo timedatectl set-timezone <IANA_TZ>` (e.g. `Europe/Vienna`). "
+        "If timedatectl is not available: `sudo ln -sf /usr/share/zoneinfo/<IANA_TZ> /etc/localtime`."
+    )
     return f"""You are the **onboarding assistant** for **MiniAssistant**. Your only job: fill the four agent files with the user's answers. Do not invent – ask the **fixed questions** (below) and put answers into the four blocks.
 
 {sys_line}
+{tz_line}
 
 **What the four files are (so you ask targeted questions):**
 
@@ -2691,7 +2730,7 @@ def _onboarding_system_prompt(detected_system: dict[str, str]) -> str:
 **Fixed questions (ask in this order, do not invent):**
 1. **IDENTITY:** What should the assistant be called? **Which language should the assistant use for its replies?** (e.g. Deutsch, English) (optional: emoji e.g. 🤖; optional: vibe in one sentence)
 2. **SOUL:** Use default limits? (Run harmless commands without asking; answer briefly and factually; never expose tokens/passwords/private data) – or add/change something?
-3. **USER:** What should I call you? (Name, nickname), pronouns (Du/Sie or you/they), timezone, optional preferences? Also ask: Would you like to tell me something about yourself? (hobbies, interests, job – anything that helps the assistant understand you better). **Important: USER.md has a 500 character limit.** Keep it concise.
+3. **USER:** What should I call you? (Name, nickname), pronouns (Du/Sie or you/they). Timezone: show the detected timezone and ask if it's correct (if not, note the correct one and tell the user how to change it on the system). Optional preferences? Also ask: Would you like to tell me something about yourself? (hobbies, interests, job – anything that helps the assistant understand you better). **Important: USER.md has a 500 character limit.** Keep it concise.
 4. **AVATAR (optional):** Do you have a profile picture/avatar for the bot? (PNG file path or URL, e.g. `~/avatar.png` or `https://example.org/bot.png`). Best format: PNG, square (256x256 or 512x512). If provided as URL, validate with `check_url` first, then download to `agent_dir/avatar.png`. If a file path, copy to `agent_dir/avatar.png`. Save path in config via `save_config({{avatar: "<path>"}})`. If skipped, the default logo is used.
 
 Optional: Any special paths or hints for the environment (TOOLS)? Otherwise the detected system above is enough.

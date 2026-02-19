@@ -347,10 +347,13 @@ def _language_section(config: dict[str, Any], identity_md_content: str = "") -> 
 def _knowledge_verification_section() -> str:
     """Instruct the AI to verify uncertain facts via web search."""
     from datetime import datetime
-    today = datetime.now().strftime("%B %d, %Y")
+    now = datetime.now().astimezone()
+    today = now.strftime("%B %d, %Y")
+    current_time = now.strftime("%H:%M:%S")
+    tz_name = now.strftime("%Z") or now.strftime("%z")
     rule = _get_rule("knowledge_verification.md")
     if rule:
-        return f"Today is **{today}**. Your training data has a cutoff date — anything after that may be outdated.\n{rule}\n\n"
+        return f"Today is **{today}**, current local time is **{current_time} {tz_name}**. Your training data has a cutoff date — anything after that may be outdated.\n{rule}\n\n"
     return ""
 
 
