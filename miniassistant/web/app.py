@@ -15,7 +15,7 @@ from pathlib import Path
 _log = logging.getLogger("uvicorn.error")
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse
 
 from fastapi.staticfiles import StaticFiles
 
@@ -33,6 +33,14 @@ _onboarding_sessions: dict[str, dict] = {}  # session_id -> { "messages": [...] 
 
 app = FastAPI(title="MiniAssistant", version="0.1.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def _favicon():
+    ico = STATIC_DIR / "favicon.ico"
+    if ico.exists():
+        return FileResponse(str(ico), media_type="image/x-icon")
+    return JSONResponse(status_code=404, content={"detail": "not found"})
 
 
 _matrix_bot_task: asyncio.Task | None = None
