@@ -1,0 +1,35 @@
+[Unit]
+Description=MiniAssistant – schlanker lokaler Assistent (Ollama)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Ersetze %INSTALL_DIR% beim Installieren (install.sh --systemd)
+ExecStart=%INSTALL_DIR%/venv/bin/python -m miniassistant.cli serve
+WorkingDirectory=%INSTALL_DIR%
+
+# Neustart bei Absturz
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=miniassistant
+
+# Optional: als eigener User laufen (auskommentieren und anpassen)
+# User=miniassistant
+# Group=miniassistant
+
+# Optional: Config-Verzeichnis (Standard: ~/.config/miniassistant des Service-Users)
+# Environment=MINIASSISTANT_CONFIG_DIR=/etc/miniassistant
+
+# Haertung (optional, auskommentieren falls Probleme)
+# ProtectSystem=full
+# PrivateTmp=true
+# NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

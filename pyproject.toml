@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "miniassistant"
+version = "0.1.0"
+description = "Schlanker lokaler Assistent für Ollama mit Agent-Dateien, /model, Token-Auth, Memory und sysvinit."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "MiniAssistant" }]
+keywords = ["ollama", "assistant", "llm", "local"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "httpx>=0.25",
+    "pyyaml>=6.0",
+    "click>=8.0",
+    "rich>=13.0",
+    "questionary>=2.0",
+    "uvicorn[standard]>=0.24",
+    "fastapi>=0.104",
+    "jinja2>=3.1",
+]
+
+[project.optional-dependencies]
+matrix = ["matrix-nio>=0.25", "mistune>=3.0"]
+matrix-e2e = ["matrix-nio[e2e]>=0.25", "mistune>=3.0"]
+discord = ["discord.py>=2.3"]
+scheduler = ["apscheduler>=3.10"]
+
+[project.scripts]
+miniassistant = "miniassistant.cli:main"
+
+[project.urls]
+Repository = "https://github.com/miniassistant/miniassistant"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["miniassistant*"]
+
+[tool.setuptools.package-dir]
+"" = "."

@@ -1,0 +1,535 @@
+"""
+Lädt Agent-Dateien (AGENTS, SOUL, IDENTITY, TOOLS, USER) und baut den System-Prompt
+inkl. Runtime-Info (root/sudo) und Tool-Beschreibungen (exec, web_search).
+AGENTS.md = schlanker Top-Level-Vertrag (Prioritäten, Grenzen); optional.
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any
+
+from miniassistant.config import load_config
+from miniassistant.memory import get_memory_for_prompt
+from miniassistant.basic_rules.loader import ensure_and_load as _load_basic_rules, get_rule as _get_rule
+
+
+def _is_root() -> bool:
+    """True wenn der Prozess als root (euid 0) läuft."""
+    try:
+        return os.geteuid() == 0
+    except AttributeError:
+        return False  # Windows o.ä.
+
+
+def _detect_system() -> dict[str, str]:
+    """
+    Erkennt OS, Distribution, Paketmanager und Init-System,
+    damit die LLM die richtigen Befehle nutzt (apt vs dnf, systemctl vs service, …).
+    """
+    import platform
+    import subprocess
+    out: dict[str, str] = {
+        "os": platform.system(),
+        "machine": platform.machine(),
+        "release": platform.release() or "",
+        "distro": "",
+        "package_manager": "",
+        "init_system": "",
+    }
+    # Init: systemd vs sysvinit
+    if Path("/run/systemd/system").exists():
+        out["init_system"] = "systemd"
+    else:
+        out["init_system"] = "sysvinit"
+    # Distro + Paketmanager (Linux)
+    if out["os"] == "Linux":
+        for etc in ("/etc/os-release", "/usr/lib/os-release"):
+            p = Path(etc)
+            if p.exists():
+                try:
+                    for line in p.read_text(encoding="utf-8").splitlines():
+                        if line.startswith("ID="):
+                            out["distro"] = line.split("=", 1)[1].strip().strip('"')
+                            break
+                        if line.startswith("ID_LIKE="):
+                            if not out["distro"]:
+                                out["distro"] = line.split("=", 1)[1].strip().strip('"').split()[0]
+                            break
+                except Exception:
+                    pass
+                break
+        # Paketmanager anhand Distro / vorhandener Befehle
+        if out["distro"] in ("debian", "ubuntu", "raspbian"):
+            out["package_manager"] = "apt"
+        elif out["distro"] in ("fedora", "rhel", "centos", "rocky", "alma"):
+            out["package_manager"] = "dnf"
+        elif out["distro"] in ("arch", "manjaro"):
+            out["package_manager"] = "pacman"
+        elif out["distro"] in ("alpine",):
+            out["package_manager"] = "apk"
+        elif out["distro"] in ("opensuse-leap", "opensuse-tumbleweed", "suse"):
+            out["package_manager"] = "zypper"
+        else:
+            for cmd in ("apt", "dnf", "yum", "pacman", "apk", "zypper"):
+                try:
+                    subprocess.run([cmd, "--version"], capture_output=True, timeout=2)
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    continue
+                out["package_manager"] = cmd
+                break
+    elif out["os"] == "Darwin":
+        out["distro"] = "macos"
+        out["package_manager"] = "brew"
+    return out
+
+
+def _trim(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text.strip()
+    # Kürzen auf max_chars, möglichst am Satzende
+    cut = text[: max_chars]
+    last_period = cut.rfind(".")
+    if last_period > max_chars // 2:
+        return cut[: last_period + 1].strip()
+    return cut.strip() + "…"
+
+
+def load_agent_files(agent_dir: str, max_chars_per_file: int = 500) -> dict[str, str]:
+    """Liest AGENTS.md, SOUL.md, IDENTITY.md, TOOLS.md, USER.md und kürzt auf max_chars."""
+    result: dict[str, str] = {}
+    base = Path(agent_dir)
+    for name in ("AGENTS.md", "SOUL.md", "IDENTITY.md", "TOOLS.md", "USER.md"):
+        path = base / name
+        if path.exists():
+            text = path.read_text(encoding="utf-8")
+            result[name] = _trim(text, max_chars_per_file)
+        elif name == "AGENTS.md":
+            result[name] = "(AGENTS.md not found – optional: priorities, limits, quality bar in a few lines.)"
+        else:
+            result[name] = f"(File {name} not found)"
+    return result
+
+
+def _system_section() -> str:
+    """Host system description (OS, distro, package manager, init) for the LLM."""
+    s = _detect_system()
+    lines = [
+        "## System (Host)",
+        f"You run on: **{s['os']}** (Kernel/Release: {s['release']}, Arch: {s['machine']}).",
+    ]
+    if s["distro"]:
+        lines.append(f"Distribution: **{s['distro']}**.")
+    if s["package_manager"]:
+        lines.append(
+            f"Package manager: **{s['package_manager']}**. "
+            f"Use e.g. {s['package_manager']} install/remove/update for packages."
+        )
+    if s["init_system"]:
+        if s["init_system"] == "systemd":
+            lines.append("Init: **systemd**. Use systemctl start/stop/status/enable for services.")
+        else:
+            lines.append("Init: **sysvinit**. Use service NAME start/stop or /etc/init.d/NAME.")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _safety_section() -> str:
+    rule = _get_rule("safety.md")
+    return (rule + "\n\n") if rule else ""
+
+
+def _runtime_section(is_root: bool) -> str:
+    if is_root:
+        return "## Runtime\nRunning as root (euid 0) – **no sudo** needed.\n"
+    return "## Runtime\nNot root – use **sudo** when needed.\n"
+
+
+def _prefs_section(config: dict[str, Any]) -> str:
+    """
+    Liest Merkdateien/Präferenzen aus agent_dir: Unterordner prefs/ und *.md/*.txt im Agent-Verzeichnis.
+    Diese werden beim Start in den Kontext geladen. Limit: prefs_max_chars (default 2500) damit z.B. wetter.md vollständig reinkommt.
+    """
+    agent_dir = (config.get("agent_dir") or "").strip()
+    if not agent_dir:
+        return ""
+    base = Path(agent_dir).expanduser().resolve()
+    if not base.exists():
+        return ""
+    max_chars = config.get("prefs_max_chars") or 2500
+    max_per_file = config.get("prefs_max_chars_per_file") or 1000
+    parts: list[str] = []
+    total = 0
+    # prefs/ Unterordner
+    prefs_dir = base / "prefs"
+    if prefs_dir.is_dir():
+        for p in sorted(prefs_dir.iterdir()):
+            if p.is_file() and total < max_chars:
+                try:
+                    t = p.read_text(encoding="utf-8", errors="replace").strip()
+                    if t:
+                        chunk = t[: min(max_per_file, max_chars - total)]
+                        parts.append(f"### {p.name}\n{chunk}")
+                        total += len(chunk)
+                except Exception:
+                    pass
+    # *.md und *.txt direkt im agent_dir (Kompatibilitaet mit alten .txt-Dateien)
+    for p in sorted(base.iterdir()):
+        if p.is_file() and p.suffix.lower() in (".md", ".txt") and p.name not in ("AGENTS.md", "SOUL.md", "IDENTITY.md", "TOOLS.md", "USER.md") and total < max_chars:
+            try:
+                t = p.read_text(encoding="utf-8", errors="replace").strip()
+                if t:
+                    chunk = t[: min(max_per_file, max_chars - total)]
+                    parts.append(f"### {p.name}\n{chunk}")
+                    total += len(chunk)
+            except Exception:
+                pass
+    if not parts:
+        return ""
+    return "## Stored preferences / notes\nFollow these when relevant.\n\n" + "\n\n".join(parts) + "\n\n"
+
+
+def _persistence_section(config: dict[str, Any]) -> str:
+    """Hinweis auf Verzeichnisse zum Merken/Schreiben."""
+    agent_dir = (config.get("agent_dir") or "").strip()
+    workspace = (config.get("workspace") or "").strip()
+    if not agent_dir and not workspace:
+        return ""
+    agent_dir_resolved = str(Path(agent_dir).expanduser().resolve()) if agent_dir else ""
+    workspace_resolved = str(Path(workspace).expanduser().resolve()) if workspace else ""
+    prefs_path = f"{agent_dir_resolved}/prefs" if agent_dir_resolved else ""
+    lines = ["## Persistence – how to store things"]
+    if prefs_path:
+        lines.append(
+            f"There are exactly **two storage mechanisms** — choose the right one:\n\n"
+            f"| What | Where | How | Format |\n"
+            f"|------|-------|-----|--------|\n"
+            f"| User preferences, notes, reminders | `{prefs_path}/` | `exec` (write file) | `.md` (Markdown) |\n"
+            f"| System config (providers, models, server, scheduler) | `config.yaml` | `save_config` tool | YAML (merged) |\n\n"
+            f"**Rules:**\n"
+            f"- When the user asks to remember/save a preference (weather location, backup settings, display style, etc.): "
+            f"use `exec` to write a `.md` file to `{prefs_path}/`. Filename = topic.\n"
+            f"- `save_config` is **ONLY** for changing system configuration (providers, models, server token/port, scheduler settings). "
+            f"**NEVER** use `save_config` for user preferences — that would corrupt the config file.\n"
+            f"- Prefs files are plain Markdown, no YAML/JSON. They are loaded into your context on every start.\n\n"
+            f"**Example** — user says *'speichere meine Wetterpräferenz für Lunz am See'*:\n"
+            f"→ `exec`: `cat > {prefs_path}/wetter.md << 'EOF'\n"
+            f"Ort: Lunz am See\n"
+            f"Quellen: 2 Dienste abfragen\n"
+            f"Format: mit Emojis, kurzer Hinweis (z.B. Regenschirm mitnehmen)\n"
+            f"EOF`\n"
+            f"→ Do **NOT** use `save_config` for this!"
+        )
+    if prefs_path:
+        lines.append(
+            f"**Project notes:** When the user says 'mach dir Notizen' or asks you to study a project/repo, "
+            f"write a concise summary to `{prefs_path}/notes-TOPIC.md` (key facts, architecture, tech stack — no full code). "
+            f"When asked 'schau dir die Notizen an', read the relevant notes file and use it as context."
+        )
+    _trash_path = f"{workspace_resolved}/.trash" if workspace_resolved else "{workspace}/.trash"
+    lines.append(f"Before deleting any file, move it to the app trash: `mv FILE {_trash_path}/` (auto-created). If user asks to empty the trash: `rm -rf {_trash_path}/*`.")
+    if workspace_resolved:
+        lines.append(
+            f"**Working directory for all file operations: `{workspace_resolved}`**\n"
+            f"Use this for ALL clones, downloads, and generated files. "
+            f"Before downloading or cloning anything, check here first: `ls {workspace_resolved}/`"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _planning_section(config: dict[str, Any], project_dir: str | None) -> str:
+    """Kompakte Anweisung für Task-Planning (Plan-Dateien im Workspace)."""
+    workspace = (config.get("workspace") or "").strip()
+    if not workspace:
+        return ""
+    ws = str(Path(workspace).expanduser().resolve())
+    # Pfad zu PLANNING.md (Referenzdatei)
+    planning_md = None
+    if project_dir:
+        p = Path(project_dir).expanduser().resolve() / "docs" / "PLANNING.md"
+        if p.exists():
+            planning_md = str(p)
+    if not planning_md:
+        p = Path(__file__).resolve().parent.parent / "docs" / "PLANNING.md"
+        if p.exists():
+            planning_md = str(p)
+    lines = [
+        "## Task planning",
+        f"For complex tasks (>3 steps or multiple components): create `{ws}/TOPIC-plan.md` with a Markdown checklist (`- [ ]`/`- [x]`).",
+        f"Read and update the plan via `exec` (cat/write) between steps. Mark steps done as you go.",
+        "With subagents: include relevant plan context in invoke_model message.",
+        "Delete the plan file when all tasks are done.",
+        f"When the user says **'schau dir den Plan an'**, **'mach weiter'**, or **references a plan by name**: "
+        f"read the plan file from `{ws}/`, summarize the status, and continue with the next open step.",
+    ]
+    if planning_md:
+        lines.append(f"For format details and examples: `exec: cat \"{planning_md}\"`")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _docs_dir_path(project_dir: str | None) -> Path | None:
+    """Path to docs/ directory. Prefer project_dir, else repo docs."""
+    if project_dir:
+        p = Path(project_dir).expanduser().resolve() / "docs"
+        if p.is_dir():
+            return p
+    base = Path(__file__).resolve().parent.parent
+    p = base / "docs"
+    return p if p.is_dir() else None
+
+
+def _docs_reference_section(project_dir: str | None) -> str:
+    """Docs-Verzeichnis mit Einzeldateien. Agent liest nur die Datei die er braucht."""
+    docs = _docs_dir_path(project_dir)
+    if not docs:
+        return ""
+    d = str(docs)
+    return (
+        "## Docs reference (read only when needed)\n"
+        f"Documentation directory: `{d}/`\n"
+        f"Each topic is a separate file. **Read only the file you need** (`exec: cat \"{d}/FILE\"`), never all of them.\n"
+        "When a topic is relevant, **read the file yourself and follow the instructions** — do not tell the user to read it.\n\n"
+        "| File | Topic |\n"
+        "|------|-------|\n"
+        "| `MATRIX.md` | Matrix bot setup (homeserver, token, device_id, E2EE) |\n"
+        "| `DISCORD.md` | Discord bot setup (bot_token, intents, invite) |\n"
+        "| `CONFIG_REFERENCE.md` | **Read before any save_config call.** Complete config structure, save_config rules, YAML examples |\n"
+        "| `PROVIDERS.md` | Multiple Ollama instances, Ollama Online, Anthropic, fallbacks |\n"
+        "| `CONTEXT_SIZE.md` | num_ctx, per-model context, model_options |\n"
+        "| `SCHEDULES.md` | Schedule tool, model parameter, cron |\n"
+        "| `SEARCH_ENGINES.md` | SearXNG, VPN search |\n"
+        "| `API_REFERENCE.md` | REST endpoints, curl examples |\n"
+        "| `SUBAGENTS.md` | Worker models, invoke_model |\n"
+        "| `VISION.md` | Image analysis, vision models |\n"
+        "| `IMAGE_GENERATION.md` | Image generation, upload to Matrix/Discord |\n"
+        "| `AVATARS.md` | Bot profile picture on Matrix/Discord |\n\n"
+    )
+
+
+def _memory_section(project_dir: str | None) -> str:
+    """Kurzer Memory-Auszug (letzte Tage, max Zeilen) für den System-Prompt."""
+    mem = get_memory_for_prompt(project_dir, max_lines=400, days=2)
+    if not mem:
+        return ""
+    return "## Memory (Auszug)\n" + mem + "\n\n"
+
+
+def _language_from_identity_md(identity_md: str) -> str:
+    """Liest Antwortsprache aus IDENTITY.md (z. B. 'Response language: Deutsch' oder 'language: English')."""
+    if not (identity_md or "").strip():
+        return ""
+    import re
+    for m in re.finditer(r"(?i)(?:response\s+language|language|sprache)\s*[:\-]\s*([A-Za-z\u00C0-\u024F]+)", identity_md):
+        return m.group(1).strip()
+    return ""
+
+
+def _language_section(config: dict[str, Any], identity_md_content: str = "") -> str:
+    """Response language from IDENTITY.md only; default Deutsch."""
+    lang = _language_from_identity_md(identity_md_content) or "Deutsch"
+    rule = _get_rule("language.md")
+    if rule:
+        # Sprache aus IDENTITY.md in die Regeldatei injizieren (ersetzt 'Deutsch' Platzhalter)
+        return rule.replace("**Deutsch**", f"**{lang}**") + "\n\n"
+    return (
+        f"## Language\nAlways respond in **{lang}** unless the user explicitly asks for another language.\n\n"
+    )
+
+
+def _knowledge_verification_section() -> str:
+    """Instruct the AI to verify uncertain facts via web search."""
+    from datetime import datetime
+    today = datetime.now().strftime("%B %d, %Y")
+    rule = _get_rule("knowledge_verification.md")
+    if rule:
+        return f"Today is **{today}**. Your training data has a cutoff date — anything after that may be outdated.\n{rule}\n\n"
+    return ""
+
+
+def _tools_umgebung_section(tools_md: str, config: dict[str, Any]) -> str:
+    """TOOLS.md-Inhalt (Suchmaschinen-Info ist bereits im Tool-Schema)."""
+    return (tools_md or "").strip()
+
+
+def _exec_behavior_section() -> str:
+    """Kompakte Verhaltensregeln für exec-Aufrufe: Schritt für Schritt, nicht aufgeben, Research first."""
+    rule = _get_rule("exec_behavior.md")
+    return (rule + "\n\n") if rule else ""
+
+
+def _tools_section(config: dict[str, Any]) -> str:
+    """Nur Verhaltensregeln fuer Tools – Details stehen bereits im Tool-Schema."""
+    lines = ["## Tool rules"]
+    sched_cfg = config.get("scheduler")
+    if sched_cfg in (None, False) or sched_cfg is True or (isinstance(sched_cfg, dict) and sched_cfg.get("enabled", True)):
+        lines.append("- **Always use `schedule` instead of cron/crontab.** prompt = work instruction (not a pre-written answer).")
+    lines.append(
+        "- `save_config`: **only for system config.** Pass only keys to change (deep-merged). Tell user to restart.\n"
+        "  Each provider has a `type` field (ollama, openai, etc.). Per-model options → `providers.<name>.model_options.\"model:tag\"` (NOT under models!). Quote `:` in YAML keys. think=bool, default=string.\n"
+        "  Valid options: temperature, top_p, top_k, num_ctx, num_predict, seed, min_p, stop, repeat_penalty, repetition_penalty, repeat_last_n, think.\n"
+        "  Read `docs/CONFIG_REFERENCE.md` (exec: cat) for examples before any save_config call. **NEVER use save_config for user preferences** — prefs/*.md via exec."
+    )
+    lines.append("- `check_url`: only when user explicitly asks to verify/check links.")
+    # Subagents: global config (subagents: [list]) oder per-provider subagents: true
+    subagent_list = config.get("subagents") or []
+    providers = config.get("providers") or {}
+    any_per_provider = any(
+        (p.get("models") or {}).get("subagents")
+        for p in providers.values() if isinstance(p, dict)
+    )
+    if subagent_list or any_per_provider:
+        sub_display = [f"`{m}`" for m in subagent_list] if subagent_list else []
+        if not sub_display and any_per_provider:
+            # Fallback: per-provider Modelle sammeln
+            default_prov = next(iter(providers), "ollama")
+            for prov_name, prov_cfg in providers.items():
+                if not isinstance(prov_cfg, dict) or not (prov_cfg.get("models") or {}).get("subagents"):
+                    continue
+                prefix = f"{prov_name}/" if prov_name != default_prov else ""
+                for alias in ((prov_cfg.get("models") or {}).get("aliases") or {}):
+                    sub_display.append(f"`{prefix}{alias}`")
+        lines.append(
+            "- `invoke_model`: Delegate tasks to subagents via `invoke_model(model='...', message='...')`.\n"
+            "  **If the user names a specific subagent: ALWAYS use it — never do the work yourself instead.**\n"
+            "  Message must be self-contained: goal, expected output format, language, relevant context, paths.\n"
+            "  Tell the subagent to complete the full task and return the result (not a TODO list).\n"
+            "  If a plan file exists: 'Arbeite gemäß Plan in [PFAD]. Markiere jeden Schritt als [x]/[!].'\n"
+            "  **On timeout or error: retry the same subagent once with the same message. Then report to user.**\n"
+            "  Do NOT do the work yourself after a subagent failure — ask the user how to proceed.\n"
+            "  If result is incomplete: re-invoke with a continuation instruction, or ask the user.\n"
+            "  Present the subagent's result directly — never redo it yourself."
+        )
+        if sub_display:
+            lines.append(f"  **Available subagents (use ONLY these exact names):** {', '.join(sub_display)}.\n"
+                         f"  Do NOT invent, abbreviate, or modify model names. Use EXACTLY one of the names listed above.")
+    cc = config.get("chat_clients") or {}
+    clients = []
+    for k in ("matrix", "discord"):
+        cfg = (cc.get(k) or config.get(k) or {}) or {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        if cfg.get("enabled", True) and (cfg.get("token") or cfg.get("bot_token")):
+            clients.append(k)
+    if clients:
+        lines.append(f"- Notifications only via {', '.join(clients)}. No notify-send.")
+        lines.append(
+            "- `status_update`: Send an **intermediate message** to the user during multi-step tasks.\n"
+            "  Use it to report progress (e.g. 'Schritt 3/7 erledigt'), share interim findings, or ask for input when you are stuck.\n"
+            "  Keep updates short (1-3 sentences). Do NOT use for the final answer — that goes in your normal response."
+        )
+    else:
+        lines.append("- No chat clients configured; notifications unavailable.")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _vision_section(config: dict[str, Any]) -> str:
+    """Vision/Image/Avatar-Abschnitt für System-Prompt."""
+    from miniassistant.ollama_client import get_vision_models, get_image_generation_models
+    vision_models = get_vision_models(config)
+    img_gen_models = get_image_generation_models(config)
+    avatar = config.get("avatar")
+    agent_dir = config.get("agent_dir") or ""
+    # Immer anzeigen — Avatar-Info ist auch ohne Vision relevant
+    lines = ["## Vision, Image & Avatar"]
+    if vision_models:
+        models_str = ", ".join(f"`{m}`" for m in vision_models)
+        lines.append(f"- **Vision models:** {models_str} (image analysis). The user can request a specific model.")
+        lines.append("  If the current chat model itself supports vision (llava, gemma3, minicpm-v, etc.), analyze directly without switching.")
+        lines.append("  Read `docs/VISION.md` for details on how to handle image uploads.")
+    else:
+        lines.append("- **No vision model configured.** If the user sends an image, tell them to set `vision` in the config.")
+    # Config-Pfad für Image-Upload und Avatar-Anweisungen
+    from miniassistant.config import config_path as _config_path
+    cfg_path = str(_config_path(None))
+    if img_gen_models:
+        models_str = ", ".join(f"`{m}`" for m in img_gen_models)
+        lines.append(f"- **Image generation models:** {models_str}. Use `invoke_model(model='MODEL_NAME', message='PROMPT')` to generate images.")
+        lines.append("  Use the **exact model name** as listed (including `provider/` prefix).")
+        lines.append(
+            "- **After generating an image:** Use `send_image(image_path='/path/to/image.png', caption='...')` to upload it to the current chat. "
+            "The tool handles Matrix upload (via bot client, E2EE-capable), Discord upload, and Web-UI automatically. No curl needed.\n"
+            "  **After a successful `send_image`: do NOT reply with text.** The user already sees the image — a confirmation message would be redundant. Only reply if the tool fails."
+        )
+    avatar_file = f"{agent_dir}/avatar.png" if agent_dir else "agent_dir/avatar.png"
+    if avatar:
+        lines.append(f"- **Avatar:** `{avatar}` (bot profile picture). Image file: `{avatar_file}`.")
+    else:
+        lines.append(f"- **Avatar:** not set. Default location: `{avatar_file}`.")
+    docs = _docs_dir_path(None)
+    avatars_md = str(docs / "AVATARS.md") if docs else "docs/AVATARS.md"
+    lines.append(
+        f"- **When asked to set/change avatar:** First `exec: ls -la \"{avatar_file}\"`. "
+        f"Then `exec: cat \"{avatars_md}\"` for the steps. "
+        f"Get credentials with `exec: grep -A20 'matrix:' \"{cfg_path}\"` (or `discord:`, or any other chat client section). "
+        "Use the real values in curl — never placeholders. Execute step by step."
+    )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def build_system_prompt(
+    config: dict[str, Any] | None = None,
+    project_dir: str | None = None,
+) -> str:
+    """Baut den kompletten System-Prompt aus Config, Agent-Dateien, Runtime und Tools.
+    Grobe Token-Abschätzung (ohne Chatverlauf ~50 Tokens weniger): mit Standard max_chars_per_file=500
+    und 5 Agent-Dateien ca. 2500 Zeichen aus Dateien + ~2000 Zeichen feste Teile → insgesamt grob
+    1000–1400 Tokens (≈ 3,5 Zeichen/Token). Der Abschnitt Chatverlauf addiert nur ~35 Tokens."""
+    if config is None:
+        config = load_config(project_dir)
+    # basic_rules laden (kopiert Defaults nach agent_dir/basic_rules/ falls nötig, cached im RAM)
+    _load_basic_rules(config)
+    agent_dir = config.get("agent_dir") or ""
+    max_chars = config.get("max_chars_per_file") or 500
+    files = load_agent_files(agent_dir, max_chars)
+    is_root = _is_root()
+
+    parts = [
+        "# Role and context",
+        "You are the assistant of **MiniAssistant**. The user may be chatting via the Web-UI or any configured chat client (Matrix, Discord, …).",
+        "**Core rules:** "
+        "(1) **Act, don't explain.** Use your tools immediately — never just describe what you *would* do. "
+        "(2) **Step by step.** One tool call at a time, check the result, then next step. "
+        "(3) **Real values only.** When a command needs config values (tokens, URLs, paths), read the relevant section from config first. Never use placeholder strings like `HOMESERVER` or `BOT_TOKEN` in commands. "
+        "(4) **Deliver results.** End with a clear confirmation of what was done, not just what could be done. "
+        "(5) **Read docs yourself.** If you need a docs file, read it and follow the instructions — don't tell the user to read it. "
+        "(6) **Don't over-ask.** If you have enough information to proceed, just do it. Only ask when essential info is truly missing (e.g. credentials the config doesn't have).",
+        "",
+        "## Chat history",
+        "Only reference prior messages when the user explicitly refers to them. Do not proactively resume older topics.",
+        "",
+        "## AGENTS (top-level contract)",
+        files.get("AGENTS.md", ""),
+        "",
+        "## SOUL (your personality)",
+        (files.get("SOUL.md", "") or "").strip()
+        + "\n\nDo not mention being an AI, the user knows. Be focused and factual.",
+        "",
+        "## IDENTITY (your identity)",
+        files.get("IDENTITY.md", ""),
+        "",
+        "## Environment",
+        _tools_umgebung_section(files.get("TOOLS.md", ""), config),
+        "",
+        "## USER (about your human)",
+        files.get("USER.md", ""),
+        "",
+        _memory_section(project_dir),
+        _prefs_section(config),
+        _language_section(config, files.get("IDENTITY.md") or ""),
+        _knowledge_verification_section(),
+        _system_section(),
+        _runtime_section(is_root),
+        _safety_section(),
+        _exec_behavior_section(),
+        _persistence_section(config),
+        _planning_section(config, project_dir),
+        _tools_section(config),
+        _docs_reference_section(project_dir),
+        _vision_section(config),
+        "---\n*End of system instructions. Everything below is the conversation.*",
+    ]
+    return "\n".join(parts).strip()
