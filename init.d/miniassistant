@@ -10,7 +10,7 @@
 ### END INIT INFO
 
 # Konfiguration – wird beim Install durch install.sh ersetzt
-INSTALL_DIR="%INSTALL_DIR%"
+INSTALL_DIR="/root/miniassistant"
 DAEMON="${INSTALL_DIR}/venv/bin/python"
 DAEMON_ARGS="-m miniassistant.cli serve"
 NAME="miniassistant"
@@ -27,17 +27,7 @@ RUN_AS=""
 
 # PATH setzen damit start-stop-daemon den Daemon findet
 PATH=/sbin:/usr/sbin:/bin:/usr/bin
-
-# HOME explizit setzen (start-stop-daemon erbt kein HOME;
-# ohne HOME expandiert Python ~ zu / statt /root)
-if [ -n "$RUN_AS" ]; then
-    export HOME=$(getent passwd "$RUN_AS" | cut -d: -f6)
-else
-    export HOME="${HOME:-/root}"
-fi
-
-# Config-Verzeichnis nur exportieren wenn explizit gesetzt
-[ -n "${CONFIG_DIR:-}" ] && export MINIASSISTANT_CONFIG_DIR="$CONFIG_DIR"
+export MINIASSISTANT_CONFIG_DIR="${CONFIG_DIR:-}"
 
 # Pruefungen
 [ -d "$INSTALL_DIR" ] || { echo "$DESC: INSTALL_DIR nicht gefunden: $INSTALL_DIR" >&2; exit 1; }
@@ -86,6 +76,26 @@ case "${1:-}" in
             echo "$DESC war nicht aktiv."
         fi
         ;;
+    update)
+        echo "Stoppe $DESC..."
+        if do_stop; then
+            echo "$DESC gestoppt."
+        else
+            echo "$DESC war nicht aktiv."
+        fi
+        cd $INSTALL_DIR
+        git pull
+        EXIT_STATUS=$?
+        if [ "$EXIT_STATUS" != "0" ]; then
+          echo "ERROR Update Failed, please do a manual `git pull`!"
+        fi
+        if do_start; then
+            echo "$DESC gestartet (PID $(cat "$PIDFILE" 2>/dev/null || echo '?'), Log: $LOGFILE)"
+        else
+            echo "$DESC konnte nicht gestartet werden." >&2
+            exit 1
+        fi
+        ;;
     restart|force-reload)
         echo "Neustart $DESC..."
         do_stop
@@ -104,7 +114,7 @@ case "${1:-}" in
         fi
         ;;
     *)
-        echo "Usage: $0 {start|stop|restart|force-reload|status}" >&2
+        echo "Usage: $0 {start|stop|restart|force-reload|status|update}" >&2
         exit 2
         ;;
 esac
