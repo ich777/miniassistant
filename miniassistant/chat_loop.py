@@ -31,7 +31,7 @@ from miniassistant.ollama_client import (
     model_supports_vision,
     resolve_model,
 )
-from miniassistant.tools import run_exec, web_search as tool_web_search, check_url as tool_check_url
+from miniassistant.tools import run_exec, web_search as tool_web_search, check_url as tool_check_url, read_url as tool_read_url
 from miniassistant.memory import append_exchange
 import miniassistant.agent_actions_log as _aal
 import miniassistant.context_log as _ctx_log
@@ -887,6 +887,14 @@ def _run_tool(
         if result.get("error"):
             parts.append(f"error: {result['error']}")
         return "\n".join(parts)
+    if name == "read_url":
+        url_arg = arguments.get("url", "").strip()
+        if not url_arg:
+            return "read_url requires url"
+        result = tool_read_url(url_arg)
+        if result.get("ok"):
+            return result.get("content", "")
+        return f"Error reading URL: {result.get('error', 'unknown error')}"
     if name == "send_image":
         from pathlib import Path as _Path
         image_path = arguments.get("image_path", "").strip()
@@ -1459,7 +1467,7 @@ def _run_subagent_anthropic(
     msgs: list[dict[str, Any]] = [{"role": "user", "content": user_msg}]
     total_content = ""
     total_thinking = ""
-    _ALLOWED_SUB_TOOLS = {"exec", "web_search", "check_url"}
+    _ALLOWED_SUB_TOOLS = {"exec", "web_search", "check_url", "read_url"}
     rounds_used = 0
     for _round in range(15):
         try:
@@ -1514,6 +1522,9 @@ def _run_subagent_anthropic(
                 if _cu_r.get("final_url"): _cu_parts.append(f"final_url: {_cu_r['final_url']}")
                 if _cu_r.get("error"): _cu_parts.append(f"error: {_cu_r['error']}")
                 tool_result = "\n".join(_cu_parts)
+            elif tc_name == "read_url":
+                _ru_r = tool_read_url(tc_args.get("url", ""))
+                tool_result = _ru_r.get("content", "") if _ru_r.get("ok") else f"Error reading URL: {_ru_r.get('error', 'unknown error')}"
             else:
                 tool_result = f"Unknown tool: {tc_name}"
             _aal.log_tool_call(config, f"subagent:{tc_name}", tc_args, tool_result)
@@ -1548,7 +1559,7 @@ def _run_subagent_google(
     msgs: list[dict[str, Any]] = [{"role": "user", "content": user_msg}]
     total_content = ""
     total_thinking = ""
-    _ALLOWED_SUB_TOOLS = {"exec", "web_search", "check_url"}
+    _ALLOWED_SUB_TOOLS = {"exec", "web_search", "check_url", "read_url"}
     rounds_used = 0
     for _round in range(15):
         try:
@@ -1604,6 +1615,9 @@ def _run_subagent_google(
                 if _cu_r.get("final_url"): _cu_parts.append(f"final_url: {_cu_r['final_url']}")
                 if _cu_r.get("error"): _cu_parts.append(f"error: {_cu_r['error']}")
                 tool_result = "\n".join(_cu_parts)
+            elif tc_name == "read_url":
+                _ru_r = tool_read_url(tc_args.get("url", ""))
+                tool_result = _ru_r.get("content", "") if _ru_r.get("ok") else f"Error reading URL: {_ru_r.get('error', 'unknown error')}"
             else:
                 tool_result = f"Unknown tool: {tc_name}"
             _aal.log_tool_call(config, f"subagent:{tc_name}", tc_args, tool_result)
@@ -1695,7 +1709,7 @@ def _run_subagent_openai(
     msgs: list[dict[str, Any]] = [{"role": "user", "content": user_msg}]
     total_content = ""
     total_thinking = ""
-    _ALLOWED_SUB_TOOLS = {"exec", "web_search", "check_url"}
+    _ALLOWED_SUB_TOOLS = {"exec", "web_search", "check_url", "read_url"}
     rounds_used = 0
     for _round in range(15):
         try:
@@ -1750,6 +1764,9 @@ def _run_subagent_openai(
                 if _cu_r.get("final_url"): _cu_parts.append(f"final_url: {_cu_r['final_url']}")
                 if _cu_r.get("error"): _cu_parts.append(f"error: {_cu_r['error']}")
                 tool_result = "\n".join(_cu_parts)
+            elif tc_name == "read_url":
+                _ru_r = tool_read_url(tc_args.get("url", ""))
+                tool_result = _ru_r.get("content", "") if _ru_r.get("ok") else f"Error reading URL: {_ru_r.get('error', 'unknown error')}"
             else:
                 tool_result = f"Unknown tool: {tc_name}"
             _aal.log_tool_call(config, f"subagent:{tc_name}", tc_args, tool_result)
@@ -1779,7 +1796,7 @@ def _run_subagent_with_tools(
     total_content = ""
     total_thinking = ""
     # Erlaubte Tools für Subagents (kein save_config, schedule, invoke_model)
-    _ALLOWED_SUB_TOOLS = {"exec", "web_search", "check_url"}
+    _ALLOWED_SUB_TOOLS = {"exec", "web_search", "check_url", "read_url"}
     rounds_used = 0
     for _round in range(max_rounds):
         r = None
@@ -1858,6 +1875,9 @@ def _run_subagent_with_tools(
                 if _cu_r.get("final_url"): _cu_parts.append(f"final_url: {_cu_r['final_url']}")
                 if _cu_r.get("error"): _cu_parts.append(f"error: {_cu_r['error']}")
                 tool_result = "\n".join(_cu_parts)
+            elif tc_name == "read_url":
+                _ru_r = tool_read_url(tc_args.get("url", ""))
+                tool_result = _ru_r.get("content", "") if _ru_r.get("ok") else f"Error reading URL: {_ru_r.get('error', 'unknown error')}"
             else:
                 tool_result = f"Unknown tool: {tc_name}"
             _aal.log_tool_call(config, f"subagent:{tc_name}", tc_args, tool_result)

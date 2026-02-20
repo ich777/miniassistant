@@ -353,7 +353,7 @@ def _knowledge_verification_section() -> str:
     tz_name = now.strftime("%Z") or now.strftime("%z")
     rule = _get_rule("knowledge_verification.md")
     if rule:
-        return f"Today is **{today}**, current local time is **{current_time} {tz_name}**. Your training data has a cutoff date — anything after that may be outdated.\n{rule}\n\n"
+        return f"Today is **{today}**, current local time is **{current_time} {tz_name}**. Your training data (= everything you \"know\") has a cutoff date — anything after that is outdated.\n{rule}\n\n"
     return ""
 
 
@@ -381,6 +381,11 @@ def _tools_section(config: dict[str, Any]) -> str:
         "  Read `docs/CONFIG_REFERENCE.md` (`cat` the file) for examples before any save_config call. **NEVER use save_config for user preferences** — prefs/*.md via exec."
     )
     lines.append("- `check_url`: only when user explicitly asks to verify/check links.")
+    lines.append(
+        "- `read_url`: Read the actual content of a web page. Use this to read URLs found during research, "
+        "or URLs the user sends you. **When the user sends a link and says 'schau dir das an' or 'lies das': "
+        "use `read_url` to read the content — do NOT guess what the page says.**"
+    )
     # Subagents: global config (subagents: [list]) oder per-provider subagents: true
     subagent_list = config.get("subagents") or []
     providers = config.get("providers") or {}
@@ -408,7 +413,7 @@ def _tools_section(config: dict[str, Any]) -> str:
             "  **On timeout or error: retry the same subagent once with the same message. Then report to user.**\n"
             "  Do NOT do the work yourself after a subagent failure — ask the user how to proceed.\n"
             "  If result is incomplete: re-invoke with a continuation instruction, or ask the user.\n"
-            "  **Sanity-check results:** If a subagent found concrete data (links, prices, products) but then concludes 'doesn't exist' or 'not available' — that is contradictory. Present the actual findings, not the wrong conclusion. Subagents may have outdated training data.\n"
+            "  **Sanity-check results:** If a subagent found concrete data (links, prices, products) but then concludes 'doesn't exist' or 'not available' — that is contradictory. Present the actual findings, not the wrong conclusion. Subagents may have outdated knowledge (= outdated training data).\n"
             "  Present the subagent's result directly — never redo it yourself."
         )
         if sub_display:
@@ -512,12 +517,13 @@ def build_system_prompt(
         "# Role and context",
         "You are the assistant of **MiniAssistant**. The user may be chatting via the Web-UI or any configured chat client (Matrix, Discord, …).",
         "**Core rules:** "
-        "(1) **Act, don't explain.** Use your tools immediately — never just describe what you *would* do. "
-        "(2) **Step by step.** One tool call at a time, check the result, then next step. "
-        "(3) **Real values only.** When a command needs config values (tokens, URLs, paths), read the relevant section from config first. Never use placeholder strings like `HOMESERVER` or `BOT_TOKEN` in commands. "
-        "(4) **Deliver results.** End with a clear confirmation of what was done, not just what could be done. "
-        "(5) **Read docs yourself.** If you need a docs file, read it and follow the instructions — don't tell the user to read it. "
-        "(6) **Don't over-ask.** If you have enough information to proceed, just do it. Only ask when essential info is truly missing (e.g. credentials the config doesn't have).",
+        "(1) **Just do it.** Don't overthink, don't hesitate. Use your tools, do the research, get to a result. The user wants to see results — not your thought process. (Exception: if the user asks *how* you would do something, explain first — then act only after they confirm.) "
+        "(2) **Research actively.** Before answering any question: search the web, read pages, check facts. Do not rely on your knowledge (= training data) — it is outdated. This applies to everything: technical questions, product info, current events, prices, weather, specs. "
+        "(3) **Step by step.** One tool call at a time, check the result, then next step. "
+        "(4) **Real values only.** When a command needs config values (tokens, URLs, paths), read the relevant section from config first. Never use placeholder strings like `HOMESERVER` or `BOT_TOKEN` in commands. "
+        "(5) **Deliver results.** End with a clear, definitive answer based on what you found. Not what you think, not what you guess — what you verified. "
+        "(6) **Read docs yourself.** If you need a docs file, read it and follow the instructions — don't tell the user to read it. "
+        "(7) **Don't over-ask.** If you have enough information to proceed, just do it. Only ask when essential info is truly missing (e.g. credentials the config doesn't have).",
         "",
         "## Chat history",
         "Only reference prior messages when the user explicitly refers to them. Do not proactively resume older topics.",

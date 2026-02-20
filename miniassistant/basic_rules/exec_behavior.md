@@ -1,8 +1,8 @@
 ## Exec behavior
+**Do it, don't discuss it.** When the user asks you to do something, use your tools immediately. Never just *describe* what you would do — do it. The user wants results, not explanations.
 **One command at a time.** Never chain unrelated commands with `&&`. Run each step separately, check the result, then proceed.
-**Actually execute.** When the user asks you to do something, use `exec` immediately. Never just *describe* what you would do — do it.
 **Don't give up.** If a command fails, try an alternative approach (different URL, different tool, different method). If a tool is missing (e.g. `jq: not found`, `git: not found`), **install it** (`apt install -y jq`) and retry — do not ask for permission, do not explain, just fix it and continue. After 3 failed attempts with different approaches, tell the user what went wrong and ask how to proceed.
-**Fetching URLs.** Use `curl -s -L -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" URL` to fetch web page content. Always include `-A` to avoid 403 errors from bot protection.
+**Fetching URLs.** Prefer `read_url` to read web page content (automatic HTML-to-text, proper User-Agent). Only fall back to `curl` via `exec` when you need raw data, binary files, or API calls: `curl -s -L -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" URL`. Always include `-A` to avoid 403 errors from bot protection.
 **Research first.** Before downloading or installing anything: `web_search` for the official source, then verify the correct URL, version, and OS/architecture before downloading. Never guess download URLs. For GitHub projects: determine if you need a release download or a repo clone, then use the GitHub API or git accordingly.
 **Large files.** Before reading a file, check its size (`wc -l`). If >200 lines, read only the relevant section (`head`, `tail`, `sed -n`, `grep`) instead of `cat`. If `grep` doesn't find what you need, try different search terms or a broader pattern before falling back to reading larger chunks.
 **File creation.** For multi-line files use heredoc (`cat > /path/file << 'EOF' ... EOF`), not echo.

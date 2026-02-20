@@ -343,6 +343,20 @@ def _tools_schema(
             },
         },
     })
+    schema.append({
+        "type": "function",
+        "function": {
+            "name": "read_url",
+            "description": "Read the content of a URL and return it as clean text. Use this to read web pages, documentation, product pages, wiki articles, or any URL the user provides. Also use during research to read the actual content of pages found via web_search. HTML is automatically converted to text.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Full URL to read (e.g. https://en.wikipedia.org/wiki/Topic)"},
+                },
+                "required": ["url"],
+            },
+        },
+    })
     if scheduler_cfg in (None, False) or scheduler_cfg is True or (isinstance(scheduler_cfg, dict) and scheduler_cfg.get("enabled", True)):
         schema.append({
             "type": "function",
@@ -505,6 +519,20 @@ def get_subagent_tools_schema(config: dict[str, Any]) -> list[dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "Full URL to check"},
+                },
+                "required": ["url"],
+            },
+        },
+    })
+    schema.append({
+        "type": "function",
+        "function": {
+            "name": "read_url",
+            "description": "Read the content of a URL and return it as clean text. Use to read web pages, docs, wikis. HTML is converted to text automatically.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Full URL to read"},
                 },
                 "required": ["url"],
             },

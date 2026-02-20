@@ -18,6 +18,7 @@ Subagents automatically receive the configured `workspace` directory as their wo
 Subagents have **limited tools** (injected at call time, no main-agent context cost):
 - ✅ `exec` — shell commands (cwd = workspace, **runs in `sh`** — use `.` not `source`, no bash-only syntax)
 - ✅ `web_search` — web search via SearXNG
+- ✅ `read_url` — read web page content as text
 - ✅ `check_url` — URL verification
 - ❌ `save_config` — config changes (main agent only)
 - ❌ `schedule` — job scheduling (main agent only)
