@@ -19,10 +19,18 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 
-def send_notification(message: str, client: str | None = None, config: dict[str, Any] | None = None) -> dict[str, str]:
+def send_notification(
+    message: str,
+    client: str | None = None,
+    config: dict[str, Any] | None = None,
+    room_id: str | None = None,
+    channel_id: str | None = None,
+) -> dict[str, str]:
     """
     Sendet eine Nachricht an konfigurierte Chat-Clients.
     client: 'matrix', 'discord' oder None (= alle konfigurierten).
+    room_id: Direkt in diesen Matrix-Raum senden (statt an alle User).
+    channel_id: Direkt in diesen Discord-Channel senden (statt an alle User).
     Returns dict mit Ergebnissen pro Client.
     """
     if config is None:
@@ -33,14 +41,20 @@ def send_notification(message: str, client: str | None = None, config: dict[str,
     if client is None or client == "matrix":
         mc = cc.get("matrix") or config.get("matrix")
         if mc and mc.get("enabled", True) and mc.get("token") and mc.get("user_id"):
-            results["matrix"] = _send_matrix(mc, message, config.get("_config_dir") if config else None)
+            if room_id:
+                results["matrix"] = _send_matrix_to_room(mc, message, room_id)
+            else:
+                results["matrix"] = _send_matrix(mc, message, config.get("_config_dir") if config else None)
         elif client == "matrix":
             results["matrix"] = "nicht konfiguriert"
 
     if client is None or client == "discord":
         dc = cc.get("discord")
         if dc and dc.get("enabled", True) and dc.get("bot_token"):
-            results["discord"] = _send_discord(dc, message, config.get("_config_dir") if config else None)
+            if channel_id:
+                results["discord"] = _send_discord_to_channel(dc, message, channel_id)
+            else:
+                results["discord"] = _send_discord(dc, message, config.get("_config_dir") if config else None)
         elif client == "discord":
             results["discord"] = "nicht konfiguriert"
 
@@ -92,6 +106,49 @@ def _send_matrix(mc: dict[str, Any], message: str, config_dir: str | None = None
                 logger.warning("Matrix -> %s fehlgeschlagen", mx_user)
 
     return f"gesendet an {len(sent_to)} User" if sent_to else "senden fehlgeschlagen"
+
+
+def _send_matrix_to_room(mc: dict[str, Any], message: str, room_id: str) -> str:
+    """Sendet eine Nachricht direkt in einen bestimmten Matrix-Raum."""
+    # Bevorzugt: ueber den laufenden Bot-Client senden (E2EE-faehig)
+    try:
+        from miniassistant.matrix_bot import send_message_to_room
+        if send_message_to_room(room_id, message):
+            logger.info("Matrix -> Room %s (via Bot)", room_id)
+            return f"gesendet in Raum {room_id}"
+    except (ImportError, Exception) as e:
+        logger.warning("Matrix Bot -> Room %s fehlgeschlagen: %s", room_id, e)
+
+    # Fallback: raw HTTP
+    import urllib.request
+    import json
+    import uuid as _uuid
+
+    homeserver = (mc.get("homeserver") or "").rstrip("/")
+    token = mc.get("token", "")
+    if not homeserver or not token:
+        return "homeserver/token fehlt"
+
+    try:
+        content: dict[str, Any] = {"msgtype": "m.text", "body": message}
+        try:
+            from miniassistant.matrix_bot import markdown_to_matrix_html
+            formatted = markdown_to_matrix_html(message)
+            if formatted:
+                content["format"] = "org.matrix.custom.html"
+                content["formatted_body"] = formatted
+        except Exception:
+            pass
+        send_url = f"{homeserver}/_matrix/client/v3/rooms/{urllib.parse.quote(room_id)}/send/m.room.message/{_uuid.uuid4()}"
+        body = json.dumps(content).encode()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        req = urllib.request.Request(send_url, data=body, headers=headers, method="PUT")
+        urllib.request.urlopen(req, timeout=10)
+        logger.info("Matrix -> Room %s (via HTTP)", room_id)
+        return f"gesendet in Raum {room_id}"
+    except Exception as e:
+        logger.warning("Matrix HTTP -> Room %s: %s", room_id, e)
+        return f"senden fehlgeschlagen: {e}"
 
 
 def _send_matrix_http(mc: dict[str, Any], mx_user: str, message: str) -> bool:
@@ -348,3 +405,28 @@ def _send_discord(dc: dict[str, Any], message: str, config_dir: str | None = Non
             logger.warning("Discord -> %s fehlgeschlagen: %s", discord_user_id, e)
 
     return f"gesendet an {len(sent_to)} User" if sent_to else "senden fehlgeschlagen"
+
+
+def _send_discord_to_channel(dc: dict[str, Any], message: str, channel_id: str) -> str:
+    """Sendet eine Nachricht direkt in einen bestimmten Discord-Channel."""
+    import urllib.request
+    import json
+
+    bot_token = dc.get("bot_token", "")
+    if not bot_token:
+        return "bot_token fehlt"
+
+    try:
+        send_url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+        body = json.dumps({"content": message}).encode()
+        req = urllib.request.Request(
+            send_url,
+            data=body,
+            headers={"Authorization": f"Bot {bot_token}", "Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=10)
+        logger.info("Discord -> Channel %s", channel_id)
+        return f"gesendet in Channel {channel_id}"
+    except Exception as e:
+        logger.warning("Discord -> Channel %s fehlgeschlagen: %s", channel_id, e)
+        return f"senden fehlgeschlagen: {e}"

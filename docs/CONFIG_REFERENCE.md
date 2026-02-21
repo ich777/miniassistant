@@ -59,7 +59,8 @@ server:
   show_context: false                     # log full context (system prompt, messages, tokens) to logs/context.log
 
 agent_dir: ~/.config/miniassistant/agent
-workspace: ~/.config/miniassistant/workspace
+workspace: ~/workspace                  # default: ~/workspace
+trash_dir: ~/.trash                     # default: ~/.trash (separate from workspace)
 max_chars_per_file: 500                   # max chars per agent file in system prompt
 max_tool_rounds: 15                       # max tool call rounds per chat message (default: 15)
 

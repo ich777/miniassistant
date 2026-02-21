@@ -39,8 +39,19 @@ def _default_agent_dir() -> str:
 
 
 def _default_workspace() -> str:
-    """Standard-Workspace für Kompilate, Notizen etc. (wird beim Start im Kontext mitgegeben)."""
-    return str(Path(get_config_dir()) / "workspace")
+    """Standard-Workspace im Home-Verzeichnis des Users."""
+    home = os.environ.get("HOME", "").strip() or "/root"
+    if not home or home == "/":
+        home = "/root"
+    return str(Path(home) / "workspace")
+
+
+def _default_trash_dir() -> str:
+    """Trash im Home-Verzeichnis, versteckt (.trash)."""
+    home = os.environ.get("HOME", "").strip() or "/root"
+    if not home or home == "/":
+        home = "/root"
+    return str(Path(home) / ".trash")
 
 
 def _normalize_search_engines(raw: Any) -> dict[str, dict[str, Any]]:
@@ -109,14 +120,10 @@ def load_config(project_dir: str | None = None) -> dict[str, Any]:
     # Verzeichnis der geladenen Config (für Matrix-Store etc.); wird nicht in die Datei geschrieben
     merged["_config_dir"] = str(path.parent.resolve())
     # Wichtige Verzeichnisse sicherstellen (workspace, agent_dir)
-    for _dir_key in ("workspace", "agent_dir"):
+    for _dir_key in ("workspace", "agent_dir", "trash_dir"):
         _dir_val = (merged.get(_dir_key) or "").strip()
         if _dir_val:
             Path(_dir_val).expanduser().mkdir(parents=True, exist_ok=True)
-    # App-eigenen Trash-Ordner im Workspace anlegen
-    _ws = (merged.get("workspace") or "").strip()
-    if _ws:
-        (Path(_ws).expanduser() / ".trash").mkdir(parents=True, exist_ok=True)
     return merged
 
 
@@ -342,6 +349,7 @@ def _merge_with_defaults(data: dict[str, Any]) -> dict[str, Any]:
         },
         "agent_dir": data.get("agent_dir") or _default_agent_dir(),
         "workspace": data.get("workspace") or _default_workspace(),
+        "trash_dir": data.get("trash_dir") or _default_trash_dir(),
         "models": models_merged,  # Shortcut: models des Default-Providers
         "search_engines": _search_engines_merged(data),
         "default_search_engine": _default_search_engine_merged(data),

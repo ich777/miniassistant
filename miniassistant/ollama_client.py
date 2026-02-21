@@ -362,16 +362,16 @@ def _tools_schema(
             "type": "function",
             "function": {
                 "name": "schedule",
-                "description": "Manage scheduled tasks. ALWAYS use this tool instead of cron/crontab! action='create': new job. action='list': show all. action='remove': delete by id.",
+                "description": "Manage scheduled tasks (geplante Jobs, Benachrichtigungen, Erinnerungen). ALWAYS use this instead of cron/crontab! action='create': new job. action='list': show all. action='remove': delete by id. To edit/change a schedule: list → remove old → create new (never leave old job running). To remove by time or description: first list to find the ID, then remove.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["create", "list", "remove"], "description": "create (default), list, or remove"},
-                        "prompt": {"type": "string", "description": "Work instruction the bot executes later (e.g. 'Get current weather for City X'). NOT a pre-formatted answer!"},
+                        "prompt": {"type": "string", "description": "Task to execute at the scheduled time. Examples: 'Search weather for City X from 3 sources and summarize' or 'Send this exact message to the user: \"Hallo!\"'. NEVER paste a pre-written answer — write the task, not the result!"},
                         "command": {"type": "string", "description": "Shell command to run (optional). Output is included in prompt context if both set."},
                         "when": {"type": "string", "description": "Cron 5 fields in local system time (e.g. '30 7 * * *' = 7:30) or 'in 30 minutes' / 'in 1 hour'"},
-                        "client": {"type": "string", "description": "Target chat client: 'matrix', 'discord', or omit for all."},
-                        "once": {"type": "boolean", "description": "Delete after first execution. Default false. 'in N minutes' triggers are always once."},
+                        "client": {"type": "string", "description": "Target chat client: 'matrix', 'discord', or omit for current. Results are sent to the room/channel where the schedule was created."},
+                        "once": {"type": "boolean", "description": "true = run once then delete (use for reminders, one-time notifications, 'einmalig', 'remind me once'). false = recurring. 'in N minutes/hours' is always once."},
                         "model": {"type": "string", "description": "Model name or alias for the prompt (e.g. 'qwen3', 'ollama-online/kimi-k2.5'). Default: current default model. Use this to control cost and capability."},
                         "id": {"type": "string", "description": "Job ID (or prefix) for action='remove'."},
                     },
@@ -439,7 +439,7 @@ def _tools_schema(
                     "type": "object",
                     "properties": {
                         "model": {"type": "string", "description": "Model name or alias (e.g. qwen2.5-coder:14b or alias 'compiler')"},
-                        "message": {"type": "string", "description": "Task or question for the other model"},
+                        "message": {"type": "string", "description": "Task or question to delegate (e.g. 'Review this code: ...'). Pass the task itself — NEVER a pre-written answer."},
                     },
                     "required": ["model", "message"],
                 },

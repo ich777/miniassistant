@@ -46,6 +46,8 @@ def _run_scheduled_job(job_id: str, job_data: str) -> None:
     client = data.get("client")
     once = data.get("once", False)
     model = data.get("model")  # Optional: spezifisches Modell (Name oder Alias)
+    room_id = data.get("room_id")  # Optional: direkt in diesen Matrix-Raum
+    channel_id = data.get("channel_id")  # Optional: direkt in diesen Discord-Channel
 
     # Shell-Befehl ausfuehren (falls gesetzt)
     cmd_output = ""
@@ -69,13 +71,13 @@ def _run_scheduled_job(job_id: str, job_data: str) -> None:
             logger.info("Job %s prompt (model=%s): %s", job_id[:8], model or "default", full_prompt[:80])
             response = _run_prompt(full_prompt, model=model)
             logger.info("Job %s antwort: %d Zeichen", job_id[:8], len(response))
-            _send_to_client(response, client)
+            _send_to_client(response, client, room_id=room_id, channel_id=channel_id)
             logger.info("Job %s -> %s gesendet", job_id[:8], client or "alle")
         except Exception as e:
             logger.exception("Job %s prompt fehlgeschlagen", job_id[:8])
-            _send_to_client(f"Schedule-Fehler: {e}", client)
+            _send_to_client(f"Schedule-Fehler: {e}", client, room_id=room_id, channel_id=channel_id)
     elif command and client:
-        _send_to_client(cmd_output or "(Keine Ausgabe)", client)
+        _send_to_client(cmd_output or "(Keine Ausgabe)", client, room_id=room_id, channel_id=channel_id)
 
     # once=True oder date-Trigger: Job nach Ausfuehrung loeschen
     if once:
@@ -117,13 +119,13 @@ def _run_prompt(prompt: str, model: str | None = None) -> str:
     return (content or "").strip()
 
 
-def _send_to_client(message: str, client: str | None) -> None:
-    """Sendet eine Nachricht an Chat-Client(s) via notify."""
+def _send_to_client(message: str, client: str | None, room_id: str | None = None, channel_id: str | None = None) -> None:
+    """Sendet eine Nachricht an Chat-Client(s) via notify. Optional direkt in Raum/Channel."""
     if not message:
         return
     try:
         from miniassistant.notify import send_notification
-        results = send_notification(message, client=client)
+        results = send_notification(message, client=client, room_id=room_id, channel_id=channel_id)
         logger.info("Notify-Ergebnis: %s", results)
     except Exception as e:
         logger.exception("Job notify fehlgeschlagen")
@@ -190,6 +192,8 @@ def add_scheduled_job(
     client: str | None = None,
     once: bool = False,
     model: str | None = None,
+    room_id: str | None = None,
+    channel_id: str | None = None,
 ) -> tuple[bool, str]:
     """
     Fuegt einen geplanten Job hinzu.
@@ -199,6 +203,8 @@ def add_scheduled_job(
     - when: Cron (5 Felder) oder 'in N minutes' / 'in 1 hour'
     - once: True = nach erster Ausfuehrung loeschen (auch bei Cron)
     - model: optionaler Modellname/Alias fuer den Prompt (Default: aktuelles Default-Modell)
+    - room_id: Matrix-Raum-ID – Ergebnis direkt dorthin senden
+    - channel_id: Discord-Channel-ID – Ergebnis direkt dorthin senden
     Date-Trigger ("in N minutes") werden immer als once behandelt.
     """
     if not command and not prompt:
@@ -226,10 +232,14 @@ def add_scheduled_job(
         job_data_dict["once"] = True
     if model:
         job_data_dict["model"] = model
+    if room_id:
+        job_data_dict["room_id"] = room_id
+    if channel_id:
+        job_data_dict["channel_id"] = channel_id
     job_data_json = json.dumps(job_data_dict, ensure_ascii=False)
 
     jobs = _load_jobs()
-    jobs.append({
+    job_entry: dict[str, Any] = {
         "id": job_id,
         "trigger": trigger_type,
         "trigger_args": trigger_args,
@@ -239,7 +249,12 @@ def add_scheduled_job(
         "once": once,
         "model": model,
         "added_at": datetime.now().astimezone().isoformat(),
-    })
+    }
+    if room_id:
+        job_entry["room_id"] = room_id
+    if channel_id:
+        job_entry["channel_id"] = channel_id
+    jobs.append(job_entry)
     _save_jobs(jobs)
 
     try:
@@ -325,6 +340,10 @@ def start_scheduler_if_enabled() -> bool:
             job_data_dict["once"] = True
         if job.get("model"):
             job_data_dict["model"] = job["model"]
+        if job.get("room_id"):
+            job_data_dict["room_id"] = job["room_id"]
+        if job.get("channel_id"):
+            job_data_dict["channel_id"] = job["channel_id"]
         if not job_data_dict:
             continue
         job_data_json = json.dumps(job_data_dict, ensure_ascii=False)

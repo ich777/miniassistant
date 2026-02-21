@@ -111,38 +111,29 @@ def load_agent_files(agent_dir: str, max_chars_per_file: int = 500) -> dict[str,
     return result
 
 
-def _system_section() -> str:
-    """Host system description (OS, distro, package manager, init) for the LLM."""
+def _system_and_runtime_section(is_root: bool) -> str:
+    """Host system + runtime info (OS, distro, package manager, init, root status) for the LLM."""
     s = _detect_system()
-    lines = [
-        "## System (Host)",
-        f"You run on: **{s['os']}** (Kernel/Release: {s['release']}, Arch: {s['machine']}).",
-    ]
+    parts = [f"**{s['os']}** (Kernel: {s['release']}, {s['machine']})"]
     if s["distro"]:
-        lines.append(f"Distribution: **{s['distro']}**.")
+        parts.append(f"Distro: **{s['distro']}**")
     if s["package_manager"]:
-        lines.append(
-            f"Package manager: **{s['package_manager']}**. "
-            f"Use e.g. {s['package_manager']} install/remove/update for packages."
-        )
+        parts.append(f"Pkg: **{s['package_manager']}**")
     if s["init_system"]:
         if s["init_system"] == "systemd":
-            lines.append("Init: **systemd**. Use systemctl start/stop/status/enable for services.")
+            parts.append("Init: **systemd** (systemctl)")
         else:
-            lines.append("Init: **sysvinit**. Use service NAME start/stop or /etc/init.d/NAME.")
-    lines.append("")
-    return "\n".join(lines)
+            parts.append("Init: **sysvinit** (service NAME start/stop)")
+    if is_root:
+        parts.append("Running as **root** – no sudo needed")
+    else:
+        parts.append("Not root – use **sudo** when needed")
+    return "## System\n" + ". ".join(parts) + ".\n\n"
 
 
 def _safety_section() -> str:
     rule = _get_rule("safety.md")
     return (rule + "\n\n") if rule else ""
-
-
-def _runtime_section(is_root: bool) -> str:
-    if is_root:
-        return "## Runtime\nRunning as root (euid 0) – **no sudo** needed.\n"
-    return "## Runtime\nNot root – use **sudo** when needed.\n"
 
 
 def _prefs_section(config: dict[str, Any]) -> str:
@@ -207,18 +198,14 @@ def _persistence_section(config: dict[str, Any]) -> str:
             f"| User preferences, notes, reminders | `{prefs_path}/` | `exec` (write file) | `.md` (Markdown) |\n"
             f"| System config (providers, models, server, scheduler) | `config.yaml` | `save_config` tool | YAML (merged) |\n\n"
             f"**Rules:**\n"
-            f"- When the user asks to remember/save a preference (weather location, backup settings, display style, etc.): "
-            f"use `exec` to write a `.md` file to `{prefs_path}/`. Filename = topic.\n"
-            f"- `save_config` is **ONLY** for changing system configuration (providers, models, server token/port, scheduler settings). "
-            f"**NEVER** use `save_config` for user preferences — that would corrupt the config file.\n"
-            f"- Prefs files are plain Markdown, no YAML/JSON. They are loaded into your context on every start.\n\n"
-            f"**Example** — user says *'speichere meine Wetterpräferenz für Lunz am See'*:\n"
-            f"→ `exec`: `cat > {prefs_path}/wetter.md << 'EOF'\n"
-            f"Ort: Lunz am See\n"
-            f"Quellen: 2 Dienste abfragen\n"
-            f"Format: mit Emojis, kurzer Hinweis (z.B. Regenschirm mitnehmen)\n"
-            f"EOF`\n"
-            f"→ Do **NOT** use `save_config` for this!"
+            f"- **Trigger phrases:** When the user says 'merk dir', 'speicher dir', 'remember', 'save', 'notier dir' → "
+            f"write a `.md` file to `{prefs_path}/` via `exec`. Filename = topic (e.g. `wetter.md`, `backup.md`).\n"
+            f"- `save_config` is **ONLY** for system config (providers, models, server). **NEVER** use it for user preferences.\n"
+            f"- Prefs are plain Markdown. They are loaded into your system prompt at session start (see \"Stored preferences\" above) — every line costs context tokens.\n"
+            f"- **Keep prefs short:** Only key facts, key-value style (e.g. `Ort: Lunz am See`). No long explanations, no full instructions. Max 5-10 lines per file.\n"
+            f"- **Before saving:** Look at your \"Stored preferences\" section above — if a file for that topic already exists, update it instead of creating a duplicate.\n"
+            f"- **NEVER store credentials, tokens, passwords, or API keys in prefs files** — they get loaded into the system prompt every session. "
+            f"For config credentials (e.g. Matrix token), use `save_config`. For other secrets, warn the user that prefs/ is not secure."
         )
     if prefs_path:
         lines.append(
@@ -226,8 +213,9 @@ def _persistence_section(config: dict[str, Any]) -> str:
             f"write a concise summary to `{prefs_path}/notes-TOPIC.md` (key facts, architecture, tech stack — no full code). "
             f"When asked 'schau dir die Notizen an', read the relevant notes file and use it as context."
         )
-    _trash_path = f"{workspace_resolved}/.trash" if workspace_resolved else "{workspace}/.trash"
-    lines.append(f"Before deleting any file, move it to the app trash: `mv FILE {_trash_path}/` (auto-created). If user asks to empty the trash: `rm -rf {_trash_path}/*`.")
+    trash_dir = (config.get("trash_dir") or "").strip()
+    _trash_path = str(Path(trash_dir).expanduser().resolve()) if trash_dir else (f"{workspace_resolved}/.trash" if workspace_resolved else ".trash")
+    lines.append(f"Before deleting any file, move it to the app trash: `mv FILE {_trash_path}/` (auto-created, separate from workspace). If user asks to empty the trash: `rm -rf {_trash_path}/*`.")
     if workspace_resolved:
         lines.append(
             f"**Working directory for all file operations: `{workspace_resolved}`**\n"
@@ -291,26 +279,21 @@ def _docs_reference_section(project_dir: str | None) -> str:
         f"Documentation directory: `{d}/`\n"
         f"Each topic is a separate file. **Read only the file you need** (`cat \"{d}/FILE\"`), never all of them.\n"
         "When a topic is relevant, **read the file yourself and follow the instructions** — do not tell the user to read it.\n\n"
-        "**MANDATORY read-first rules:**\n"
-        "- **Matrix/Discord setup:** When the user asks to set up Matrix or Discord, this means configuring **YOUR OWN** `chat_clients` section in the config so that YOU (the bot) can be reached via that platform. "
-        "It does **NOT** mean installing a Matrix server, Synapse, Element, or any other software. "
-        f"**ALWAYS** read `{d}/MATRIX.md` or `{d}/DISCORD.md` FIRST (before any action), then use `save_config` with the correct field names from the doc.\n"
-        f"- **Any config change:** Read `{d}/CONFIG_REFERENCE.md` before calling `save_config`.\n\n"
+        "**Read-first rules:** Before Matrix/Discord setup or any `save_config` call, read the matching doc file first.\n\n"
         "| File | Topic |\n"
         "|------|-------|\n"
-        "| `MATRIX.md` | **Read first before any Matrix action.** Configuring YOUR bot connection (chat_clients.matrix: homeserver, token, device_id, encrypted_rooms) |\n"
-        "| `DISCORD.md` | **Read first before any Discord action.** Configuring YOUR bot connection (chat_clients.discord: bot_token) |\n"
-        "| `CONFIG_REFERENCE.md` | **Read before any save_config call.** Complete config structure, save_config rules, YAML examples |\n"
-        "| `PROVIDERS.md` | Multiple Ollama instances, Ollama Online, Anthropic, fallbacks |\n"
-        "| `CONTEXT_SIZE.md` | num_ctx, per-model context, model_options |\n"
-        "| `SCHEDULES.md` | Schedule tool, model parameter, cron |\n"
-        "| `SEARCH_ENGINES.md` | SearXNG, VPN search |\n"
-        "| `API_REFERENCE.md` | REST endpoints, curl examples |\n"
+        f"| `MATRIX.md` | Configuring YOUR bot connection (chat_clients.matrix) |\n"
+        f"| `DISCORD.md` | Configuring YOUR bot connection (chat_clients.discord) |\n"
+        f"| `CONFIG_REFERENCE.md` | Config structure, save_config rules |\n"
+        "| `PROVIDERS.md` | Multiple Ollama instances, Ollama Online, Anthropic |\n"
+        "| `CONTEXT_SIZE.md` | num_ctx, per-model context |\n"
+        "| `SCHEDULES.md` | Schedule tool, cron jobs |\n"
+        "| `SEARCH_ENGINES.md` | SearXNG setup |\n"
         "| `SUBAGENTS.md` | Worker models, invoke_model |\n"
-        "| `VISION.md` | Image analysis, vision models |\n"
-        "| `IMAGE_GENERATION.md` | Image generation, upload to Matrix/Discord |\n"
-        "| `DEBATE.md` | Structured multi-round AI debate, context management, parameters |\n"
-        "| `AVATARS.md` | Bot profile picture on Matrix/Discord |\n\n"
+        "| `VISION.md` | Image analysis |\n"
+        "| `IMAGE_GENERATION.md` | Image generation |\n"
+        "| `DEBATE.md` | Multi-round AI debate |\n"
+        "| `AVATARS.md` | Bot profile picture |\n\n"
     )
 
 
@@ -373,12 +356,21 @@ def _tools_section(config: dict[str, Any]) -> str:
     lines = ["## Tool rules"]
     sched_cfg = config.get("scheduler")
     if sched_cfg in (None, False) or sched_cfg is True or (isinstance(sched_cfg, dict) and sched_cfg.get("enabled", True)):
-        lines.append("- **Always use `schedule` instead of cron/crontab.** prompt = work instruction (not a pre-written answer).")
+        lines.append(
+            "- **Always use `schedule` instead of cron/crontab.**\n"
+            "  - prompt = work instruction to execute later. **NEVER copy a pre-written answer into prompt** — the bot re-executes the task fresh.\n"
+            "  - **Simple message** (user says 'schick mir X um Y Uhr' / 'send me X at Y'): prompt = `'Send this exact message to the user: \"X\"'` — NOT just `\"X\"` alone, or the bot will respond to it like a chat message.\n"
+            "  - **One-time** (user says 'einmalig', 'once', 'erinner mich', 'remind me'): set `once: true`.\n"
+            "  - **If the user asks to do something NOW and also schedule it:** do it now first, then create the schedule with the original task as prompt — not the result you just produced.\n"
+            "  - **Changing/editing a schedule** (user says 'ändere', 'verschiebe', 'update', 'change the schedule'): "
+            "first `action='list'` to find the old job ID, then `action='remove'` the old one, then `action='create'` the new one. Never leave the old job running.\n"
+            "- **After creating a schedule: always confirm it** — say what was scheduled, at what time, and what it will do (e.g. '✅ Benachrichtigung für 7:20 Uhr eingerichtet – ich hole dann die Wetterübersicht neu.')."
+        )
     lines.append(
-        "- `save_config`: **only for system config.** Pass only keys to change (deep-merged). After saving, tell the user to restart **miniassistant** (YOUR service, not matrix-synapse or any other program).\n"
-        "  Each provider has a `type` field (ollama, openai, etc.). Per-model options → `providers.<name>.model_options.\"model:tag\"` (NOT under models!). Quote `:` in YAML keys. think=bool, default=string.\n"
+        "- `save_config`: **only for system config** (see Persistence section). Pass only keys to change (deep-merged). After saving, tell the user to restart **miniassistant**.\n"
+        "  Per-model options → `providers.<name>.model_options.\"model:tag\"`. Quote `:` in YAML keys.\n"
         "  Valid options: temperature, top_p, top_k, num_ctx, num_predict, seed, min_p, stop, repeat_penalty, repetition_penalty, repeat_last_n, think.\n"
-        "  Read `docs/CONFIG_REFERENCE.md` (`cat` the file) for examples before any save_config call. **NEVER use save_config for user preferences** — prefs/*.md via exec."
+        "  Read `docs/CONFIG_REFERENCE.md` before any save_config call."
     )
     lines.append("- `check_url`: only when user explicitly asks to verify/check links.")
     lines.append(
@@ -517,13 +509,12 @@ def build_system_prompt(
         "# Role and context",
         "You are the assistant of **MiniAssistant**. The user may be chatting via the Web-UI or any configured chat client (Matrix, Discord, …).",
         "**Core rules:** "
-        "(1) **Just do it.** Don't overthink, don't hesitate. Use your tools, do the research, get to a result. The user wants to see results — not your thought process. (Exception: if the user asks *how* you would do something, explain first — then act only after they confirm.) "
-        "(2) **Research actively.** Before answering any question: search the web, read pages, check facts. Do not rely on your knowledge (= training data) — it is outdated. This applies to everything: technical questions, product info, current events, prices, weather, specs. "
+        "(1) **Just do it.** Use your tools immediately — don't explain what you *would* do, just do it. The user wants results, not your thought process. (Exception: if the user asks *how* you would do something, explain first — then act only after they confirm.) "
+        "(2) **Research actively.** Before answering any factual question: `web_search` first, then answer. Do not rely on your knowledge (= training data) — it is outdated. This applies to everything: technical questions, product info, current events, prices, weather, specs. "
         "(3) **Step by step.** One tool call at a time, check the result, then next step. "
-        "(4) **Real values only.** When a command needs config values (tokens, URLs, paths), read the relevant section from config first. Never use placeholder strings like `HOMESERVER` or `BOT_TOKEN` in commands. "
-        "(5) **Deliver results.** End with a clear, definitive answer based on what you found. Not what you think, not what you guess — what you verified. "
-        "(6) **Read docs yourself.** If you need a docs file, read it and follow the instructions — don't tell the user to read it. "
-        "(7) **Don't over-ask.** If you have enough information to proceed, just do it. Only ask when essential info is truly missing (e.g. credentials the config doesn't have).",
+        "(4) **Real values, real results.** Never use placeholder strings (`HOMESERVER`, `BOT_TOKEN`) — read config first. End with a clear, verified answer — not guesses. "
+        "(5) **Read docs yourself.** If you need a docs file, read it and follow the instructions — don't tell the user to read it. "
+        "(6) **Don't over-ask.** If you have enough information to proceed, just do it. Only ask when essential info is truly missing (e.g. credentials the config doesn't have).",
         "",
         "## Chat history",
         "Only reference prior messages when the user explicitly refers to them. Do not proactively resume older topics.",
@@ -548,8 +539,7 @@ def build_system_prompt(
         _prefs_section(config),
         _language_section(config, files.get("IDENTITY.md") or ""),
         _knowledge_verification_section(),
-        _system_section(),
-        _runtime_section(is_root),
+        _system_and_runtime_section(is_root),
         _safety_section(),
         _exec_behavior_section(),
         _persistence_section(config),

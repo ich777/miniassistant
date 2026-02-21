@@ -388,8 +388,8 @@ def _trim_messages_to_fit(
 
 _COMPACT_SYSTEM = (
     "Du bist ein Zusammenfassungs-Assistent. Fasse den Chatverlauf kurz und präzise zusammen.\n"
-    "Behalte: Fakten, Entscheidungen, offene Aufgaben, User-Präferenzen, wichtige Ergebnisse.\n"
-    "Format: Stichpunkte, max 300 Wörter. Antworte NUR mit der Zusammenfassung, keine Einleitung."
+    "Behalte: Fakten, Entscheidungen, offene Aufgaben, User-Präferenzen, wichtige Ergebnisse, Tool-Aufrufe und deren Resultate.\n"
+    "Format: Stichpunkte, max 400 Wörter. Antworte NUR mit der Zusammenfassung, keine Einleitung."
 )
 
 
@@ -420,21 +420,30 @@ def _needs_compacting(
 
 
 def _format_messages_for_summary(messages: list[dict[str, Any]]) -> str:
-    """Formatiert Messages als lesbaren Text für die Zusammenfassung."""
+    """Formatiert Messages als lesbaren Text für die Zusammenfassung.
+    Tool-Calls (leerer content aber tool_calls-Array) werden explizit erfasst."""
     lines: list[str] = []
     for m in messages:
         role = m.get("role", "?")
         content = (m.get("content") or "").strip()
-        if not content:
-            continue
+        tool_calls = m.get("tool_calls") or []
         if role == "tool":
-            lines.append(f"[Tool-Ergebnis]: {content[:300]}")
+            if content:
+                lines.append(f"[Tool-Ergebnis]: {content[:800]}")
         elif role == "assistant":
-            lines.append(f"Assistant: {content[:500]}")
+            for tc in tool_calls:
+                fn = (tc.get("function") or {})
+                name = fn.get("name", "?")
+                args = json.dumps(fn.get("arguments") or {}, ensure_ascii=False)
+                lines.append(f"[Tool-Aufruf: {name}({args[:300]})]")
+            if content:
+                lines.append(f"Assistant: {content[:800]}")
         elif role == "user":
-            lines.append(f"User: {content[:500]}")
+            if content:
+                lines.append(f"User: {content[:1000]}")
         elif role == "system":
-            lines.append(f"[System]: {content[:200]}")
+            if content:
+                lines.append(f"[System]: {content[:300]}")
     return "\n".join(lines)
 
 
@@ -969,6 +978,10 @@ def _run_tool(
                     parts.append(f'model={j["model"]}')
                 if j.get("once"):
                     parts.append("once")
+                if j.get("room_id"):
+                    parts.append(f'room={j["room_id"]}')
+                if j.get("channel_id"):
+                    parts.append(f'channel={j["channel_id"]}')
                 lines.append(f"- ID:{jid} | {when_str} | {' '.join(parts)}")
             return "\n".join(lines)
         if action == "remove":
@@ -992,7 +1005,11 @@ def _run_tool(
         sched_model = arguments.get("model", "").strip() or None
         if not cmd and not prompt:
             return "schedule requires 'command' and/or 'prompt'"
-        ok, msg = add_scheduled_job(when, command=cmd, prompt=prompt, client=client, once=bool(once), model=sched_model)
+        # Room/Channel aus chat_context automatisch uebernehmen
+        chat_ctx = config.get("_chat_context") or {}
+        sched_room_id = chat_ctx.get("room_id") if chat_ctx.get("platform") == "matrix" else None
+        sched_channel_id = chat_ctx.get("channel_id") if chat_ctx.get("platform") == "discord" else None
+        ok, msg = add_scheduled_job(when, command=cmd, prompt=prompt, client=client or chat_ctx.get("platform"), once=bool(once), model=sched_model, room_id=sched_room_id, channel_id=sched_channel_id)
         return f"Scheduled: {msg}" if ok else f"Schedule failed: {msg}"
     if name == "debate":
         topic = arguments.get("topic", "").strip()
@@ -2750,7 +2767,7 @@ def _onboarding_system_prompt(detected_system: dict[str, str]) -> str:
 **Fixed questions (ask in this order, do not invent):**
 1. **IDENTITY:** What should the assistant be called? **Which language should the assistant use for its replies?** (e.g. Deutsch, English) (optional: emoji e.g. 🤖; optional: vibe in one sentence)
 2. **SOUL:** Use default limits? (Run harmless commands without asking; answer briefly and factually; never expose tokens/passwords/private data) – or add/change something?
-3. **USER:** What should I call you? (Name, nickname), pronouns (Du/Sie or you/they). Timezone: show the detected timezone and ask if it's correct (if not, note the correct one and tell the user how to change it on the system). Optional preferences? Also ask: Would you like to tell me something about yourself? (hobbies, interests, job – anything that helps the assistant understand you better). **Important: USER.md has a 500 character limit.** Keep it concise.
+3. **USER:** What should I call you? (Name, nickname), pronouns (Du/Sie or you/they). Timezone: show the detected timezone and ask if it's correct (if not, note the correct one and tell the user how to change it on the system). **Country (optional):** Which country are you in? (e.g. Austria, Germany, Switzerland, USA). This helps the assistant search with local context (prices, shops, domains). If the user skips this, simply omit the country field from USER.md. Optional preferences? Also ask: Would you like to tell me something about yourself? (hobbies, interests, job – anything that helps the assistant understand you better). **Important: USER.md has a 500 character limit.** Keep it concise.
 4. **AVATAR (optional):** Do you have a profile picture/avatar for the bot? (PNG file path or URL, e.g. `~/avatar.png` or `https://example.org/bot.png`). Best format: PNG, square (256x256 or 512x512). If provided as URL, validate with `check_url` first, then download to `agent_dir/avatar.png`. If a file path, copy to `agent_dir/avatar.png`. Save path in config via `save_config({{avatar: "<path>"}})`. If skipped, the default logo is used.
 
 Optional: Any special paths or hints for the environment (TOOLS)? Otherwise the detected system above is enough.
@@ -2776,7 +2793,7 @@ You only provide content; the user saves via button. Exact headings: "## SOUL.md
 [Environment: detected system above; optional paths/hints from user. **No meta text like 'Onboarding done' – only real environment info.**]
 
 ## USER.md
-[Name, nickname, pronouns, timezone; optional preferences (e.g. short/long answers)]
+[Name, nickname, pronouns, timezone, country; optional preferences (e.g. short/long answers)]
 
 **Important:** The four blocks must contain ONLY the actual file content. Do NOT add commentary, status messages, or text like "Onboarding complete" inside any block.
 """

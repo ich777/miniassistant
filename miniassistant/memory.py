@@ -87,17 +87,17 @@ def get_memory_for_prompt(
 ) -> str | None:
     """
     Liest Memory der letzten `days` Tage; Wert aus Config (memory.days), Default 2 (heute + gestern).
-    Bis zu `max_lines` Zeilen. Zeilen auf `max_chars_per_line` gekürzt (Config memory.max_chars_per_line, Default 300). 0 = keine Kürzung.
-    Token-Budget: `max_tokens` (Config memory.max_tokens, Default 6000). Stoppt wenn Budget erschöpft.
+    Bis zu `max_lines` Zeilen. Zeilen auf `max_chars_per_line` gekürzt (Config memory.max_chars_per_line, Default 100). 0 = keine Kürzung.
+    Token-Budget: `max_tokens` (Config memory.max_tokens, Default 1500). Stoppt wenn Budget erschöpft.
     Returns None wenn kein Memory existiert.
     """
     config = load_config(project_dir) if (max_chars_per_line is None or days is None or max_tokens is None) else None
     if max_chars_per_line is None:
-        max_chars_per_line = int((config.get("memory") or {}).get("max_chars_per_line", 300) or 300)
+        max_chars_per_line = int((config.get("memory") or {}).get("max_chars_per_line", 100) or 100)
     if days is None:
         days = int((config.get("memory") or {}).get("days", 2) or 2)
     if max_tokens is None:
-        max_tokens = int((config.get("memory") or {}).get("max_tokens", 6000) or 6000)
+        max_tokens = int((config.get("memory") or {}).get("max_tokens", 1500) or 1500)
     d = memory_dir(project_dir)
     if not d.exists():
         return None

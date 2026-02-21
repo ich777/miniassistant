@@ -491,11 +491,26 @@ async def schedules_page(request: Request):
             # Aufgabe zusammenbauen
             task_parts = []
             if j.get("prompt"):
-                task_parts.append(_escape(j["prompt"][:80]))
+                full_prompt = _escape(j["prompt"])
+                if len(j["prompt"]) > 80:
+                    short = _escape(j["prompt"][:80])
+                    task_parts.append(f'<details><summary>{short}…</summary><div class="prompt-full">{full_prompt}</div></details>')
+                else:
+                    task_parts.append(full_prompt)
             if j.get("command"):
-                task_parts.append(f'<code>{_escape(j["command"][:60])}</code>')
+                full_cmd = _escape(j["command"])
+                if len(j["command"]) > 60:
+                    short_cmd = _escape(j["command"][:60])
+                    task_parts.append(f'<details><summary><code>{short_cmd}…</code></summary><div class="prompt-full"><code>{full_cmd}</code></div></details>')
+                else:
+                    task_parts.append(f'<code>{full_cmd}</code>')
             task = "<br>".join(task_parts) if task_parts else "?"
-            client = _escape(j.get("client") or "alle")
+            client_str = j.get("client") or "alle"
+            if j.get("room_id"):
+                client_str += f' <span style="font-size:0.8em;color:var(--muted);" title="{_escape(j["room_id"])}">📍Raum</span>'
+            elif j.get("channel_id"):
+                client_str += f' <span style="font-size:0.8em;color:var(--muted);" title="{_escape(j["channel_id"])}">📍Channel</span>'
+            client = client_str
             model = _escape(j.get("model") or "default")
             once_tag = ' <span style="color:var(--muted);font-size:0.8em;">einmalig</span>' if j.get("once") else ""
             full_id = _escape(j.get("id", ""))
@@ -520,6 +535,9 @@ async def schedules_page(request: Request):
     .btn-del {{ background: none; border: 1.5px solid var(--danger); color: var(--danger); border-radius: 4px;
       cursor: pointer; padding: 0.15em 0.4em; font-size: 0.85em; line-height: 1; transition: background 0.15s; }}
     .btn-del:hover {{ background: var(--danger); color: #fff; }}
+    details {{ cursor: pointer; }}
+    details summary {{ display: inline; }}
+    details .prompt-full {{ margin-top: 0.4em; white-space: pre-wrap; word-break: break-word; padding: 0.4em; background: var(--bg-secondary, #f5f5f5); border-radius: 4px; font-size: 0.9em; }}
     </style>
     </head><body>
     <div class="sched-wrap">
