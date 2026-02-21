@@ -276,6 +276,11 @@ providers:
 ```
 Models on the second provider are used with prefix: `ollama2/llama3.3:70b` or `ollama2/big`. Without prefix, the first provider (default) is used.
 
+**Save GitHub token** (injected as `$GH_TOKEN` in every exec call — NEVER under `providers.github`):
+```yaml
+github_token: github_pat_xxx...
+```
+
 **Add a search engine:**
 ```yaml
 search_engines:

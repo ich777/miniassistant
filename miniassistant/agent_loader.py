@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from miniassistant.config import load_config
+from miniassistant.config import load_config, config_path
 from miniassistant.memory import get_memory_for_prompt
 from miniassistant.basic_rules.loader import ensure_and_load as _load_basic_rules, get_rule as _get_rule
 
@@ -288,6 +288,7 @@ def _docs_reference_section(project_dir: str | None) -> str:
         "| `PROVIDERS.md` | Multiple Ollama instances, Ollama Online, Anthropic |\n"
         "| `CONTEXT_SIZE.md` | num_ctx, per-model context |\n"
         "| `SCHEDULES.md` | Schedule tool, cron jobs |\n"
+        "| `GITHUB.md` | GitHub REST API, token usage |\n"
         "| `SEARCH_ENGINES.md` | SearXNG setup |\n"
         "| `SUBAGENTS.md` | Worker models, invoke_model |\n"
         "| `VISION.md` | Image analysis |\n"
@@ -369,23 +370,11 @@ def _tools_section(config: dict[str, Any]) -> str:
         "  Valid options: temperature, top_p, top_k, num_ctx, num_predict, seed, min_p, stop, repeat_penalty, repetition_penalty, repeat_last_n, think.\n"
         "  Read `docs/CONFIG_REFERENCE.md` before any save_config call."
     )
-    if config.get("github_token"):
-        lines.append(
-            "- **GitHub:** `GH_TOKEN` and `GITHUB_TOKEN` are set automatically in every `exec` call. "
-            "Use `gh` CLI for all GitHub tasks — never tell the user to open GitHub themselves:\n"
-            "  - Issues: `gh issue list --repo OWNER/REPO --state open` or `gh api repos/OWNER/REPO --jq .open_issues_count`\n"
-            "  - PRs: `gh pr list --repo OWNER/REPO`\n"
-            "  - Repo info: `gh repo view OWNER/REPO`\n"
-            "  - Clone private repo: `git clone https://github.com/OWNER/REPO`\n"
-            "  Never echo or print the token value."
-        )
-    else:
-        lines.append(
-            "- **GitHub token:** If the user wants to save a GitHub token (or any API token for exec use): "
-            "use `save_config` with `{\"github_token\": \"TOKEN\"}` (any format: ghp_..., github_pat_..., etc.) — it is stored in config.yaml (not in prefs) "
-            "and injected automatically as `GH_TOKEN`/`GITHUB_TOKEN` into every exec call. "
-            "Never save tokens to prefs/ files."
-        )
+    lines.append(
+        "- **GitHub:** Use REST API via `curl` — NEVER `gh` CLI, NEVER `gh auth`, NEVER tell the user to set up auth. "
+        "`$GH_TOKEN` is already injected in every exec call — no setup needed. "
+        "Read `docs/GITHUB.md` for curl examples."
+    )
     lines.append("- `check_url`: only when user explicitly asks to verify/check links.")
     lines.append(
         "- `read_url`: Read the actual content of a web page. Use this to read URLs found during research, "

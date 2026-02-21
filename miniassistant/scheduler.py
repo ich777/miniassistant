@@ -62,13 +62,22 @@ def _run_scheduled_job(job_id: str, job_data: str) -> None:
             cmd_output = f"Fehler: {e}"
             logger.exception("Job %s exec fehlgeschlagen", job_id[:8])
 
+    # Autonomie-Präfix: Scheduled-Bot weiß dass er keine Rückfragen stellen kann
+    _SCHEDULE_PREFIX = (
+        "[SCHEDULED TASK — autonomous mode] "
+        "You are executing a scheduled task. The user is NOT present and cannot respond. "
+        "Complete the task fully on your own using your tools (exec, web_search, gh CLI, etc.). "
+        "NEVER give instructions to the user, NEVER ask follow-up questions, NEVER say 'you can do X'. "
+        "Just do it, deliver the result.\n\n"
+    )
+
     # Prompt ausfuehren (Bot aufwecken)
     if prompt:
         try:
-            full_prompt = prompt
+            full_prompt = _SCHEDULE_PREFIX + prompt
             if cmd_output:
-                full_prompt = f"{prompt}\n\nAusgabe des Befehls:\n{cmd_output}"
-            logger.info("Job %s prompt (model=%s): %s", job_id[:8], model or "default", full_prompt[:80])
+                full_prompt = f"{full_prompt}\n\nAusgabe des Befehls:\n{cmd_output}"
+            logger.info("Job %s prompt (model=%s): %s", job_id[:8], model or "default", prompt[:80])
             response = _run_prompt(full_prompt, model=model)
             logger.info("Job %s antwort: %d Zeichen", job_id[:8], len(response))
             _send_to_client(response, client, room_id=room_id, channel_id=channel_id)

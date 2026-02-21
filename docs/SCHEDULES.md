@@ -11,7 +11,7 @@ Scheduled tasks are managed by the **schedule** tool and stored in `schedules.js
 - `model`: model alias to use (only set if user explicitly requests it)
 
 ## Prompt rules — critical
-- **Plain language only.** Write WHAT to do, not HOW: `'List open issues from GitHub repo OWNER/REPO using gh CLI'` ✅ — NOT `exec: gh issue list ...` ❌
+- **Plain language only.** Write WHAT to do, not HOW: `'List open issues from GitHub repo OWNER/REPO via GitHub API'` ✅ — NOT `exec: curl ...` ❌
 - **Never copy a result into prompt.** The bot fetches fresh data at execution time.
 - **Never show a preview** of what the result might look like — the schedule hasn't run yet.
 - **Simple message** (user says "schick mir X um Y Uhr"): `prompt='Send this exact message to the user: "X"'` — NOT just `"X"` alone or the bot will reply to it like a greeting.
