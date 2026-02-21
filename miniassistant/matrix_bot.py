@@ -64,20 +64,19 @@ def send_message_to_user(target_user_id: str, message: str) -> bool:
         return False
 
 
-def send_message_to_room(room_id: str, message: str) -> bool:
+def send_message_to_room(room_id: str, message: str, keep_typing: bool = True) -> bool:
     """Thread-safe: Sendet eine Textnachricht in einen bestimmten Raum.
-    Wird von status_update Tool aufgerufen. Gibt True bei Erfolg zurueck.
-    Stellt Typing-Indikator nach dem Senden sofort wieder her."""
+    keep_typing=True (default): Typing-Indikator nach dem Senden wiederherstellen (für status_update mid-processing).
+    keep_typing=False: Typing-Indikator nach dem Senden ausschalten (für finale Nachrichten, z.B. Scheduler)."""
     if not _bot_client or not _bot_loop or not _bot_send_fn:
         return False
 
     async def _do_send() -> bool:
         await _bot_send_fn(_bot_client, room_id, message)
-        # Typing-Indikator sofort wiederherstellen (Senden löscht ihn serverseitig)
         room_typing = getattr(_bot_client, "room_typing", None)
         if callable(room_typing):
             try:
-                await room_typing(room_id, True)
+                await room_typing(room_id, keep_typing)
             except Exception:
                 pass
         return True

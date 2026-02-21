@@ -113,7 +113,7 @@ def _send_matrix_to_room(mc: dict[str, Any], message: str, room_id: str) -> str:
     # Bevorzugt: ueber den laufenden Bot-Client senden (E2EE-faehig)
     try:
         from miniassistant.matrix_bot import send_message_to_room
-        if send_message_to_room(room_id, message):
+        if send_message_to_room(room_id, message, keep_typing=False):
             logger.info("Matrix -> Room %s (via Bot)", room_id)
             return f"gesendet in Raum {room_id}"
     except (ImportError, Exception) as e:
