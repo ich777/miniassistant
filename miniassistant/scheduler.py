@@ -66,7 +66,7 @@ def _run_scheduled_job(job_id: str, job_data: str) -> None:
     _SCHEDULE_PREFIX = (
         "[SCHEDULED TASK — autonomous mode] "
         "You are executing a scheduled task. The user is NOT present and cannot respond. "
-        "Complete the task fully on your own using your tools (exec, web_search, gh CLI, etc.). "
+        "Complete the task fully on your own using your tools (exec, web_search, read_url, etc.). "
         "NEVER give instructions to the user, NEVER ask follow-up questions, NEVER say 'you can do X'. "
         "Just do it, deliver the result.\n\n"
     )

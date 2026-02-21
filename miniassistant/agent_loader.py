@@ -359,7 +359,7 @@ def _tools_section(config: dict[str, Any]) -> str:
     if sched_cfg in (None, False) or sched_cfg is True or (isinstance(sched_cfg, dict) and sched_cfg.get("enabled", True)):
         lines.append(
             "- **Always use `schedule` instead of cron/crontab.** "
-            "prompt = plain language task (e.g. `'List open issues from GitHub repo OWNER/REPO using gh CLI'`) — "
+            "prompt = plain language task (e.g. `'List open issues from GitHub repo OWNER/REPO'`) — "
             "NO shell commands, NO exec:/tool syntax, NO pre-written answers, NO result previews. "
             "After creating: confirm what was scheduled, when, and what it will do. "
             "Read `docs/SCHEDULES.md` for edge cases (once, simple messages, editing, now+schedule)."
