@@ -162,6 +162,7 @@ def write_config_raw(content: str, project_dir: str | None = None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     backup_config(path)
     path.write_text(content, encoding="utf-8")
+    path.chmod(0o600)
     return path
 
 
@@ -371,6 +372,7 @@ def _merge_with_defaults(data: dict[str, Any]) -> dict[str, Any]:
         "vision": _parse_model_ref_list(data.get("vision")),
         "image_generation": _parse_model_ref_list(data.get("image_generation")),
         "avatar": (data.get("avatar") or "").strip() or None,
+        "github_token": (data.get("github_token") or "").strip() or None,
     }
 
 
@@ -453,8 +455,11 @@ def save_config(config: dict[str, Any], project_dir: str | None = None) -> Path:
         out["image_generation"] = config["image_generation"]
     if config.get("avatar"):
         out["avatar"] = config["avatar"]
+    if config.get("github_token"):
+        out["github_token"] = config["github_token"]
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(out, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    path.chmod(0o600)
     return path
 
 

@@ -367,7 +367,7 @@ def _tools_schema(
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["create", "list", "remove"], "description": "create (default), list, or remove"},
-                        "prompt": {"type": "string", "description": "Task to execute at the scheduled time. Examples: 'Search weather for City X from 3 sources and summarize' or 'Send this exact message to the user: \"Hallo!\"'. NEVER paste a pre-written answer — write the task, not the result!"},
+                        "prompt": {"type": "string", "description": "Plain language task to execute at the scheduled time. Examples: 'List open issues from GitHub repo OWNER/REPO using gh CLI' or 'Search weather for City X from 3 sources and summarize'. NEVER put shell commands or exec:/tool syntax here — write WHAT to do, not HOW. NEVER paste a pre-written answer."},
                         "command": {"type": "string", "description": "Shell command to run (optional). Output is included in prompt context if both set."},
                         "when": {"type": "string", "description": "Cron 5 fields in local system time (e.g. '30 7 * * *' = 7:30) or 'in 30 minutes' / 'in 1 hour'"},
                         "client": {"type": "string", "description": "Target chat client: 'matrix', 'discord', or omit for current. Results are sent to the room/channel where the schedule was created."},

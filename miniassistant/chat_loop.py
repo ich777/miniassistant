@@ -393,6 +393,16 @@ _COMPACT_SYSTEM = (
 )
 
 
+def _exec_env(config: dict[str, Any]) -> dict[str, str] | None:
+    """Baut Extra-Umgebungsvariablen für run_exec aus der Config (z. B. GitHub-Token)."""
+    env: dict[str, str] = {}
+    github_token = (config.get("github_token") or "").strip()
+    if github_token:
+        env["GH_TOKEN"] = github_token
+        env["GITHUB_TOKEN"] = github_token
+    return env or None
+
+
 def _context_budget(config: dict[str, Any], num_ctx: int) -> int:
     """Max erlaubte Tokens (system + tools + messages) basierend auf context_quota."""
     quota = float((config.get("chat") or {}).get("context_quota", 0.85) or 0.85)
@@ -704,6 +714,13 @@ def _validate_provider_config(merged: dict) -> str | None:
     providers = merged.get("providers")
     if not isinstance(providers, dict):
         return None  # Kein providers-Block → nichts zu validieren
+    # github ist kein Ollama-Provider — github_token ist ein Top-Level-Key
+    if "github" in providers:
+        return (
+            "There is no 'github' provider. "
+            "To save a GitHub token use the top-level key: save_config with {github_token: 'YOUR_TOKEN'}. "
+            "Do NOT put it under providers."
+        )
     for prov_name, prov_cfg in providers.items():
         if not isinstance(prov_cfg, dict):
             continue
@@ -870,7 +887,7 @@ def _run_tool(
     if name == "exec":
         cmd = arguments.get("command", "")
         workspace = (config.get("workspace") or "").strip() or None
-        result = run_exec(cmd, cwd=workspace)
+        result = run_exec(cmd, cwd=workspace, extra_env=_exec_env(config))
         return f"returncode: {result['returncode']}\nstdout:\n{result['stdout']}\nstderr:\n{result['stderr']}"
     if name == "web_search":
         query = arguments.get("query", "")
@@ -1519,7 +1536,7 @@ def _run_subagent_anthropic(
                 tool_result = f"Tool '{tc_name}' is not available for subagents."
             elif tc_name == "exec":
                 _ws = (config.get("workspace") or "").strip() or None
-                _exec_r = run_exec(tc_args.get("command", ""), cwd=_ws)
+                _exec_r = run_exec(tc_args.get("command", ""), cwd=_ws, extra_env=_exec_env(config))
                 tool_result = f"returncode: {_exec_r['returncode']}\nstdout:\n{_exec_r['stdout']}\nstderr:\n{_exec_r['stderr']}"
             elif tc_name == "web_search":
                 from miniassistant.config import get_search_engine_url
@@ -1612,7 +1629,7 @@ def _run_subagent_google(
                 tool_result = f"Tool '{tc_name}' is not available for subagents."
             elif tc_name == "exec":
                 _ws = (config.get("workspace") or "").strip() or None
-                _exec_r = run_exec(tc_args.get("command", ""), cwd=_ws)
+                _exec_r = run_exec(tc_args.get("command", ""), cwd=_ws, extra_env=_exec_env(config))
                 tool_result = f"returncode: {_exec_r['returncode']}\nstdout:\n{_exec_r['stdout']}\nstderr:\n{_exec_r['stderr']}"
             elif tc_name == "web_search":
                 from miniassistant.config import get_search_engine_url
@@ -1761,7 +1778,7 @@ def _run_subagent_openai(
                 tool_result = f"Tool '{tc_name}' is not available for subagents."
             elif tc_name == "exec":
                 _ws = (config.get("workspace") or "").strip() or None
-                _exec_r = run_exec(tc_args.get("command", ""), cwd=_ws)
+                _exec_r = run_exec(tc_args.get("command", ""), cwd=_ws, extra_env=_exec_env(config))
                 tool_result = f"returncode: {_exec_r['returncode']}\nstdout:\n{_exec_r['stdout']}\nstderr:\n{_exec_r['stderr']}"
             elif tc_name == "web_search":
                 from miniassistant.config import get_search_engine_url
@@ -1870,7 +1887,7 @@ def _run_subagent_with_tools(
                 tool_result = f"Tool '{tc_name}' is not available for subagents."
             elif tc_name == "exec":
                 _ws = (config.get("workspace") or "").strip() or None
-                _exec_r = run_exec(tc_args.get("command", ""), cwd=_ws)
+                _exec_r = run_exec(tc_args.get("command", ""), cwd=_ws, extra_env=_exec_env(config))
                 tool_result = f"returncode: {_exec_r['returncode']}\nstdout:\n{_exec_r['stdout']}\nstderr:\n{_exec_r['stderr']}"
             elif tc_name == "web_search":
                 from miniassistant.config import get_search_engine_url

@@ -63,6 +63,7 @@ workspace: ~/workspace                  # default: ~/workspace
 trash_dir: ~/.trash                     # default: ~/.trash (separate from workspace)
 max_chars_per_file: 500                   # max chars per agent file in system prompt
 max_tool_rounds: 15                       # max tool call rounds per chat message (default: 15)
+github_token: github_pat_xxx...           # optional: any token format (ghp_..., github_pat_...) — injected as GH_TOKEN/GITHUB_TOKEN into every exec call
 
 search_engines:
   main:

@@ -357,14 +357,11 @@ def _tools_section(config: dict[str, Any]) -> str:
     sched_cfg = config.get("scheduler")
     if sched_cfg in (None, False) or sched_cfg is True or (isinstance(sched_cfg, dict) and sched_cfg.get("enabled", True)):
         lines.append(
-            "- **Always use `schedule` instead of cron/crontab.**\n"
-            "  - prompt = work instruction to execute later. **NEVER copy a pre-written answer into prompt** — the bot re-executes the task fresh.\n"
-            "  - **Simple message** (user says 'schick mir X um Y Uhr' / 'send me X at Y'): prompt = `'Send this exact message to the user: \"X\"'` — NOT just `\"X\"` alone, or the bot will respond to it like a chat message.\n"
-            "  - **One-time** (user says 'einmalig', 'once', 'erinner mich', 'remind me'): set `once: true`.\n"
-            "  - **If the user asks to do something NOW and also schedule it:** do it now first, then create the schedule with the original task as prompt — not the result you just produced.\n"
-            "  - **Changing/editing a schedule** (user says 'ändere', 'verschiebe', 'update', 'change the schedule'): "
-            "first `action='list'` to find the old job ID, then `action='remove'` the old one, then `action='create'` the new one. Never leave the old job running.\n"
-            "- **After creating a schedule: always confirm it** — say what was scheduled, at what time, and what it will do (e.g. '✅ Benachrichtigung für 7:20 Uhr eingerichtet – ich hole dann die Wetterübersicht neu.')."
+            "- **Always use `schedule` instead of cron/crontab.** "
+            "prompt = plain language task (e.g. `'List open issues from GitHub repo OWNER/REPO using gh CLI'`) — "
+            "NO shell commands, NO exec:/tool syntax, NO pre-written answers, NO result previews. "
+            "After creating: confirm what was scheduled, when, and what it will do. "
+            "Read `docs/SCHEDULES.md` for edge cases (once, simple messages, editing, now+schedule)."
         )
     lines.append(
         "- `save_config`: **only for system config** (see Persistence section). Pass only keys to change (deep-merged). After saving, tell the user to restart **miniassistant**.\n"
@@ -372,6 +369,23 @@ def _tools_section(config: dict[str, Any]) -> str:
         "  Valid options: temperature, top_p, top_k, num_ctx, num_predict, seed, min_p, stop, repeat_penalty, repetition_penalty, repeat_last_n, think.\n"
         "  Read `docs/CONFIG_REFERENCE.md` before any save_config call."
     )
+    if config.get("github_token"):
+        lines.append(
+            "- **GitHub:** `GH_TOKEN` and `GITHUB_TOKEN` are set automatically in every `exec` call. "
+            "Use `gh` CLI for all GitHub tasks — never tell the user to open GitHub themselves:\n"
+            "  - Issues: `gh issue list --repo OWNER/REPO --state open` or `gh api repos/OWNER/REPO --jq .open_issues_count`\n"
+            "  - PRs: `gh pr list --repo OWNER/REPO`\n"
+            "  - Repo info: `gh repo view OWNER/REPO`\n"
+            "  - Clone private repo: `git clone https://github.com/OWNER/REPO`\n"
+            "  Never echo or print the token value."
+        )
+    else:
+        lines.append(
+            "- **GitHub token:** If the user wants to save a GitHub token (or any API token for exec use): "
+            "use `save_config` with `{\"github_token\": \"TOKEN\"}` (any format: ghp_..., github_pat_..., etc.) — it is stored in config.yaml (not in prefs) "
+            "and injected automatically as `GH_TOKEN`/`GITHUB_TOKEN` into every exec call. "
+            "Never save tokens to prefs/ files."
+        )
     lines.append("- `check_url`: only when user explicitly asks to verify/check links.")
     lines.append(
         "- `read_url`: Read the actual content of a web page. Use this to read URLs found during research, "
@@ -406,6 +420,7 @@ def _tools_section(config: dict[str, Any]) -> str:
             "  Do NOT do the work yourself after a subagent failure — ask the user how to proceed.\n"
             "  If result is incomplete: re-invoke with a continuation instruction, or ask the user.\n"
             "  **Sanity-check results:** If a subagent found concrete data (links, prices, products) but then concludes 'doesn't exist' or 'not available' — that is contradictory. Present the actual findings, not the wrong conclusion. Subagents may have outdated knowledge (= outdated training data).\n"
+            "  **If subagent returns raw JSON instead of a result:** the subagent failed to execute — do NOT pretend it succeeded. Either retry the subagent or do the task yourself with your own tools.\n"
             "  Present the subagent's result directly — never redo it yourself."
         )
         if sub_display:
@@ -511,6 +526,7 @@ def build_system_prompt(
         "**Core rules:** "
         "(1) **Just do it.** Use your tools immediately — don't explain what you *would* do, just do it. The user wants results, not your thought process. (Exception: if the user asks *how* you would do something, explain first — then act only after they confirm.) "
         "(2) **Research actively.** Before answering any factual question: `web_search` first, then answer. Do not rely on your knowledge (= training data) — it is outdated. This applies to everything: technical questions, product info, current events, prices, weather, specs. "
+        "**Exception:** Questions about your own capabilities, tools, or behavior (e.g. 'kannst du suchen?', 'hast du ein Tool für X?') → answer from your system prompt, do NOT web_search. "
         "(3) **Step by step.** One tool call at a time, check the result, then next step. "
         "(4) **Real values, real results.** Never use placeholder strings (`HOMESERVER`, `BOT_TOKEN`) — read config first. End with a clear, verified answer — not guesses. "
         "(5) **Read docs yourself.** If you need a docs file, read it and follow the instructions — don't tell the user to read it. "

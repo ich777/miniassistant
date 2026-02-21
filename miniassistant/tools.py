@@ -30,23 +30,27 @@ def _fix_heredoc_quotes(cmd: str) -> str:
     return _HEREDOC_BAD_QUOTE.sub(_repl, cmd)
 
 
-def run_exec(command: str, timeout: int = 60, cwd: str | None = None) -> dict[str, Any]:
+def run_exec(command: str, timeout: int = 60, cwd: str | None = None, extra_env: dict[str, str] | None = None) -> dict[str, Any]:
     """
     Führt einen Shell-Befehl aus. Gibt stdout, stderr und returncode zurück.
     cwd: Working directory (default: Workspace aus Config, sonst Process-CWD).
+    extra_env: Zusätzliche Umgebungsvariablen (z. B. GH_TOKEN) — werden zu os.environ gemergt.
     Kein sudo-Handling hier – die KI weiß aus dem System-Prompt ob sie root ist.
     """
+    import os
     try:
         command = _fix_heredoc_quotes(command)
         if cwd:
             from pathlib import Path
             Path(cwd).mkdir(parents=True, exist_ok=True)
+        env = {**os.environ, **(extra_env or {})}
         result = subprocess.run(
             ["sh", "-c", command],
             capture_output=True,
             text=True,
             timeout=timeout,
             cwd=cwd or None,
+            env=env,
         )
         return {
             "stdout": result.stdout or "",

@@ -376,7 +376,7 @@ async def config_page(request: Request):
     # Sensitive Werte maskieren (nur Anzeige, beim Speichern bleibt Original wenn nicht geändert)
     import re
     def _mask_secrets(text: str) -> str:
-        pattern = r'((?:api_key|token|bot_token):\s*)(\S+)'
+        pattern = r'((?:api_key|token|bot_token|github_token):\s*)(\S+)'
         return re.sub(pattern, lambda m: m.group(1) + m.group(2)[:4] + '****' if len(m.group(2)) > 4 else m.group(0), text)
     display_raw = _mask_secrets(raw)
     raw_b64 = base64.b64encode(display_raw.encode("utf-8")).decode("ascii")

@@ -10,7 +10,7 @@ Your training data is outdated. You do NOT know what is current, even if you fee
 This applies to EVERYTHING: prices, software versions, hardware specs, dates, people, events, weather, statistics, product availability.
 
 ### Different sources
-- If the user says differnt sources he means it - make sure to get different sources, if you don't know what sources to use research it first
+- If the user says different sources he means it - make sure to get different sources, if you don't know what sources to use research it first
 - Make sure the sources are different - if using the websearch make sure that the base URL is different (https://bergfex.at/wetter and http://bergfex.at/prognose is the same!)
 
 ### Minimum 2 sources — up to 5 if contradictory
