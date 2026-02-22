@@ -49,5 +49,9 @@ Repository = "https://github.com/miniassistant/miniassistant"
 where = ["."]
 include = ["miniassistant*"]
 
+[tool.setuptools.package-data]
+"miniassistant.basic_rules" = ["*.md"]
+"miniassistant.docs" = ["*.md"]
+
 [tool.setuptools.package-dir]
 "" = "."

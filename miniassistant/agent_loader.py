@@ -12,6 +12,7 @@ from typing import Any
 from miniassistant.config import load_config, config_path
 from miniassistant.memory import get_memory_for_prompt
 from miniassistant.basic_rules.loader import ensure_and_load as _load_basic_rules, get_rule as _get_rule
+from miniassistant.docs.loader import ensure_docs as _ensure_docs, docs_dir_path as _docs_dir_path_from_config
 
 
 def _is_root() -> bool:
@@ -226,20 +227,17 @@ def _persistence_section(config: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _planning_section(config: dict[str, Any], project_dir: str | None) -> str:
+def _planning_section(config: dict[str, Any]) -> str:
     """Kompakte Anweisung für Task-Planning (Plan-Dateien im Workspace)."""
     workspace = (config.get("workspace") or "").strip()
     if not workspace:
         return ""
     ws = str(Path(workspace).expanduser().resolve())
-    # Pfad zu PLANNING.md (Referenzdatei)
+    # Pfad zu PLANNING.md (aus agent_dir/docs/ oder Package-Fallback)
     planning_md = None
-    if project_dir:
-        p = Path(project_dir).expanduser().resolve() / "docs" / "PLANNING.md"
-        if p.exists():
-            planning_md = str(p)
-    if not planning_md:
-        p = Path(__file__).resolve().parent.parent / "docs" / "PLANNING.md"
+    docs = _docs_dir_path_from_config(config)
+    if docs:
+        p = docs / "PLANNING.md"
         if p.exists():
             planning_md = str(p)
     lines = [
@@ -257,20 +255,14 @@ def _planning_section(config: dict[str, Any], project_dir: str | None) -> str:
     return "\n".join(lines)
 
 
-def _docs_dir_path(project_dir: str | None) -> Path | None:
-    """Path to docs/ directory. Prefer project_dir, else repo docs."""
-    if project_dir:
-        p = Path(project_dir).expanduser().resolve() / "docs"
-        if p.is_dir():
-            return p
-    base = Path(__file__).resolve().parent.parent
-    p = base / "docs"
-    return p if p.is_dir() else None
+def _docs_dir_path(config: dict[str, Any]) -> Path | None:
+    """Path to docs/ directory. Uses agent_dir/docs/ (synced by docs loader) or package fallback."""
+    return _docs_dir_path_from_config(config)
 
 
-def _docs_reference_section(project_dir: str | None) -> str:
+def _docs_reference_section(config: dict[str, Any]) -> str:
     """Docs-Verzeichnis mit Einzeldateien. Agent liest nur die Datei die er braucht."""
-    docs = _docs_dir_path(project_dir)
+    docs = _docs_dir_path(config)
     if not docs:
         return ""
     d = str(docs)
@@ -287,8 +279,8 @@ def _docs_reference_section(project_dir: str | None) -> str:
         f"| `CONFIG_REFERENCE.md` | Config structure, save_config rules |\n"
         "| `PROVIDERS.md` | Multiple Ollama instances, Ollama Online, Anthropic |\n"
         "| `CONTEXT_SIZE.md` | num_ctx, per-model context |\n"
-        "| `SCHEDULES.md` | Schedule tool, cron jobs |\n"
-        "| `GITHUB.md` | GitHub REST API, token usage |\n"
+        "| `SCHEDULES.md` | Schedule tool, cron jobs, workspace cleanup protection |\n"
+        "| `GITHUB.md` | GitHub REST API, token usage, repo tracking |\n"
         "| `SEARCH_ENGINES.md` | SearXNG setup |\n"
         "| `SUBAGENTS.md` | Worker models, invoke_model |\n"
         "| `VISION.md` | Image analysis |\n"
@@ -354,6 +346,8 @@ def _exec_behavior_section() -> str:
 
 def _tools_section(config: dict[str, Any]) -> str:
     """Nur Verhaltensregeln fuer Tools – Details stehen bereits im Tool-Schema."""
+    docs = _docs_dir_path(config)
+    docs_prefix = str(docs) + "/" if docs else "docs/"
     lines = ["## Tool rules"]
     sched_cfg = config.get("scheduler")
     if sched_cfg in (None, False) or sched_cfg is True or (isinstance(sched_cfg, dict) and sched_cfg.get("enabled", True)):
@@ -362,18 +356,18 @@ def _tools_section(config: dict[str, Any]) -> str:
             "prompt = plain language task (e.g. `'List open issues from GitHub repo OWNER/REPO'`) — "
             "NO shell commands, NO exec:/tool syntax, NO pre-written answers, NO result previews. "
             "After creating: confirm what was scheduled, when, and what it will do. "
-            "Read `docs/SCHEDULES.md` for edge cases (once, simple messages, editing, now+schedule)."
+            f"Read `{docs_prefix}SCHEDULES.md` for edge cases (once, simple messages, editing, now+schedule)."
         )
     lines.append(
         "- `save_config`: **only for system config** (see Persistence section). Pass only keys to change (deep-merged). After saving, tell the user to restart **miniassistant**.\n"
         "  Per-model options → `providers.<name>.model_options.\"model:tag\"`. Quote `:` in YAML keys.\n"
         "  Valid options: temperature, top_p, top_k, num_ctx, num_predict, seed, min_p, stop, repeat_penalty, repetition_penalty, repeat_last_n, think.\n"
-        "  Read `docs/CONFIG_REFERENCE.md` before any save_config call."
+        f"  Read `{docs_prefix}CONFIG_REFERENCE.md` before any save_config call."
     )
     lines.append(
         "- **GitHub:** Use REST API via `curl` — NEVER `gh` CLI, NEVER `gh auth`, NEVER tell the user to set up auth. "
         "`$GH_TOKEN` is already injected in every exec call — no setup needed. "
-        "Read `docs/GITHUB.md` for curl examples."
+        f"Read `{docs_prefix}GITHUB.md` for curl examples and **repo tracking** setup."
     )
     lines.append("- `check_url`: only when user explicitly asks to verify/check links.")
     lines.append(
@@ -424,7 +418,7 @@ def _tools_section(config: dict[str, Any]) -> str:
             "  Between rounds, previous arguments are automatically summarized so small models keep context.\n"
             "  Parameters: `topic`, `perspective_a`, `perspective_b`, `model` (required), `model_b` (optional), `rounds` (1-10, default 3), `language`.\n"
             "  You choose the perspectives — e.g. for weather: 'Wetter wird besser' vs. 'Wetter bleibt schlecht'.\n"
-            "  Read `docs/DEBATE.md` for details."
+            f"  Read `{docs_prefix}DEBATE.md` for details."
         )
     cc = config.get("chat_clients") or {}
     clients = []
@@ -460,7 +454,9 @@ def _vision_section(config: dict[str, Any]) -> str:
         models_str = ", ".join(f"`{m}`" for m in vision_models)
         lines.append(f"- **Vision models:** {models_str} (image analysis). The user can request a specific model.")
         lines.append("  If the current chat model itself supports vision (llava, gemma3, minicpm-v, etc.), analyze directly without switching.")
-        lines.append("  Read `docs/VISION.md` for details on how to handle image uploads.")
+        docs_v = _docs_dir_path(config)
+        docs_v_prefix = str(docs_v) + "/" if docs_v else "docs/"
+        lines.append(f"  Read `{docs_v_prefix}VISION.md` for details on how to handle image uploads.")
     else:
         lines.append("- **No vision model configured.** If the user sends an image, tell them to set `vision` in the config.")
     # Config-Pfad für Image-Upload und Avatar-Anweisungen
@@ -480,7 +476,7 @@ def _vision_section(config: dict[str, Any]) -> str:
         lines.append(f"- **Avatar:** `{avatar}` (bot profile picture). Image file: `{avatar_file}`.")
     else:
         lines.append(f"- **Avatar:** not set. Default location: `{avatar_file}`.")
-    docs = _docs_dir_path(None)
+    docs = _docs_dir_path(config)
     avatars_md = str(docs / "AVATARS.md") if docs else "docs/AVATARS.md"
     lines.append(
         f"- **When asked to set/change avatar:** First `ls -la \"{avatar_file}\"`. "
@@ -504,6 +500,8 @@ def build_system_prompt(
         config = load_config(project_dir)
     # basic_rules laden (kopiert Defaults nach agent_dir/basic_rules/ falls nötig, cached im RAM)
     _load_basic_rules(config)
+    # docs kopieren (kopiert Defaults nach agent_dir/docs/ falls nötig)
+    _ensure_docs(config)
     agent_dir = config.get("agent_dir") or ""
     max_chars = config.get("max_chars_per_file") or 500
     files = load_agent_files(agent_dir, max_chars)
@@ -548,9 +546,9 @@ def build_system_prompt(
         _safety_section(),
         _exec_behavior_section(),
         _persistence_section(config),
-        _planning_section(config, project_dir),
+        _planning_section(config),
         _tools_section(config),
-        _docs_reference_section(project_dir),
+        _docs_reference_section(config),
         _vision_section(config),
         "---\n*End of system instructions. Everything below is the conversation.*",
     ]
