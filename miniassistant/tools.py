@@ -9,7 +9,17 @@ import re
 import subprocess
 from html.parser import HTMLParser
 from typing import Any
+import logging
+import time
+
 import httpx
+
+_log = logging.getLogger(__name__)
+
+_RETRYABLE_STATUS_CODES = (500, 502, 503, 504)
+_RETRY_ATTEMPTS = 3
+_RETRY_DELAY = 3  # seconds
+
 
 # Browser User-Agent um Bot-Detection und Anubis-Checks zu vermeiden
 _USER_AGENT = (
@@ -77,13 +87,32 @@ def web_search(searxng_url: str, query: str, max_results: int = 5) -> dict[str, 
     if "/search" not in url and not url.endswith("/search"):
         url = f"{url}/search"
     params = {"q": query, "format": "json"}
-    try:
-        with httpx.Client(timeout=15.0) as client:
-            r = client.get(url, params=params)
-            r.raise_for_status()
-            data = r.json()
-    except Exception as e:
-        return {"error": str(e), "results": []}
+    last_err: Exception | None = None
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            with httpx.Client(timeout=15.0) as client:
+                r = client.get(url, params=params)
+                r.raise_for_status()
+                data = r.json()
+            break
+        except (httpx.TimeoutException, httpx.RemoteProtocolError) as e:
+            last_err = e
+            if attempt < _RETRY_ATTEMPTS - 1:
+                _log.warning("web_search attempt %d/%d failed (%s), retrying in %ds …", attempt + 1, _RETRY_ATTEMPTS, e, _RETRY_DELAY)
+                time.sleep(_RETRY_DELAY)
+                continue
+            return {"error": str(e), "results": []}
+        except httpx.HTTPStatusError as e:
+            last_err = e
+            if attempt < _RETRY_ATTEMPTS - 1 and e.response.status_code in _RETRYABLE_STATUS_CODES:
+                _log.warning("web_search attempt %d/%d failed (HTTP %d), retrying in %ds …", attempt + 1, _RETRY_ATTEMPTS, e.response.status_code, _RETRY_DELAY)
+                time.sleep(_RETRY_DELAY)
+                continue
+            return {"error": str(e), "results": []}
+        except Exception as e:
+            return {"error": str(e), "results": []}
+    else:
+        return {"error": str(last_err), "results": []}
     results = data.get("results") or []
     out = []
     for hit in results[:max_results]:
@@ -106,24 +135,43 @@ def check_url(url: str, timeout: float = 10.0) -> dict[str, Any]:
         return {"reachable": False, "status_code": None, "final_url": None, "error": "URL is empty"}
     if not u.startswith(("http://", "https://")):
         u = "https://" + u
-    try:
-        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-            r = client.get(u)
-            final = str(r.url)
+    last_err: Exception | None = None
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+                r = client.get(u)
+                final = str(r.url)
+                if r.status_code in _RETRYABLE_STATUS_CODES and attempt < _RETRY_ATTEMPTS - 1:
+                    _log.warning("check_url attempt %d/%d got HTTP %d, retrying in %ds …", attempt + 1, _RETRY_ATTEMPTS, r.status_code, _RETRY_DELAY)
+                    time.sleep(_RETRY_DELAY)
+                    continue
+                return {
+                    "reachable": 200 <= r.status_code < 400,
+                    "status_code": r.status_code,
+                    "final_url": final if final != u else None,
+                }
+        except (httpx.TimeoutException, httpx.RemoteProtocolError) as e:
+            last_err = e
+            if attempt < _RETRY_ATTEMPTS - 1:
+                _log.warning("check_url attempt %d/%d failed (%s), retrying in %ds …", attempt + 1, _RETRY_ATTEMPTS, e, _RETRY_DELAY)
+                time.sleep(_RETRY_DELAY)
+                continue
+            return {"reachable": False, "status_code": None, "final_url": None, "error": str(e)}
+        except httpx.HTTPStatusError as e:
+            last_err = e
+            if attempt < _RETRY_ATTEMPTS - 1 and e.response.status_code in _RETRYABLE_STATUS_CODES:
+                _log.warning("check_url attempt %d/%d failed (HTTP %d), retrying in %ds …", attempt + 1, _RETRY_ATTEMPTS, e.response.status_code, _RETRY_DELAY)
+                time.sleep(_RETRY_DELAY)
+                continue
             return {
-                "reachable": 200 <= r.status_code < 400,
-                "status_code": r.status_code,
-                "final_url": final if final != u else None,
+                "reachable": False,
+                "status_code": e.response.status_code if e.response else None,
+                "final_url": str(e.response.url) if e.response else None,
+                "error": str(e),
             }
-    except httpx.HTTPStatusError as e:
-        return {
-            "reachable": False,
-            "status_code": e.response.status_code if e.response else None,
-            "final_url": str(e.response.url) if e.response else None,
-            "error": str(e),
-        }
-    except Exception as e:
-        return {"reachable": False, "status_code": None, "final_url": None, "error": str(e)}
+        except Exception as e:
+            return {"reachable": False, "status_code": None, "final_url": None, "error": str(e)}
+    return {"reachable": False, "status_code": None, "final_url": None, "error": str(last_err)}
 
 
 # ---------------------------------------------------------------------------
@@ -192,44 +240,59 @@ def read_url(url: str, max_chars: int = 8000, timeout: float = 15.0) -> dict[str
         return {"ok": False, "content": "", "error": "URL is empty"}
     if not u.startswith(("http://", "https://")):
         u = "https://" + u
-    try:
-        headers = {
-            "User-Agent": _USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
-        }
-        with httpx.Client(
-            timeout=timeout,
-            follow_redirects=True,
-            headers=headers,
-        ) as client:
-            r = client.get(u)
-            r.raise_for_status()
-            content_type = r.headers.get("content-type", "")
-            if "html" in content_type:
-                text = _html_to_text(r.text)
-            elif "json" in content_type:
-                text = r.text
-            elif content_type.startswith("text/"):
-                text = r.text
-            else:
-                return {
-                    "ok": False,
-                    "content": "",
-                    "error": f"Unsupported content-type: {content_type}",
-                }
-        # Auf max_chars begrenzen
-        if len(text) > max_chars:
-            text = text[:max_chars] + "\n\n[... truncated ...]"
-        return {"ok": True, "content": text}
-    except httpx.HTTPStatusError as e:
-        return {
-            "ok": False,
-            "content": "",
-            "error": f"HTTP {e.response.status_code}: {e}",
-        }
-    except Exception as e:
-        return {"ok": False, "content": "", "error": str(e)}
+    headers = {
+        "User-Agent": _USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+    }
+    last_err: Exception | None = None
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            with httpx.Client(
+                timeout=timeout,
+                follow_redirects=True,
+                headers=headers,
+            ) as client:
+                r = client.get(u)
+                r.raise_for_status()
+                content_type = r.headers.get("content-type", "")
+                if "html" in content_type:
+                    text = _html_to_text(r.text)
+                elif "json" in content_type:
+                    text = r.text
+                elif content_type.startswith("text/"):
+                    text = r.text
+                else:
+                    return {
+                        "ok": False,
+                        "content": "",
+                        "error": f"Unsupported content-type: {content_type}",
+                    }
+            # Auf max_chars begrenzen
+            if len(text) > max_chars:
+                text = text[:max_chars] + "\n\n[... truncated ...]"
+            return {"ok": True, "content": text}
+        except (httpx.TimeoutException, httpx.RemoteProtocolError) as e:
+            last_err = e
+            if attempt < _RETRY_ATTEMPTS - 1:
+                _log.warning("read_url attempt %d/%d failed (%s), retrying in %ds …", attempt + 1, _RETRY_ATTEMPTS, e, _RETRY_DELAY)
+                time.sleep(_RETRY_DELAY)
+                continue
+            return {"ok": False, "content": "", "error": str(e)}
+        except httpx.HTTPStatusError as e:
+            last_err = e
+            if attempt < _RETRY_ATTEMPTS - 1 and e.response.status_code in _RETRYABLE_STATUS_CODES:
+                _log.warning("read_url attempt %d/%d failed (HTTP %d), retrying in %ds …", attempt + 1, _RETRY_ATTEMPTS, e.response.status_code, _RETRY_DELAY)
+                time.sleep(_RETRY_DELAY)
+                continue
+            return {
+                "ok": False,
+                "content": "",
+                "error": f"HTTP {e.response.status_code}: {e}",
+            }
+        except Exception as e:
+            return {"ok": False, "content": "", "error": str(e)}
+    return {"ok": False, "content": "", "error": str(last_err)}
 
 
 # ---------------------------------------------------------------------------

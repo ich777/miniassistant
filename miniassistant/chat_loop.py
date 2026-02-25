@@ -2124,8 +2124,9 @@ def chat_round(
                     except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.RemoteProtocolError, RuntimeError) as e:
                         if attempt < 2:
                             code = getattr(getattr(e, "response", None), "status_code", None)
-                            if isinstance(e, (httpx.TimeoutException, httpx.RemoteProtocolError)) or code == 400:
-                                time.sleep(2)
+                            if isinstance(e, (httpx.TimeoutException, httpx.RemoteProtocolError)) or code in (400, 500, 502, 503, 504):
+                                _log.warning("API attempt %d/3 failed (%s), retrying in 3s …", attempt + 1, e)
+                                time.sleep(3)
                                 continue
                         raise
                 if response is None:
@@ -2406,12 +2407,13 @@ def chat_round_stream(
                             last_response = chunk
                             break
                     break
-                except (httpx.TimeoutException, httpx.HTTPStatusError) as e:
+                except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.RemoteProtocolError) as e:
                     if attempt < 2:
                         code = getattr(getattr(e, "response", None), "status_code", None)
-                        if isinstance(e, httpx.TimeoutException) or code == 400:
-                            yield {"type": "status", "message": "Connection failed, retrying…"}
-                            time.sleep(2)
+                        if isinstance(e, (httpx.TimeoutException, httpx.RemoteProtocolError)) or code in (400, 500, 502, 503, 504):
+                            _log.warning("Stream attempt %d/3 failed (%s), retrying in 3s …", attempt + 1, e)
+                            yield {"type": "status", "message": "Verbindung fehlgeschlagen, neuer Versuch …"}
+                            time.sleep(3)
                             continue
                     raise
         except Exception as e:
