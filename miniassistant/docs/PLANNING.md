@@ -103,6 +103,8 @@ Wenn Subagents verfügbar sind (`invoke_model`), kannst du Teilaufgaben delegier
 - Du brauchst eine **zweite Meinung** oder Verifizierung
 - Die Aufgabe lässt sich in **parallele Batches** aufteilen (z.B. "Analysiere Dateien A-C", dann "Analysiere Dateien D-F")
 
+**Parallel ausführen:** Wenn du mehrere unabhängige `invoke_model`, `web_search` oder `read_url` Aufrufe hast, rufe sie alle **in einer einzigen Antwort** auf — sie werden automatisch parallel ausgeführt. Nicht nacheinander in separaten Runden!
+
 ### Wie delegieren?
 
 Gib dem Subagent **Kontext aus dem Plan** mit:

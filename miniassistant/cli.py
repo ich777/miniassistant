@@ -481,13 +481,13 @@ def _fetch_models_for_provider(prov_name: str, prov_cfg: dict, timeout: int = 5)
         base_url = prov_cfg.get("base_url", "https://generativelanguage.googleapis.com")
         models = google_list(api_key, base_url=base_url)
         return [m.get("name", "") for m in models if m.get("name")]
-    elif prov_type in ("openai", "deepseek"):
+    elif prov_type in ("openai", "deepseek", "openai-compat"):
         from miniassistant.openai_client import api_list_models as openai_list
-        api_key = prov_cfg.get("api_key", "")
-        if not api_key:
+        api_key = prov_cfg.get("api_key") or ""
+        if not api_key and prov_type in ("openai", "deepseek"):
             raise RuntimeError("api_key fehlt")
-        _default_url = "https://api.deepseek.com" if prov_type == "deepseek" else "https://api.openai.com"
-        base_url = prov_cfg.get("base_url", _default_url)
+        _default_urls = {"deepseek": "https://api.deepseek.com", "openai": "https://api.openai.com"}
+        base_url = prov_cfg.get("base_url") or _default_urls.get(prov_type, "http://127.0.0.1:8000")
         models = openai_list(api_key, base_url=base_url)
         return [m.get("name", "") for m in models if m.get("name")]
     elif prov_type == "anthropic":
@@ -831,6 +831,7 @@ def providers_add(ctx: click.Context, name: str) -> None:
         "Google Gemini API (Gemini, API-Key nötig)",
         "OpenAI API (GPT-4o, DALL-E, API-Key nötig)",
         "DeepSeek API (DeepSeek-V3/R1, API-Key nötig)",
+        "OpenAI-kompatibel (vLLM, llama.cpp, LiteLLM, etc.)",
         "Anthropic API (Claude, API-Key nötig)",
     ]
     # Claude Code nur anzeigen wenn installiert
@@ -850,8 +851,8 @@ def providers_add(ctx: click.Context, name: str) -> None:
     if _use_q:
         type_choice = questionary.select("Provider-Typ:", choices=type_choices).ask()
     else:
-        console.print("Provider-Typen: 1=Ollama lokal, 2=Ollama Online, 3=Ollama Server, 4=Google Gemini, 5=OpenAI, 6=DeepSeek, 7=Anthropic, 8=Claude Code")
-        tc = _prompt_text("Typ (1-8)", default="1", use_questionary=False)
+        console.print("Provider-Typen: 1=Ollama lokal, 2=Ollama Online, 3=Ollama Server, 4=Google Gemini, 5=OpenAI, 6=DeepSeek, 7=OpenAI-kompatibel, 8=Anthropic, 9=Claude Code")
+        tc = _prompt_text("Typ (1-9)", default="1", use_questionary=False)
         idx = int(tc) - 1 if tc.strip().isdigit() else 0
         type_choice = type_choices[idx] if 0 <= idx < len(type_choices) else type_choices[0]
 
@@ -860,7 +861,7 @@ def providers_add(ctx: click.Context, name: str) -> None:
             console.print("[yellow]Claude Code CLI nicht gefunden.[/yellow] Installieren: npm install -g @anthropic-ai/claude-code && claude login")
         return
 
-    # Preset bestimmen
+    # Preset bestimmen (OpenAI-kompatibel VOR OpenAI prüfen, da "OpenAI" in beiden vorkommt)
     if "lokal" in type_choice:
         prov_type, preset = "ollama", "local"
     elif "Online" in type_choice:
@@ -869,6 +870,8 @@ def providers_add(ctx: click.Context, name: str) -> None:
         prov_type, preset = "ollama", "custom"
     elif "Google" in type_choice or "Gemini" in type_choice:
         prov_type, preset = "google", "google"
+    elif "kompatibel" in type_choice or "vLLM" in type_choice or "llama.cpp" in type_choice:
+        prov_type, preset = "openai-compat", "openai-compat"
     elif "OpenAI" in type_choice or "GPT" in type_choice:
         prov_type, preset = "openai", "openai"
     elif "DeepSeek" in type_choice:
@@ -884,7 +887,8 @@ def providers_add(ctx: click.Context, name: str) -> None:
     if not name:
         default_names = {
             "local": "ollama", "online": "ollama-online", "custom": "ollama2",
-            "google": "google", "openai": "openai", "deepseek": "deepseek", "anthropic": "anthropic", "claude-code": "claude",
+            "google": "google", "openai": "openai", "deepseek": "deepseek",
+            "openai-compat": "vllm", "anthropic": "anthropic", "claude-code": "claude",
         }
         default_name = default_names.get(preset, "provider")
         while default_name in providers:
@@ -1003,6 +1007,29 @@ def providers_add(ctx: click.Context, name: str) -> None:
             think = questionary.confirm("Thinking aktivieren? (nur DeepSeek-R1)", default=False).ask()
         else:
             think = _prompt_text("Thinking aktivieren? (j/n, nur DeepSeek-R1)", default="n", use_questionary=False).lower().startswith("j")
+        if think:
+            prov_cfg["think"] = True
+
+    elif preset == "openai-compat":
+        # OpenAI-kompatibel — eigene URL, optionaler API-Key (vLLM, llama.cpp, LiteLLM, etc.)
+        console.print("[dim]Für vLLM, llama.cpp, LiteLLM, TabbyAPI, LocalAI und andere OpenAI-kompatible Server.[/dim]")
+        base_url = _prompt_text("Base-URL (z.B. http://192.168.1.50:8000)", default="http://127.0.0.1:8000", use_questionary=_use_q)
+        if not base_url.strip():
+            console.print("[red]Base-URL ist erforderlich.[/red]")
+            return
+        prov_cfg["base_url"] = base_url.strip().rstrip("/")
+        api_key = _prompt_text("API-Key (leer lassen wenn nicht nötig)", default="", use_questionary=_use_q)
+        if api_key.strip():
+            prov_cfg["api_key"] = api_key.strip()
+        num_ctx = _prompt_text("num_ctx (Context-Länge, modellabhängig)", default="32768", use_questionary=_use_q)
+        if num_ctx.strip() and num_ctx.strip() != "0":
+            prov_cfg["num_ctx"] = int(num_ctx)
+        else:
+            prov_cfg["num_ctx"] = 32768
+        if _use_q:
+            think = questionary.confirm("Thinking aktivieren?", default=False).ask()
+        else:
+            think = _prompt_text("Thinking aktivieren? (j/n)", default="n", use_questionary=False).lower().startswith("j")
         if think:
             prov_cfg["think"] = True
 

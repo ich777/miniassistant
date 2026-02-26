@@ -32,12 +32,12 @@ _TIMEOUT = 120
 # Auth + Helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _api_headers(api_key: str) -> dict[str, str]:
-    """Standard-Header für OpenAI API."""
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+def _api_headers(api_key: str | None) -> dict[str, str]:
+    """Standard-Header für OpenAI-kompatible APIs. Ohne api_key wird kein Auth-Header gesendet."""
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
 
 
 def _uses_max_completion_tokens(model: str) -> bool:
@@ -70,8 +70,7 @@ def api_list_models(
     Listet verfügbare Modelle über GET /v1/models.
     Returns: Liste von {name, owned_by} Dicts.
     """
-    if not api_key:
-        raise RuntimeError("OpenAI API: api_key erforderlich")
+    # api_key ist optional für OpenAI-kompatible APIs (z.B. vLLM, llama.cpp)
     url = f"{base_url.rstrip('/')}/v1/models"
     try:
         r = httpx.get(url, headers=_api_headers(api_key), timeout=_TIMEOUT)
@@ -334,8 +333,7 @@ def api_chat(
 
     Returns: Einheitliches Response-Dict.
     """
-    if not api_key:
-        raise RuntimeError("OpenAI API: api_key erforderlich")
+    # api_key ist optional für OpenAI-kompatible APIs (z.B. vLLM, llama.cpp)
 
     url = f"{base_url.rstrip('/')}/v1/chat/completions"
 
@@ -432,8 +430,7 @@ def api_chat_stream(
     OpenAI Chat Completions API mit Streaming (SSE).
     Yields Chunks im einheitlichen Format.
     """
-    if not api_key:
-        raise RuntimeError("OpenAI API: api_key erforderlich")
+    # api_key ist optional für OpenAI-kompatible APIs (z.B. vLLM, llama.cpp)
 
     url = f"{base_url.rstrip('/')}/v1/chat/completions"
     api_msgs = _convert_messages(messages, system=system)
@@ -551,8 +548,7 @@ def api_generate_image(
     OpenAI Image Generation – POST /v1/images/generations.
     Returns: {url: str, revised_prompt: str} oder {b64_json: str, revised_prompt: str}.
     """
-    if not api_key:
-        raise RuntimeError("OpenAI API: api_key erforderlich")
+    # api_key ist optional für OpenAI-kompatible APIs (z.B. vLLM, llama.cpp)
     url = f"{base_url.rstrip('/')}/v1/images/generations"
     body: dict[str, Any] = {
         "model": model,

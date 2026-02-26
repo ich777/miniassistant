@@ -38,6 +38,15 @@ If `invoke_model` returns an error or times out:
 2. If it fails again: tell the user (e.g. "Subagent qwen3-coder-max ist nicht erreichbar.") and ask how to proceed.
 3. **Never do the subagent's work yourself** after a failure — ask the user first.
 
+## Parallel execution
+
+Multiple tool calls returned in a **single response** are executed concurrently when safe (invoke_model, web_search, read_url, check_url, read_email). This means:
+
+- If you need to delegate **multiple independent tasks**, call `invoke_model` for each one **in the same response** — they will run in parallel, not one after another.
+- Same for research: call multiple `web_search` or `read_url` in a single response to search/read in parallel.
+- **Do this whenever tasks are independent.** Example: "search 4 sources" → 4× `web_search` in one response, not 4 sequential rounds.
+- Sequential tools (exec, save_config, schedule) still run one at a time.
+
 ## Message guidelines
 
 The message to the subagent must be self-contained — the subagent has no conversation history. Include:

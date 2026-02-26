@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import httpx
@@ -37,6 +38,9 @@ import miniassistant.agent_actions_log as _aal
 import miniassistant.context_log as _ctx_log
 import re as _re
 
+# Tools die sicher parallel ausgeführt werden können (kein shared state, kein Filesystem-Konflikt)
+_CONCURRENT_SAFE_TOOLS = frozenset({"invoke_model", "web_search", "read_url", "check_url", "read_email"})
+
 # Regex für <think>...</think> Tags die manche Modelle (phi4-reasoning, deepseek-r1)
 # inline im Content ausgeben wenn think nicht als API-Parameter gesendet wird.
 _THINK_TAG_RE = _re.compile(r"<think>(.*?)</think>", _re.DOTALL)
@@ -66,7 +70,7 @@ def _resolve_vision_model(config: dict[str, Any], current_model: str) -> str | N
     Returns: Modellname (vision-fähig) oder None wenn kein Vision-Modell verfügbar."""
     # Google/OpenAI/Anthropic sind nativ multimodal → kein Wechsel nötig
     provider_type = get_provider_type(config, current_model)
-    if provider_type in ("google", "openai", "anthropic"):
+    if provider_type in ("google", "openai", "openai-compat", "anthropic"):
         return current_model
     # Ollama: Capabilities prüfen
     base_url = get_base_url_for_model(config, current_model)
@@ -112,13 +116,13 @@ def _dispatch_chat(
             options=options, base_url=base_url or "https://generativelanguage.googleapis.com",
             timeout=int(timeout),
         )
-    if provider_type == "openai" or provider_type == "deepseek":
+    if provider_type in ("openai", "deepseek", "openai-compat"):
         from miniassistant.openai_client import api_chat as openai_chat
-        _default_url = "https://api.deepseek.com" if provider_type == "deepseek" else "https://api.openai.com"
+        _default_urls = {"deepseek": "https://api.deepseek.com", "openai": "https://api.openai.com"}
         return openai_chat(
             messages, api_key=api_key, model=api_model,
             system=system, thinking=think, tools=tools,
-            options=options, base_url=base_url or _default_url,
+            options=options, base_url=base_url or _default_urls.get(provider_type, "http://127.0.0.1:8000"),
             timeout=int(timeout),
         )
     if provider_type == "anthropic":
@@ -179,13 +183,13 @@ def _dispatch_chat_stream(
             options=options, base_url=base_url or "https://generativelanguage.googleapis.com",
         )
         return
-    if provider_type == "openai" or provider_type == "deepseek":
+    if provider_type in ("openai", "deepseek", "openai-compat"):
         from miniassistant.openai_client import api_chat_stream as openai_stream
-        _default_url = "https://api.deepseek.com" if provider_type == "deepseek" else "https://api.openai.com"
+        _default_urls = {"deepseek": "https://api.deepseek.com", "openai": "https://api.openai.com"}
         yield from openai_stream(
             messages, api_key=api_key, model=api_model,
             system=system, thinking=think, tools=tools,
-            options=options, base_url=base_url or _default_url,
+            options=options, base_url=base_url or _default_urls.get(provider_type, "http://127.0.0.1:8000"),
         )
         return
     if provider_type == "anthropic":
@@ -224,7 +228,9 @@ def _provider_supports_tools(config: dict[str, Any], model_name: str) -> bool:
         from miniassistant.google_client import model_supports_tools as google_tools_check
         _, api_model = get_provider_config(config, model_name)
         return google_tools_check(api_model or model_name)
-    if provider_type == "openai" or provider_type == "deepseek":
+    if provider_type in ("openai", "deepseek", "openai-compat"):
+        if provider_type == "openai-compat":
+            return True  # OpenAI-kompatible APIs: Tool-Support vom User verantwortet
         from miniassistant.openai_client import model_supports_tools as openai_tools_check
         _, api_model = get_provider_config(config, model_name)
         return openai_tools_check(api_model or model_name)
@@ -263,15 +269,16 @@ def _ollama_available_models(config: dict[str, Any], provider_name: str | None =
             return (names, "")
         except Exception as e:
             return ([], str(e).strip() or "Google Gemini API nicht erreichbar")
-    elif prov_type in ("openai", "deepseek"):
+    elif prov_type in ("openai", "deepseek", "openai-compat"):
         try:
             from miniassistant.openai_client import api_list_models as openai_list
-            _default_url = "https://api.deepseek.com" if prov_type == "deepseek" else "https://api.openai.com"
-            raw = openai_list(api_key or "", base_url=prov.get("base_url", _default_url))
+            _default_urls = {"deepseek": "https://api.deepseek.com", "openai": "https://api.openai.com"}
+            raw = openai_list(api_key or "", base_url=prov.get("base_url") or _default_urls.get(prov_type, "http://127.0.0.1:8000"))
             names = [m.get("name", "") for m in raw if m.get("name")]
             return (names, "")
         except Exception as e:
-            _label = "DeepSeek" if prov_type == "deepseek" else "OpenAI"
+            _labels = {"deepseek": "DeepSeek", "openai": "OpenAI", "openai-compat": "OpenAI-kompatible"}
+            _label = _labels.get(prov_type, "OpenAI-kompatible")
             return ([], str(e).strip() or f"{_label} API nicht erreichbar")
     elif prov_type == "anthropic":
         try:
@@ -842,6 +849,87 @@ def _validate_provider_config(merged: dict) -> str | None:
     return None
 
 
+def _run_tools_maybe_concurrent(
+    tool_calls: list[tuple[str, dict[str, Any] | str]],
+    config: dict[str, Any],
+    project_dir: str | None,
+) -> list[tuple[str, dict[str, Any] | str, str]]:
+    """Führt Tool-Calls aus — concurrent-safe Tools parallel, Rest sequenziell.
+
+    Respektiert Abhängigkeiten: Tool-Calls werden in Blöcke aufgeteilt.
+    Ein zusammenhängender Block von concurrent-safe Tools läuft parallel,
+    aber ein sequenzieller Tool-Call dazwischen erzwingt eine Grenze —
+    alles davor wird abgeschlossen bevor der sequenzielle Call startet.
+
+    Beispiel: [web_search, web_search, exec, invoke_model, invoke_model]
+    → Block 1: web_search + web_search (parallel)
+    → Block 2: exec (sequenziell, wartet auf Block 1)
+    → Block 3: invoke_model + invoke_model (parallel, wartet auf Block 2)
+
+    Returns: Liste von (name, args, result) in der Original-Reihenfolge der tool_calls.
+    """
+    if len(tool_calls) < 2:
+        results: list[tuple[str, dict[str, Any] | str, str]] = []
+        for name, args in tool_calls:
+            results.append((name, args, _run_tool(name, args, config, project_dir)))
+        return results
+
+    # In Blöcke aufteilen: zusammenhängende concurrent-safe Tools bilden einen Block
+    blocks: list[tuple[str, list[int]]] = []  # ("concurrent"|"sequential", [indices])
+    for i, (name, _) in enumerate(tool_calls):
+        is_concurrent = name in _CONCURRENT_SAFE_TOOLS
+        block_type = "concurrent" if is_concurrent else "sequential"
+        if blocks and blocks[-1][0] == block_type:
+            blocks[-1][1].append(i)
+        else:
+            blocks.append((block_type, [i]))
+
+    # Prüfe ob sich Parallelismus überhaupt lohnt (mind. 1 Block mit 2+ concurrent)
+    any_parallel = any(btype == "concurrent" and len(indices) >= 2 for btype, indices in blocks)
+    if not any_parallel:
+        results = []
+        for name, args in tool_calls:
+            results.append((name, args, _run_tool(name, args, config, project_dir)))
+        return results
+
+    _log.info(
+        "Concurrent tool execution: %d blocks from %d tool calls (%s)",
+        len(blocks), len(tool_calls),
+        " → ".join(
+            f"{btype}({','.join(tool_calls[i][0] for i in idxs)})"
+            for btype, idxs in blocks
+        ),
+    )
+
+    # Blöcke der Reihe nach abarbeiten — jeder Block wartet auf den vorherigen
+    results_by_idx: dict[int, str] = {}
+
+    for block_type, indices in blocks:
+        if block_type == "concurrent" and len(indices) >= 2:
+            # Parallel ausführen
+            with ThreadPoolExecutor(max_workers=len(indices)) as pool:
+                future_to_idx = {}
+                for i in indices:
+                    name, args = tool_calls[i]
+                    future = pool.submit(_run_tool, name, args, config, project_dir)
+                    future_to_idx[future] = i
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    try:
+                        results_by_idx[idx] = future.result()
+                    except Exception as e:
+                        tname = tool_calls[idx][0]
+                        _log.error("Concurrent tool %s failed: %s", tname, e)
+                        results_by_idx[idx] = f"Tool {tname} failed: {e}"
+        else:
+            # Sequenziell ausführen (einzelner concurrent-safe oder sequential tool)
+            for i in indices:
+                name, args = tool_calls[i]
+                results_by_idx[i] = _run_tool(name, args, config, project_dir)
+
+    return [(tool_calls[i][0], tool_calls[i][1], results_by_idx[i]) for i in range(len(tool_calls))]
+
+
 def _run_tool(
     name: str,
     arguments: dict[str, Any] | str,
@@ -934,7 +1022,7 @@ def _run_tool(
         url_arg = arguments.get("url", "").strip()
         if not url_arg:
             return "read_url requires url"
-        result = tool_read_url(url_arg)
+        result = tool_read_url(url_arg, config=config)
         if result.get("ok"):
             return result.get("content", "")
         return f"Error reading URL: {result.get('error', 'unknown error')}"
@@ -1156,8 +1244,8 @@ def _run_tool(
                 return _run_subagent_google(
                     config, api_model_sub, sub_system, sub_msg, resolved,
                 )
-            elif provider_type in ("openai", "deepseek"):
-                # OpenAI / DeepSeek API – Subagent mit Tool-Support
+            elif provider_type in ("openai", "deepseek", "openai-compat"):
+                # OpenAI / DeepSeek / OpenAI-kompatible API – Subagent mit Tool-Support
                 return _run_subagent_openai(
                     config, api_model_sub, sub_system, sub_msg, resolved,
                 )
@@ -1268,7 +1356,7 @@ def _debate_call(
             return _run_subagent_anthropic(config, api_model, enriched_system, message, api_key, base_url, think, model_name)
         elif provider_type == "google":
             return _run_subagent_google(config, api_model, enriched_system, message, model_name)
-        elif provider_type in ("openai", "deepseek"):
+        elif provider_type in ("openai", "deepseek", "openai-compat"):
             return _run_subagent_openai(config, api_model, enriched_system, message, model_name)
         else:
             # Ollama (default)
@@ -1610,7 +1698,7 @@ def _run_subagent_anthropic(
                 if _cu_r.get("error"): _cu_parts.append(f"error: {_cu_r['error']}")
                 tool_result = "\n".join(_cu_parts)
             elif tc_name == "read_url":
-                _ru_r = tool_read_url(tc_args.get("url", ""))
+                _ru_r = tool_read_url(tc_args.get("url", ""), config=config)
                 tool_result = _ru_r.get("content", "") if _ru_r.get("ok") else f"Error reading URL: {_ru_r.get('error', 'unknown error')}"
             else:
                 tool_result = f"Unknown tool: {tc_name}"
@@ -1703,7 +1791,7 @@ def _run_subagent_google(
                 if _cu_r.get("error"): _cu_parts.append(f"error: {_cu_r['error']}")
                 tool_result = "\n".join(_cu_parts)
             elif tc_name == "read_url":
-                _ru_r = tool_read_url(tc_args.get("url", ""))
+                _ru_r = tool_read_url(tc_args.get("url", ""), config=config)
                 tool_result = _ru_r.get("content", "") if _ru_r.get("ok") else f"Error reading URL: {_ru_r.get('error', 'unknown error')}"
             else:
                 tool_result = f"Unknown tool: {tc_name}"
@@ -1852,7 +1940,7 @@ def _run_subagent_openai(
                 if _cu_r.get("error"): _cu_parts.append(f"error: {_cu_r['error']}")
                 tool_result = "\n".join(_cu_parts)
             elif tc_name == "read_url":
-                _ru_r = tool_read_url(tc_args.get("url", ""))
+                _ru_r = tool_read_url(tc_args.get("url", ""), config=config)
                 tool_result = _ru_r.get("content", "") if _ru_r.get("ok") else f"Error reading URL: {_ru_r.get('error', 'unknown error')}"
             else:
                 tool_result = f"Unknown tool: {tc_name}"
@@ -1963,7 +2051,7 @@ def _run_subagent_with_tools(
                 if _cu_r.get("error"): _cu_parts.append(f"error: {_cu_r['error']}")
                 tool_result = "\n".join(_cu_parts)
             elif tc_name == "read_url":
-                _ru_r = tool_read_url(tc_args.get("url", ""))
+                _ru_r = tool_read_url(tc_args.get("url", ""), config=config)
                 tool_result = _ru_r.get("content", "") if _ru_r.get("ok") else f"Error reading URL: {_ru_r.get('error', 'unknown error')}"
             else:
                 tool_result = f"Unknown tool: {tc_name}"
@@ -2165,8 +2253,8 @@ def chat_round(
                         msgs_final = msgs
                         effective_model = try_model
                         break
-                for name, args in tool_calls:
-                    result = _run_tool(name, args, config, project_dir)
+                tool_results = _run_tools_maybe_concurrent(tool_calls, config, project_dir)
+                for name, args, result in tool_results:
                     _aal.log_tool_call(config, name, args, result)
                     msgs.append({"role": "tool", "tool_name": name, "content": result})
                     if name == "send_image":
@@ -2507,9 +2595,15 @@ def chat_round_stream(
                 yield {"type": "content", "delta": "\n\n*(Verarbeitung abgebrochen)*"}
                 yield {"type": "done", "thinking": _final_thinking, "content": _final_content, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info}
                 return
-        for name, args in tool_calls:
-            yield {"type": "status", "message": f"Tool: {name}"}
-            result = _run_tool(name, args, config, project_dir)
+        _tool_names_all = [n for n, _ in tool_calls]
+        _concurrent_count = sum(1 for n in _tool_names_all if n in _CONCURRENT_SAFE_TOOLS)
+        if _concurrent_count > 1:
+            yield {"type": "status", "message": f"Tools parallel: {', '.join(_tool_names_all)}"}
+        else:
+            for tn in _tool_names_all:
+                yield {"type": "status", "message": f"Tool: {tn}"}
+        tool_results = _run_tools_maybe_concurrent(tool_calls, config, project_dir)
+        for name, args, result in tool_results:
             _aal.log_tool_call(config, name, args, result)
             msgs.append({"role": "tool", "tool_name": name, "content": result})
             if name == "send_image":

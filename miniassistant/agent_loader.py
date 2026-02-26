@@ -390,6 +390,15 @@ def _tools_section(config: dict[str, Any]) -> str:
         "or URLs the user sends you. **When the user sends a link and says 'schau dir das an' or 'lies das': "
         "use `read_url` to read the content — do NOT guess what the page says.**"
     )
+    lines.append(
+        "- **Parallel execution:** When you return multiple tool calls in a single response, "
+        "these tools run **concurrently** (in parallel): `web_search`, `read_url`, `check_url`, `read_email`, `invoke_model`. "
+        "When you have multiple **independent** calls of these tools, return them ALL in one response to save time. "
+        "Example: user asks 'search 3 sources for X' → return 3× `web_search` in one response (not 3 separate rounds). "
+        "**Ordering is preserved:** if you return [web_search, web_search, exec, read_url], the searches run first in parallel, "
+        "then exec runs after they finish, then read_url. So place dependent calls AFTER the calls they depend on. "
+        "`exec` always runs sequentially (filesystem safety)."
+    )
     # Subagents: global config (subagents: [list]) oder per-provider subagents: true
     subagent_list = config.get("subagents") or []
     providers = config.get("providers") or {}
@@ -419,7 +428,10 @@ def _tools_section(config: dict[str, Any]) -> str:
             "  If result is incomplete: re-invoke with a continuation instruction, or ask the user.\n"
             "  **Sanity-check results:** If a subagent found concrete data (links, prices, products) but then concludes 'doesn't exist' or 'not available' — that is contradictory. Present the actual findings, not the wrong conclusion. Subagents may have outdated knowledge (= outdated training data).\n"
             "  **If subagent returns raw JSON instead of a result:** the subagent failed to execute — do NOT pretend it succeeded. Either retry the subagent or do the task yourself with your own tools.\n"
-            "  Present the subagent's result directly — never redo it yourself."
+            "  Present the subagent's result directly — never redo it yourself.\n"
+            "  **Parallel execution:** Multiple tool calls in a single response run concurrently for: invoke_model, web_search, read_url, check_url, read_email.\n"
+            "  When you have multiple independent tasks (e.g. delegate to 3 subagents, or search 4 sources), call ALL of them in ONE response — they execute in parallel, saving time.\n"
+            "  Do NOT call them one by one in separate rounds when they are independent."
         )
         if sub_display:
             lines.append(f"  **Available subagents (use ONLY these exact names):** {', '.join(sub_display)}.\n"

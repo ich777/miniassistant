@@ -228,11 +228,85 @@ def _html_to_text(html: str) -> str:
     return parser.get_text()
 
 
-def read_url(url: str, max_chars: int = 8000, timeout: float = 15.0) -> dict[str, Any]:
+_GITHUB_ISSUE_PR_RE = re.compile(
+    r"^https?://github\.com/([^/]+)/([^/]+)/(issues|pull)/(\d+)(?:[#?].*)?$"
+)
+_GITHUB_RAW_FILE_RE = re.compile(
+    r"^https?://github\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.+?)(?:[#?].*)?$"
+)
+
+
+def _try_github_api(url: str, gh_token: str | None, max_chars: int, timeout: float) -> dict[str, Any] | None:
+    """Versucht GitHub-URLs über die API zu lesen. Gibt None zurück wenn keine GitHub-URL."""
+    # Issues / Pull Requests
+    m = _GITHUB_ISSUE_PR_RE.match(url)
+    if m:
+        owner, repo, kind, number = m.groups()
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/issues/{number}"
+        headers: dict[str, str] = {"Accept": "application/vnd.github+json", "User-Agent": _USER_AGENT}
+        if gh_token:
+            headers["Authorization"] = f"Bearer {gh_token}"
+        try:
+            r = httpx.get(api_url, headers=headers, timeout=timeout, follow_redirects=True)
+            r.raise_for_status()
+            data = r.json()
+            parts = [
+                f"# {data.get('title', '')} (#{number})",
+                f"**State:** {data.get('state', '')}",
+                f"**Author:** {(data.get('user') or {}).get('login', '')}",
+                f"**Created:** {data.get('created_at', '')}",
+                f"**Labels:** {', '.join(l.get('name', '') for l in (data.get('labels') or []))}",
+                "",
+                data.get("body") or "(no description)",
+            ]
+            # Kommentare laden wenn wenige
+            comments_count = data.get("comments", 0)
+            if comments_count > 0 and comments_count <= 20:
+                try:
+                    cr = httpx.get(api_url + "/comments", headers=headers, timeout=timeout)
+                    cr.raise_for_status()
+                    for c in cr.json():
+                        parts.append(f"\n---\n**{(c.get('user') or {}).get('login', '')}** ({c.get('created_at', '')}):\n{c.get('body', '')}")
+                except Exception:
+                    pass
+            elif comments_count > 20:
+                parts.append(f"\n({comments_count} comments — showing first page only)")
+            text = "\n".join(parts)
+            if len(text) > max_chars:
+                text = text[:max_chars] + "\n\n[... truncated ...]"
+            return {"ok": True, "content": text}
+        except Exception as e:
+            _log.warning("GitHub API fallback failed for %s: %s", url, e)
+            return None  # Fallback auf normalen HTTP-Abruf
+
+    # Dateien in Repos (blob → raw)
+    m = _GITHUB_RAW_FILE_RE.match(url)
+    if m:
+        owner, repo, ref, path = m.groups()
+        raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{path}"
+        headers = {"User-Agent": _USER_AGENT}
+        if gh_token:
+            headers["Authorization"] = f"Bearer {gh_token}"
+        try:
+            r = httpx.get(raw_url, headers=headers, timeout=timeout, follow_redirects=True)
+            r.raise_for_status()
+            text = r.text
+            if len(text) > max_chars:
+                text = text[:max_chars] + "\n\n[... truncated ...]"
+            return {"ok": True, "content": text}
+        except Exception as e:
+            _log.warning("GitHub raw fallback failed for %s: %s", url, e)
+            return None
+
+    return None  # Keine GitHub-URL
+
+
+def read_url(url: str, max_chars: int = 8000, timeout: float = 15.0, config: dict[str, Any] | None = None) -> dict[str, Any]:
     """
     Liest den Inhalt einer URL und gibt ihn als bereinigten Text zurück.
     Nutzt einen Browser-User-Agent um Bot-Detection/Anubis-Checks zu vermeiden.
     HTML wird automatisch in Text konvertiert.
+    GitHub-URLs (Issues, PRs, Dateien) werden automatisch über die API gelesen.
     max_chars begrenzt die Ausgabe (für kleine Modell-Kontexte).
     """
     u = (url or "").strip()
@@ -240,6 +314,12 @@ def read_url(url: str, max_chars: int = 8000, timeout: float = 15.0) -> dict[str
         return {"ok": False, "content": "", "error": "URL is empty"}
     if not u.startswith(("http://", "https://")):
         u = "https://" + u
+
+    # GitHub-URLs über die API lesen (besserer Content, kein HTML-Navigation-Müll)
+    gh_token = ((config or {}).get("github_token") or "").strip() or None
+    gh_result = _try_github_api(u, gh_token, max_chars, timeout)
+    if gh_result is not None:
+        return gh_result
     headers = {
         "User-Agent": _USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
