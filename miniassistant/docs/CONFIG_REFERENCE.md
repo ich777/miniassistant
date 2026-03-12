@@ -62,7 +62,7 @@ agent_dir: ~/.config/miniassistant/agent
 workspace: ~/workspace                  # default: ~/workspace
 trash_dir: ~/.trash                     # default: ~/.trash (separate from workspace)
 max_chars_per_file: 500                   # max chars per agent file in system prompt
-max_tool_rounds: 15                       # max tool call rounds per chat message (default: 15)
+max_tool_rounds: 100                      # max tool call rounds per chat message (default: 100)
 github_token: github_pat_xxx...           # optional: any token format (ghp_..., github_pat_...) — injected as GH_TOKEN/GITHUB_TOKEN into every exec call
 
 search_engines:
@@ -71,6 +71,10 @@ search_engines:
   vpn:
     url: https://search-vpn.example.org
 default_search_engine: main
+search_engine_strategy: first             # 'first' (default), 'random', or 'specific'
+                                          # first: use default engine; on no results, suggest others to user
+                                          # random: pick a random engine each request
+                                          # specific: always use default engine only, no fallback suggestion
 
 scheduler: false                          # or { enabled: true }
 
@@ -105,6 +109,14 @@ image_generation:
   model: "stable-diffusion"              # Image generation model
   num_ctx: 32768
 # Short form: image_generation: "stable-diffusion"
+
+voice:
+  stt:
+    url: tcp://localhost:10300          # Wyoming STT server (e.g. faster-whisper)
+  tts:
+    url: tcp://localhost:10200          # Wyoming TTS server (e.g. Piper)
+  language: de                          # STT language hint (default: de)
+  tts_voice: de_DE-thorsten-medium      # Piper voice name (optional)
 
 avatar: "~/.config/miniassistant/agent/avatar.png"  # Bot profile picture (path or URL)
 
@@ -356,3 +368,47 @@ email:
 - Port 465 (SSL-only): set `ssl: true` and `smtp_port: 465` — uses `SMTP_SSL` instead of STARTTLS
 
 **CRITICAL:** Always use `send_email` and `read_email` tools — never write Python scripts for email. Credentials are loaded automatically from config. Read EMAIL.md for tool usage details.
+
+## Voice setup (Wyoming STT + TTS)
+
+Voice enables speech-to-text (STT) and text-to-speech (TTS) for Matrix and Discord.
+Requires: `ffmpeg` system package + running Wyoming STT/TTS servers.
+
+**User says "richte Voice ein" or "konfiguriere Sprachausgabe" → ask for:**
+- STT server URL (e.g. `tcp://localhost:10300` for faster-whisper)
+- TTS server URL (e.g. `tcp://localhost:10200` for Piper) — optional, text-only reply if missing
+- Language for STT (default: `de`)
+- Piper voice name — optional (e.g. `de_DE-thorsten-medium`)
+
+**Minimal voice setup (STT only):**
+```yaml
+voice:
+  stt:
+    url: tcp://localhost:10300
+  language: de
+```
+
+**Full voice setup (STT + TTS):**
+```yaml
+voice:
+  stt:
+    url: tcp://localhost:10300
+  tts:
+    url: tcp://localhost:10200
+  language: de
+  tts_voice: de_DE-thorsten-medium
+```
+
+**Wyoming server addresses:**
+- `tcp://host:port` — standard form
+- `wyoming://host:port` and `wyoming+tcp://host:port` are also accepted
+- Default ports: faster-whisper = 10300, Piper = 10200 (configurable in the Wyoming server)
+
+**How voice works:**
+- Matrix: incoming `m.audio` messages → STT → agent → TTS → audio reply
+- Discord: audio attachments (ogg, mp3, wav, m4a, webm) → STT → agent → TTS → WAV attachment
+- Messages transcribed with `[Voice]` prefix so agent responds in spoken language (concise, no markdown)
+- If TTS is not configured, agent replies in text
+- Tables and code blocks are always sent as separate text messages
+
+**Read VOICE.md for server setup instructions.**

@@ -455,3 +455,65 @@ def remove_scheduled_job(job_id_prefix: str) -> tuple[bool, str]:
 
 def list_scheduled_jobs() -> list[dict[str, Any]]:
     return _load_jobs()
+
+
+def update_schedule_prompt(
+    job_id: str,
+    new_prompt: str | None,
+    *,
+    new_model: str | None = None,
+    new_when: str | None = None,
+) -> tuple[bool, str]:
+    """Aktualisiert Prompt, Modell und/oder Zeitplan eines bestehenden Jobs."""
+    jobs = _load_jobs()
+    job = next((j for j in jobs if j.get("id") == job_id), None)
+    if not job:
+        return False, f"Job {job_id[:8]} nicht gefunden"
+    if new_prompt:
+        job["prompt"] = new_prompt
+    if new_model is not None:
+        if new_model:
+            job["model"] = new_model
+        else:
+            job.pop("model", None)
+    new_trigger_type: str | None = None
+    new_trigger_args: dict | None = None
+    if new_when:
+        parsed = _parse_when(new_when)
+        if not parsed:
+            return False, "Ungültiges 'when': Cron (5 Felder, z.B. '30 7 * * *') oder 'in N minutes'"
+        new_trigger_type, new_trigger_args = parsed
+        job["trigger"] = new_trigger_type
+        job["trigger_args"] = new_trigger_args
+    _save_jobs(jobs)
+    # APScheduler-Job-Args aktualisieren damit der nächste Run den neuen Prompt hat
+    sched = get_scheduler()
+    if sched:
+        try:
+            apjob = sched.get_job(job_id)
+            if apjob:
+                data: dict[str, Any] = {}
+                prompt_val = job.get("prompt")
+                if prompt_val:
+                    data["prompt"] = prompt_val
+                for key in ("command", "client", "once", "model", "room_id", "channel_id"):
+                    if job.get(key):
+                        data[key] = job[key]
+                apjob.modify(args=[job_id, json.dumps(data, ensure_ascii=False)])
+                if new_trigger_type and new_trigger_args:
+                    if new_trigger_type == "date":
+                        from apscheduler.triggers.date import DateTrigger
+                        run_date = datetime.fromisoformat(new_trigger_args["run_date"].replace("Z", "+00:00"))
+                        apjob.reschedule(DateTrigger(run_date=run_date))
+                    else:
+                        from apscheduler.triggers.cron import CronTrigger
+                        apjob.reschedule(CronTrigger(
+                            minute=new_trigger_args.get("minute", "*"),
+                            hour=new_trigger_args.get("hour", "*"),
+                            day=new_trigger_args.get("day", "*"),
+                            month=new_trigger_args.get("month", "*"),
+                            day_of_week=new_trigger_args.get("day_of_week", "*"),
+                        ))
+        except Exception as e:
+            logger.warning("APScheduler job update failed: %s", e)
+    return True, f"Job {job_id[:8]} aktualisiert"

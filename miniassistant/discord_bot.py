@@ -174,8 +174,9 @@ async def run_discord_bot(config: dict[str, Any]) -> None:
         if is_mentioned and client.user is not None:
             body = body.replace(f"<@{client.user.id}>", "").replace(f"<@!{client.user.id}>", "").strip()
 
-        # Bild-Attachments herunterladen
+        # Bild- und Audio-Attachments herunterladen
         msg_images: list[dict[str, Any]] = []
+        audio_bytes: bytes | None = None
         for att in message.attachments:
             ct = (att.content_type or "").lower()
             if ct.startswith("image/") or att.filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
@@ -188,6 +189,67 @@ async def run_discord_bot(config: dict[str, Any]) -> None:
                     logger.info("Discord: Bild-Attachment von %s: %s (%s)", sender_id, att.filename, mime)
                 except Exception as e:
                     logger.warning("Discord: Bild-Download fehlgeschlagen für %s: %s", att.filename, e)
+            elif ct.startswith("audio/") or att.filename.lower().endswith((".ogg", ".mp3", ".wav", ".m4a", ".webm")):
+                try:
+                    audio_bytes = await att.read()
+                    logger.info("Discord: Audio-Attachment von %s: %s (%d bytes)", sender_id, att.filename, len(audio_bytes))
+                except Exception as e:
+                    logger.warning("Discord: Audio-Download fehlgeschlagen für %s: %s", att.filename, e)
+
+        # Audio-Nachricht: STT → Agent → TTS → Antwort senden
+        if audio_bytes is not None:
+            from miniassistant.config import get_voice_stt_url, get_voice_tts_url, get_voice_language, get_voice_tts_voice
+            config_dir = config.get("_config_dir")
+            if not is_authorized("discord", sender_id, config_dir):
+                code = get_or_generate_code("discord", sender_id, config_dir)
+                await message.reply(f"Nicht freigeschaltet. Auth-Code: **{code}**")
+                return
+            stt_url = get_voice_stt_url(config)
+            if not stt_url:
+                await message.reply("Sprachfunktion nicht konfiguriert (voice.stt.url fehlt).")
+                return
+            try:
+                from miniassistant import wyoming_client as _wyoming
+                lang = get_voice_language(config)
+                transcript = _wyoming.transcribe(audio_bytes, stt_url, language=lang)
+            except Exception as e:
+                logger.exception("Discord Audio: STT fehlgeschlagen")
+                await message.reply(f"Spracherkennung fehlgeschlagen: {e}")
+                return
+            if not transcript:
+                await message.reply("Konnte Sprachnachricht nicht erkennen.")
+                return
+            logger.info("Discord Audio: Transkript von %s: %s", sender_id, transcript[:80])
+            async with message.channel.typing():
+                try:
+                    response = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: _get_chat_response(config, sender_id, f"[Voice] {transcript}", discord_sessions, channel_id=str(message.channel.id)),
+                    )
+                except Exception as e:
+                    logger.exception("Discord Audio: Agent fehlgeschlagen")
+                    await message.reply(f"Fehler: {e}")
+                    return
+            if not response:
+                return
+            from miniassistant.voice_format import format_for_voice
+            voice_text, visual_content = format_for_voice(response)
+            tts_url = get_voice_tts_url(config)
+            if tts_url and voice_text:
+                try:
+                    tts_voice = get_voice_tts_voice(config)
+                    wav_bytes = _wyoming.synthesize(voice_text, tts_url, voice=tts_voice)
+                    import io as _io
+                    await message.reply(file=discord.File(_io.BytesIO(wav_bytes), filename="response.wav"))
+                except Exception as e:
+                    logger.exception("Discord Audio: TTS fehlgeschlagen")
+                    await message.reply(voice_text[:2000])
+            else:
+                await message.reply(voice_text[:2000])
+            if visual_content:
+                for chunk in _split_message(visual_content, 2000):
+                    await message.channel.send(chunk)
+            return
 
         # Bild ohne Text → Pending speichern, User fragen
         if msg_images and not body:

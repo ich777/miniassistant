@@ -97,6 +97,75 @@ def get_search_engine_url(config: dict[str, Any], engine_id: str | None = None) 
     return (engines[eid].get("url") or "").strip() or None
 
 
+def get_search_engine_for_request(config: dict[str, Any], engine_id: str | None = None) -> tuple[str | None, str | None]:
+    """Gibt (url, eid) für eine Suchanfrage zurück, basierend auf search_engine_strategy.
+
+    Strategien (config: search_engine_strategy):
+      'first'    (default): bevorzuge erste/default Engine
+      'random':             wähle zufällig eine Engine
+      'specific':           nur default Engine, kein Fallback
+
+    engine_id: expliziter Override, ignoriert Strategy.
+    """
+    import random as _random
+    engines = config.get("search_engines") or {}
+    if not engines:
+        return None, None
+    if engine_id:
+        url = (engines.get(engine_id, {}).get("url") or "").strip()
+        return (url or None), engine_id
+    strategy = (config.get("search_engine_strategy") or "first").strip().lower()
+    if strategy == "random":
+        eid = _random.choice(list(engines.keys()))
+    else:  # "first" oder "specific"
+        eid = config.get("default_search_engine") or next(iter(engines), None)
+    if not eid or eid not in engines:
+        return None, None
+    url = (engines[eid].get("url") or "").strip()
+    return (url or None), eid
+
+
+def get_voice_stt_url(config: dict[str, Any]) -> str | None:
+    """Wyoming STT URL aus config.voice.stt.url, oder None wenn nicht konfiguriert."""
+    voice = config.get("voice") or {}
+    return (voice.get("stt") or {}).get("url") or None
+
+
+def get_voice_tts_url(config: dict[str, Any]) -> str | None:
+    """Wyoming TTS URL aus config.voice.tts.url, oder None wenn nicht konfiguriert."""
+    voice = config.get("voice") or {}
+    return (voice.get("tts") or {}).get("url") or None
+
+
+def get_voice_language(config: dict[str, Any]) -> str:
+    """STT-Sprache aus config.voice.language (oder voice.stt.language als Fallback), Default 'de'."""
+    voice = config.get("voice") or {}
+    return voice.get("language") or (voice.get("stt") or {}).get("language") or "de"
+
+
+def get_voice_tts_voice(config: dict[str, Any]) -> str | None:
+    """Piper-Voice-Name aus config.voice.tts_voice (oder voice.tts.voice als Fallback), oder None für Piper-Default."""
+    voice = config.get("voice") or {}
+    return voice.get("tts_voice") or (voice.get("tts") or {}).get("voice") or None
+
+
+def get_voice_tts_options(config: dict[str, Any]) -> dict[str, float]:
+    """Synthesis-Optionen für Wyoming TTS aus config.voice.tts.*
+    Gibt nur gesetzte Werte zurück (keine Defaults — der Server verwendet seine eigenen Defaults).
+    Keys: noise_scale, noise_w, length_scale, sentence_silence
+    """
+    tts = (config.get("voice") or {}).get("tts") or {}
+    opts: dict[str, float] = {}
+    for key in ("noise_scale", "noise_w", "length_scale", "sentence_silence"):
+        val = tts.get(key)
+        if val is not None:
+            try:
+                opts[key] = float(val)
+            except (TypeError, ValueError):
+                pass
+    return opts
+
+
 def config_path(project_dir: str | None = None) -> Path:
     """Config-Datei: project_dir/miniassistant.yaml wenn project_dir gesetzt, sonst get_config_dir()/config.yaml."""
     if project_dir:
@@ -432,6 +501,7 @@ def _merge_with_defaults(data: dict[str, Any]) -> dict[str, Any]:
         "avatar": (data.get("avatar") or "").strip() or None,
         "github_token": (data.get("github_token") or "").strip() or None,
         "email": _normalize_email(data),
+        "voice": data.get("voice") or None,
     }
 
 
@@ -517,6 +587,8 @@ def save_config(config: dict[str, Any], project_dir: str | None = None) -> Path:
         out["avatar"] = config["avatar"]
     if config.get("github_token"):
         out["github_token"] = config["github_token"]
+    if config.get("voice"):
+        out["voice"] = config["voice"]
     # Auto-Migration: email unter chat_clients.* → top-level email:
     cc_raw = config.get("chat_clients") or {}
     if not config.get("email"):

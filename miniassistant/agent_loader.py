@@ -275,7 +275,7 @@ def _docs_reference_section(config: dict[str, Any]) -> str:
         f"Documentation directory: `{d}/`\n"
         f"Each topic is a separate file. **Read only the file you need** (`cat \"{d}/FILE\"`), never all of them.\n"
         "When a topic is relevant, **read the file yourself and follow the instructions** — do not tell the user to read it.\n\n"
-        "**Read-first rules:** Before Matrix/Discord setup or any `save_config` call, read the matching doc file first.\n\n"
+        "**Read-first rules:** Before configuring Matrix/Discord/Voice (installation, server setup, save_config), read the matching doc file first. Do NOT read docs just to use a tool — `send_audio`, `send_image`, `web_search` etc. can be called directly.\n\n"
         "| File | Topic |\n"
         "|------|-------|\n"
         f"| `MATRIX.md` | Configuring YOUR bot connection (chat_clients.matrix) |\n"
@@ -291,7 +291,8 @@ def _docs_reference_section(config: dict[str, Any]) -> str:
         "| `IMAGE_GENERATION.md` | Image generation |\n"
         "| `DEBATE.md` | Multi-round AI debate |\n"
         "| `AVATARS.md` | Bot profile picture |\n"
-        "| `EMAIL.md` | IMAP/SMTP, multi-account, tracking, auto-reply |\n\n"
+        "| `EMAIL.md` | IMAP/SMTP, multi-account, tracking, auto-reply |\n"
+        "| `VOICE.md` | Wyoming STT/TTS, voice setup, supported formats |\n\n"
     )
 
 
@@ -367,7 +368,7 @@ def _tools_section(config: dict[str, Any]) -> str:
         "- `save_config`: **only for system config** (see Persistence section). Pass only keys to change (deep-merged). After saving, tell the user to restart **miniassistant**.\n"
         "  Per-model options → `providers.<name>.model_options.\"model:tag\"`. Quote `:` in YAML keys.\n"
         "  Valid options: temperature, top_p, top_k, num_ctx, num_predict, seed, min_p, stop, repeat_penalty, repetition_penalty, repeat_last_n, think.\n"
-        f"  Read `{docs_prefix}CONFIG_REFERENCE.md` before any save_config call."
+        f"  If unsure about the config structure: read `{docs_prefix}CONFIG_REFERENCE.md`."
     )
     lines.append(
         "- **GitHub:** Use REST API via `curl` — NEVER `gh` CLI, NEVER `gh auth`, NEVER tell the user to set up auth. "
@@ -515,6 +516,26 @@ def _vision_section(config: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _voice_section(config: dict[str, Any]) -> str:
+    """Voice-Mode-Hinweise — wenn STT oder TTS konfiguriert ist."""
+    from miniassistant.config import get_voice_stt_url, get_voice_tts_url
+    has_stt = bool(get_voice_stt_url(config))
+    has_tts = bool(get_voice_tts_url(config))
+    if not has_stt and not has_tts:
+        return ""
+    lines = ["\n## Voice Mode"]
+    if has_tts:
+        lines.append("**Sending audio:** `send_audio(text=\"...\")` — call it immediately when the user wants a voice/audio message. No setup, no config reading. After success: no text reply.")
+    if has_stt:
+        lines.append(
+            "**Incoming voice** (message starts with `[Voice]`): respond in plain spoken language — "
+            "no markdown, no tables, no code blocks. Be concise (1-3 sentences). "
+            "Tables and code are sent as separate text automatically."
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def build_system_prompt(
     config: dict[str, Any] | None = None,
     project_dir: str | None = None,
@@ -577,6 +598,7 @@ def build_system_prompt(
         _tools_section(config),
         _docs_reference_section(config),
         _vision_section(config),
+        _voice_section(config),
         "---\n*End of system instructions. Everything below is the conversation.*",
     ]
     return "\n".join(parts).strip()

@@ -6,6 +6,7 @@ Leichtgewichtig: eigene HTTP-Calls, keine laufenden Bot-Instanzen noetig.
 from __future__ import annotations
 
 import logging
+import time
 import urllib.parse
 from typing import Any
 
@@ -351,6 +352,145 @@ def _send_discord_image(dc: dict[str, Any], image_path: str, caption: str = "", 
             logger.warning("Discord Bild -> Channel %s fehlgeschlagen: %s", cid, e)
 
     return f"Bild gesendet an {sent} Channel" if sent else "Bild senden fehlgeschlagen"
+
+
+def send_audio(
+    text: str,
+    client: str | None = None,
+    room_id: str | None = None,
+    channel_id: str | None = None,
+    config: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    """Synthetisiert Text zu Audio via Wyoming TTS und sendet es an Chat-Clients."""
+    if config is None:
+        config = load_config()
+    from miniassistant.config import get_voice_tts_url, get_voice_tts_voice, get_voice_tts_options
+    from miniassistant import usage as _usage
+    tts_url = get_voice_tts_url(config)
+    if not tts_url:
+        return {"error": "TTS nicht konfiguriert (voice.tts.url fehlt)"}
+    try:
+        from miniassistant import wyoming_client as _wc
+        _t0 = time.monotonic()
+        wav_bytes = _wc.synthesize(
+            text, tts_url,
+            voice=get_voice_tts_voice(config),
+            **get_voice_tts_options(config),
+        )
+        _usage.record(config, get_voice_tts_voice(config) or "wyoming", "tts", time.monotonic() - _t0)
+    except Exception as e:
+        return {"error": f"TTS fehlgeschlagen: {e}"}
+
+    cc = config.get("chat_clients") or {}
+    results: dict[str, str] = {}
+
+    if client is None or client == "matrix":
+        mc = cc.get("matrix") or config.get("matrix")
+        if mc and mc.get("enabled", True) and mc.get("token") and mc.get("user_id"):
+            results["matrix"] = _send_matrix_audio(mc, wav_bytes, room_id=room_id, config_dir=config.get("_config_dir"))
+        elif client == "matrix":
+            results["matrix"] = "nicht konfiguriert"
+
+    if client is None or client == "discord":
+        dc = cc.get("discord")
+        if dc and dc.get("enabled", True) and dc.get("bot_token"):
+            results["discord"] = _send_discord_audio(dc, wav_bytes, channel_id=channel_id, config_dir=config.get("_config_dir"))
+        elif client == "discord":
+            results["discord"] = "nicht konfiguriert"
+
+    if not results:
+        results["error"] = "Kein Chat-Client konfiguriert"
+    return results
+
+
+def _send_matrix_audio(mc: dict[str, Any], wav_bytes: bytes, room_id: str | None = None, config_dir: str | None = None) -> str:
+    try:
+        from miniassistant.matrix_bot import send_audio_to_room, send_audio_to_user
+    except ImportError:
+        return "matrix-nio nicht verfügbar"
+
+    if room_id:
+        ok = send_audio_to_room(room_id, wav_bytes)
+        return f"Audio gesendet in Raum {room_id}" if ok else f"Audio-Upload fehlgeschlagen für Raum {room_id}"
+
+    try:
+        from miniassistant.chat_auth import list_authorized
+        authorized = list_authorized("matrix", config_dir)
+    except Exception:
+        authorized = []
+    if not authorized:
+        return "keine autorisierten Matrix-User"
+
+    sent_to: list[str] = []
+    for entry in authorized:
+        uid = entry.get("user_id", entry) if isinstance(entry, dict) else entry
+        if uid and isinstance(uid, str):
+            if send_audio_to_user(uid, wav_bytes):
+                sent_to.append(uid)
+    return f"Audio gesendet an {len(sent_to)} User" if sent_to else "Audio senden fehlgeschlagen"
+
+
+def _send_discord_audio(dc: dict[str, Any], wav_bytes: bytes, channel_id: str | None = None, config_dir: str | None = None) -> str:
+    import urllib.request
+    import json
+
+    bot_token = dc.get("bot_token", "")
+    if not bot_token:
+        return "bot_token fehlt"
+
+    channels: list[str] = []
+    if channel_id:
+        channels.append(channel_id)
+    else:
+        try:
+            from miniassistant.chat_auth import list_authorized
+            authorized = list_authorized("discord", config_dir)
+        except Exception:
+            authorized = []
+        for entry in authorized:
+            discord_user_id = entry.get("user_id", entry) if isinstance(entry, dict) else entry
+            if not discord_user_id or not isinstance(discord_user_id, str):
+                continue
+            try:
+                create_url = "https://discord.com/api/v10/users/@me/channels"
+                create_data = json.dumps({"recipient_id": discord_user_id}).encode()
+                req = urllib.request.Request(
+                    create_url, data=create_data,
+                    headers={"Authorization": f"Bot {bot_token}", "Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    cid = json.loads(resp.read()).get("id")
+                if cid:
+                    channels.append(cid)
+            except Exception:
+                continue
+
+    if not channels:
+        return "kein Ziel-Channel gefunden"
+
+    sent = 0
+    for cid in channels:
+        try:
+            import uuid as _uuid
+            boundary = f"----FormBoundary{_uuid.uuid4().hex[:16]}"
+            body_bytes = (
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"files[0]\"; "
+                f"filename=\"response.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+            ).encode("utf-8") + wav_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
+            send_url = f"https://discord.com/api/v10/channels/{cid}/messages"
+            req = urllib.request.Request(
+                send_url, data=body_bytes,
+                headers={
+                    "Authorization": f"Bot {bot_token}",
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                },
+            )
+            urllib.request.urlopen(req, timeout=30)
+            sent += 1
+        except Exception as e:
+            logger.warning("Discord Audio -> Channel %s fehlgeschlagen: %s", cid, e)
+
+    return f"Audio gesendet an {sent} Channel" if sent else "Audio senden fehlgeschlagen"
 
 
 def _send_discord(dc: dict[str, Any], message: str, config_dir: str | None = None) -> str:

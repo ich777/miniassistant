@@ -14,6 +14,13 @@ import time
 
 import httpx
 
+try:
+    from curl_cffi import requests as _curl_requests
+    _CURL_CFFI_AVAILABLE = True
+except ImportError:
+    _curl_requests = None  # type: ignore
+    _CURL_CFFI_AVAILABLE = False
+
 _log = logging.getLogger(__name__)
 
 _RETRYABLE_STATUS_CODES = (500, 502, 503, 504)
@@ -357,6 +364,22 @@ def read_url(url: str, max_chars: int = 8000, timeout: float = 15.0, config: dic
             return {"ok": False, "content": "", "error": str(e)}
         except httpx.HTTPStatusError as e:
             last_err = e
+            if e.response.status_code in (403, 429) and _CURL_CFFI_AVAILABLE:
+                # Bot-Detection (Cloudflare etc.) → Chrome-Impersonation als Fallback
+                _log.info("read_url: HTTP %d → retrying with curl_cffi Chrome impersonation", e.response.status_code)
+                try:
+                    cr = _curl_requests.get(u, impersonate="chrome", timeout=timeout)
+                    if cr.status_code < 400:
+                        ct = cr.headers.get("content-type", "")
+                        if "html" in ct:
+                            text = _html_to_text(cr.text)
+                        else:
+                            text = cr.text
+                        if len(text) > max_chars:
+                            text = text[:max_chars] + "\n\n[... truncated ...]"
+                        return {"ok": True, "content": text}
+                except Exception as ce:
+                    _log.debug("read_url curl_cffi fallback failed: %s", ce)
             if attempt < _RETRY_ATTEMPTS - 1 and e.response.status_code in _RETRYABLE_STATUS_CODES:
                 _log.warning("read_url attempt %d/%d failed (HTTP %d), retrying in %ds …", attempt + 1, _RETRY_ATTEMPTS, e.response.status_code, _RETRY_DELAY)
                 time.sleep(_RETRY_DELAY)

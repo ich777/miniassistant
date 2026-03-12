@@ -31,6 +31,7 @@ DOC_FILES = [
     "SEARCH_ENGINES.md",
     "SUBAGENTS.md",
     "VISION.md",
+    "VOICE.md",
     "EMAIL.md",
 ]
 

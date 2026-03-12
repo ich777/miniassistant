@@ -32,21 +32,24 @@ fi
 
 # --- System-Pakete installieren (vor der Python-Prüfung); bei Fehler (z. B. ohne sudo) weitermachen ---
 # Für Matrix-E2EE: libolm-dev, cmake, make, python3-dev (Header für C-Erweiterungen wie python-olm)
-echo "System-Pakete (python3, venv, pip; für Matrix-E2EE: libolm-dev, cmake, make, python3-dev)..."
+echo "System-Pakete (python3, venv, pip; für Matrix-E2EE: libolm-dev, cmake, make, python3-dev; für Voice: ffmpeg)..."
 if command -v apt-get >/dev/null 2>&1; then
-  ( $SUDO apt-get update -qq && $SUDO apt-get install -y python3 python3-venv python3-pip python3-dev python3-yaml libolm-dev cmake build-essential ) 2>/dev/null || {
-    ( $SUDO apt-get update -qq && $SUDO apt-get install -y python3 python3-venv python3-pip python3-dev python3-yaml libolm-dev cmake make ) 2>/dev/null || \
+  ( $SUDO apt-get update -qq && $SUDO apt-get install -y python3 python3-venv python3-pip python3-dev python3-yaml libolm-dev cmake build-essential ffmpeg ) 2>/dev/null || {
+    ( $SUDO apt-get update -qq && $SUDO apt-get install -y python3 python3-venv python3-pip python3-dev python3-yaml libolm-dev cmake make ffmpeg ) 2>/dev/null || \
+    ( $SUDO apt-get update -qq && $SUDO apt-get install -y python3 python3-venv python3-pip python3-yaml ffmpeg ) 2>/dev/null || \
     ( $SUDO apt-get update -qq && $SUDO apt-get install -y python3 python3-venv python3-pip python3-yaml ) 2>/dev/null || true
-    echo "  Hinweis: Installation fehlgeschlagen oder abgebrochen (z. B. ohne sudo). Für E2EE: libolm-dev, cmake, make, python3-dev."
+    echo "  Hinweis: Installation fehlgeschlagen oder abgebrochen (z. B. ohne sudo). Für E2EE: libolm-dev, cmake, make, python3-dev. Für Voice: ffmpeg."
   }
 elif command -v dnf >/dev/null 2>&1; then
-  ( $SUDO dnf install -y python3 python3-virtualenv python3-pip python3-pyyaml olm-devel cmake make ) 2>/dev/null || \
+  ( $SUDO dnf install -y python3 python3-virtualenv python3-pip python3-pyyaml olm-devel cmake make ffmpeg ) 2>/dev/null || \
+  ( $SUDO dnf install -y python3 python3-virtualenv python3-pip python3-pyyaml ffmpeg ) 2>/dev/null || \
   ( $SUDO dnf install -y python3 python3-virtualenv python3-pip python3-pyyaml ) 2>/dev/null || true
 elif command -v apk >/dev/null 2>&1; then
-  ( $SUDO apk add python3 py3-pip py3-venv py3-yaml olm-dev cmake make ) 2>/dev/null || \
+  ( $SUDO apk add python3 py3-pip py3-venv py3-yaml olm-dev cmake make ffmpeg ) 2>/dev/null || \
+  ( $SUDO apk add python3 py3-pip py3-venv py3-yaml ffmpeg ) 2>/dev/null || \
   ( $SUDO apk add python3 py3-pip py3-venv py3-yaml ) 2>/dev/null || true
 else
-  echo "  Unbekannter Paketmanager. Bitte manuell: python3, python3-venv, python3-pip; für E2EE: libolm, cmake, make."
+  echo "  Unbekannter Paketmanager. Bitte manuell: python3, python3-venv, python3-pip; für E2EE: libolm, cmake, make; für Voice: ffmpeg."
 fi
 echo ""
 

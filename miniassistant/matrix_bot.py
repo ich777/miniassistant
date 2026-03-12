@@ -30,6 +30,7 @@ _bot_client: Any = None
 _bot_loop: Any = None
 _bot_send_fn: Any = None  # async fn(client, room_id, body)
 _bot_send_image_fn: Any = None  # async fn(client, room_id, image_path, caption)
+_bot_send_audio_fn: Any = None  # async fn(client, room_id, wav_bytes)
 
 
 def send_message_to_user(target_user_id: str, message: str) -> bool:
@@ -162,6 +163,51 @@ def send_image_to_user(target_user_id: str, image_path: str, caption: str = "") 
         return False
 
 
+def send_audio_to_room(room_id: str, wav_bytes: bytes) -> bool:
+    """Thread-safe: Sendet Audio in einen bestimmten Raum über den laufenden Bot-Client."""
+    if not _bot_client or not _bot_loop or not _bot_send_audio_fn:
+        return False
+
+    async def _do_send() -> bool:
+        await _bot_send_audio_fn(_bot_client, room_id, wav_bytes)
+        return True
+
+    try:
+        future = asyncio.run_coroutine_threadsafe(_do_send(), _bot_loop)
+        return future.result(timeout=60)
+    except Exception as e:
+        logger.warning("Matrix send_audio_to_room fehlgeschlagen: %s", e)
+        return False
+
+
+def send_audio_to_user(target_user_id: str, wav_bytes: bytes) -> bool:
+    """Thread-safe: Sendet Audio an einen User (sucht passenden Raum)."""
+    if not _bot_client or not _bot_loop or not _bot_send_audio_fn:
+        return False
+
+    async def _do_send() -> bool:
+        cl = _bot_client
+        rooms = getattr(cl, "rooms", {}) or {}
+        for rid, room in rooms.items():
+            members = getattr(room, "users", {}) or {}
+            if target_user_id in members:
+                await _bot_send_audio_fn(cl, rid, wav_bytes)
+                return True
+        for rid, room in rooms.items():
+            invited = getattr(room, "invited_users", {}) or {}
+            if target_user_id in invited:
+                await _bot_send_audio_fn(cl, rid, wav_bytes)
+                return True
+        return False
+
+    try:
+        future = asyncio.run_coroutine_threadsafe(_do_send(), _bot_loop)
+        return future.result(timeout=60)
+    except Exception as e:
+        logger.warning("Matrix send_audio_to_user fehlgeschlagen: %s", e)
+        return False
+
+
 # Optional: matrix-nio (pip install miniassistant[matrix])
 _NIO_IMPORT_ERROR: str | None = None
 try:
@@ -180,6 +226,10 @@ try:
     except ImportError:
         RoomMessageImage = None  # ältere matrix-nio
     try:
+        from nio.events import RoomMessageAudio
+    except ImportError:
+        RoomMessageAudio = None  # ältere matrix-nio
+    try:
         from nio.events.room_events import RoomMessage as _RoomMessageBase
     except ImportError:
         _RoomMessageBase = None
@@ -195,6 +245,7 @@ except ImportError as e:
     RoomMessageText = None  # type: ignore
     RoomMessageNotice = None  # type: ignore
     RoomMessageImage = None  # type: ignore
+    RoomMessageAudio = None  # type: ignore
     MegolmEvent = None  # type: ignore
 
 
@@ -407,6 +458,36 @@ async def run_matrix_bot(config: dict[str, Any]) -> None:
             logger.exception("Matrix: Bild-Upload/Senden fehlgeschlagen: %s", e)
             await _send_room_message(cl, room_id, f"Bild konnte nicht gesendet werden: {e}")
 
+    async def _send_room_audio(cl: Any, room_id: str, wav_bytes: bytes) -> None:
+        """Lädt WAV hoch (media repo) und sendet es als m.audio im Raum."""
+        import io as _io
+        try:
+            upload_resp = await cl.upload(
+                _io.BytesIO(wav_bytes),
+                content_type="audio/wav",
+                filename="response.wav",
+                filesize=len(wav_bytes),
+            )
+            mxc = getattr(upload_resp, "content_uri", None)
+            if isinstance(upload_resp, tuple):
+                mxc = mxc or getattr(upload_resp[0], "content_uri", None)
+            if not mxc:
+                logger.warning("Matrix: Audio-Upload fehlgeschlagen: %s", upload_resp)
+                return
+            audio_content: dict[str, Any] = {
+                "msgtype": "m.audio",
+                "body": "Sprachnachricht",
+                "url": mxc,
+                "info": {"mimetype": "audio/wav", "size": len(wav_bytes)},
+            }
+            try:
+                await cl.room_send(room_id, "m.room.message", audio_content, ignore_unverified_devices=True)
+            except TypeError:
+                await cl.room_send(room_id, "m.room.message", audio_content)
+            logger.info("Matrix: Audio gesendet in %s (%d bytes)", room_id, len(wav_bytes))
+        except Exception as e:
+            logger.exception("Matrix: Audio-Upload/Senden fehlgeschlagen: %s", e)
+
     def _has_body(event: Any) -> bool:
         return isinstance(event, (RoomMessageText, RoomMessageNotice)) or bool(getattr(event, "body", None))
 
@@ -513,6 +594,108 @@ async def run_matrix_bot(config: dict[str, Any]) -> None:
         _pending_images.setdefault(sender, []).append(img_data)
         await _send_room_message(client, room_id, "Bild empfangen. Was soll ich damit machen? (Schreib mir eine Nachricht dazu)")
 
+    async def on_audio(room_id: str, event: Any) -> None:
+        """Sprachnachricht empfangen: STT → Agent → TTS → Audio senden."""
+        from miniassistant.config import get_voice_stt_url, get_voice_tts_url, get_voice_language, get_voice_tts_voice
+        sender = getattr(event, "sender", None) or ""
+        if not sender or sender == user_id:
+            return
+        config_dir = config.get("_config_dir")
+        if not is_authorized("matrix", sender, config_dir):
+            code = get_or_generate_code("matrix", sender, config_dir)
+            await _send_room_message(client, room_id, f"Nicht freigeschaltet. Auth-Code: **{code}**")
+            return
+        stt_url = get_voice_stt_url(config)
+        if not stt_url:
+            await _send_room_message(client, room_id, "Sprachfunktion nicht konfiguriert (voice.stt.url fehlt).")
+            return
+        # MXC-URL aus Event extrahieren
+        mxc_url = getattr(event, "url", None) or ""
+        source = getattr(event, "source", None) or {}
+        content = source.get("content") or {} if isinstance(source, dict) else {}
+        file_info = content.get("file") if isinstance(content, dict) else None
+        if file_info and not mxc_url:
+            mxc_url = (file_info or {}).get("url", "")
+        if not mxc_url:
+            await _send_room_message(client, room_id, "Konnte Audio-URL nicht lesen.")
+            return
+        # Audio herunterladen
+        try:
+            resp = await client.download(mxc_url)
+            if not (hasattr(resp, "body") and resp.body):
+                raise RuntimeError("Kein Body in Download-Response")
+            audio_bytes = resp.body
+            # E2EE entschlüsseln falls nötig
+            if file_info and file_info.get("key") and file_info.get("iv"):
+                try:
+                    from nio.crypto.attachments import decrypt_attachment
+                    audio_bytes = decrypt_attachment(audio_bytes, file_info["key"].get("k", ""), (file_info.get("hashes") or {}).get("sha256", ""), file_info.get("iv", ""))
+                except Exception as e:
+                    logger.warning("Matrix Audio: Entschlüsselung fehlgeschlagen: %s", e)
+        except Exception as e:
+            logger.exception("Matrix Audio: Download fehlgeschlagen")
+            await _send_room_message(client, room_id, f"Audio-Download fehlgeschlagen: {e}")
+            return
+        # STT
+        try:
+            from miniassistant import wyoming_client as _wyoming
+            lang = get_voice_language(config)
+            transcript = _wyoming.transcribe(audio_bytes, stt_url, language=lang)
+        except Exception as e:
+            logger.exception("Matrix Audio: STT fehlgeschlagen")
+            await _send_room_message(client, room_id, f"Spracherkennung fehlgeschlagen: {e}")
+            return
+        if not transcript:
+            await _send_room_message(client, room_id, "Konnte Sprachnachricht nicht erkennen.")
+            return
+        logger.info("Matrix Audio: Transkript von %s: %s", sender, transcript[:80])
+        # Typing-Indikator
+        try:
+            await client.room_typing(room_id, True)
+        except Exception:
+            pass
+        # Agent aufrufen (mit [Voice]-Prefix)
+        response = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _get_chat_response(config, sender, f"[Voice] {transcript}", matrix_sessions, room_id=room_id),
+        )
+        try:
+            await client.room_typing(room_id, False)
+        except Exception:
+            pass
+        if not response:
+            return
+        # Voice formatieren: visuellen Inhalt herausfiltern
+        from miniassistant.voice_format import format_for_voice
+        voice_text, visual_content = format_for_voice(response)
+        # TTS
+        tts_url = get_voice_tts_url(config)
+        if tts_url and voice_text:
+            try:
+                tts_voice = get_voice_tts_voice(config)
+                wav_bytes = _wyoming.synthesize(voice_text, tts_url, voice=tts_voice)
+                # Audio hochladen und als m.audio senden
+                import io as _io
+                upload_resp = await client.upload(_io.BytesIO(wav_bytes), content_type="audio/wav", filename="response.wav", filesize=len(wav_bytes))
+                mxc_audio = getattr(upload_resp, "content_uri", None) or (upload_resp[0].content_uri if isinstance(upload_resp, tuple) else None)
+                if mxc_audio:
+                    await client.room_send(room_id, "m.room.message", {
+                        "msgtype": "m.audio",
+                        "url": mxc_audio,
+                        "body": "Sprachantwort",
+                        "info": {"mimetype": "audio/wav", "size": len(wav_bytes)},
+                    })
+                else:
+                    await _send_room_message(client, room_id, voice_text)
+            except Exception as e:
+                logger.exception("Matrix Audio: TTS/Upload fehlgeschlagen")
+                await _send_room_message(client, room_id, voice_text)
+        else:
+            await _send_room_message(client, room_id, voice_text)
+        # Visuellen Inhalt (Tabellen, Code) als Text senden
+        if visual_content:
+            await _send_room_message(client, room_id, visual_content)
+
     async def on_message(room_id: str, event: Any) -> None:
         # Bild-Events abfangen: RoomMessageImage, msgtype=m.image, oder body+url Heuristik
         _is_image = (RoomMessageImage and isinstance(event, RoomMessageImage))
@@ -533,6 +716,17 @@ async def run_matrix_bot(config: dict[str, Any]) -> None:
         if _is_image:
             logger.info("Matrix: Bild-Event in on_message erkannt (%s), delegiere an on_image", type(event).__name__)
             await on_image(room_id, event)
+            return
+        # Audio-Events: msgtype=m.audio oder RoomMessageAudio
+        _is_audio = (RoomMessageAudio and isinstance(event, RoomMessageAudio))
+        if not _is_audio:
+            _src = getattr(event, "source", None) or {}
+            _sc = _src.get("content") or {} if isinstance(_src, dict) else {}
+            if isinstance(_sc, dict) and _sc.get("msgtype") == "m.audio":
+                _is_audio = True
+        if _is_audio:
+            logger.info("Matrix: Audio-Event erkannt, delegiere an on_audio")
+            await on_audio(room_id, event)
             return
         if not _has_body(event):
             logger.debug("Matrix: Ereignis ignoriert (kein Text/Notice): %s", type(event).__name__)
@@ -737,11 +931,12 @@ async def run_matrix_bot(config: dict[str, Any]) -> None:
     )
 
     # Globale Referenzen fuer Notify setzen (Scheduler kann ueber Bot senden)
-    global _bot_client, _bot_loop, _bot_send_fn, _bot_send_image_fn
+    global _bot_client, _bot_loop, _bot_send_fn, _bot_send_image_fn, _bot_send_audio_fn
     _bot_client = client
     _bot_loop = asyncio.get_running_loop()
     _bot_send_fn = _send_room_message
     _bot_send_image_fn = _send_room_image
+    _bot_send_audio_fn = _send_room_audio
 
     _rooms = getattr(client, "rooms", {}) or {}
     if _rooms:

@@ -39,7 +39,7 @@ import miniassistant.context_log as _ctx_log
 import re as _re
 
 # Tools die sicher parallel ausgeführt werden können (kein shared state, kein Filesystem-Konflikt)
-_CONCURRENT_SAFE_TOOLS = frozenset({"invoke_model", "web_search", "read_url", "check_url", "read_email"})
+_CONCURRENT_SAFE_TOOLS = frozenset({"invoke_model", "read_url", "check_url", "read_email"})
 
 # Regex für <think>...</think> Tags die manche Modelle (phi4-reasoning, deepseek-r1)
 # inline im Content ausgeben wenn think nicht als API-Parameter gesendet wird.
@@ -565,6 +565,23 @@ def _compact_history(
     return [summary_msg] + recent
 
 
+def _format_help() -> str:
+    """Gibt eine kurze Befehlsübersicht zurück."""
+    return (
+        "**Befehle:**\n\n"
+        "| Befehl | Beschreibung |\n"
+        "|--------|-------------|\n"
+        "| `/model` | Aktuelles Modell anzeigen |\n"
+        "| `/model NAME` | Modell wechseln |\n"
+        "| `/models` | Alle Modelle anzeigen |\n"
+        "| `/new` · `/neu` | Neue Session / Verlauf löschen |\n"
+        "| `/schedules` · `/aufgaben` | Geplante Jobs anzeigen |\n"
+        "| `/schedule remove ID` · `/aufgabe entfernen ID` | Job löschen |\n"
+        "| `/auth CODE` | Web-UI freischalten |\n"
+        "| `/help` · `/hilfe` | Diese Hilfe |"
+    )
+
+
 def _format_schedules() -> str:
     """Formatiert die Liste der geplanten Jobs als Markdown."""
     if not list_scheduled_jobs:
@@ -986,6 +1003,34 @@ def _run_tool(
         prov_err = _validate_provider_config(merged)
         if prov_err:
             return f"save_config rejected: {prov_err}"
+        # --- Voice Validierung (nach Merge) ---
+        _voice_name = (merged.get("voice") or {}).get("tts", {}).get("voice")
+        if _voice_name:
+            _tts_url = (merged.get("voice") or {}).get("tts", {}).get("url")
+            if _tts_url:
+                try:
+                    import socket as _sock
+                    from miniassistant.wyoming_client import _parse_url, _send_event, _recv_event
+                    _host, _port = _parse_url(_tts_url)
+                    with _sock.create_connection((_host, _port), timeout=5) as _s:
+                        _send_event(_s, "describe")
+                        _etype, _edata, _ = _recv_event(_s)
+                    _installed = [
+                        v["name"]
+                        for tts in (_edata.get("tts") or [])
+                        for v in (tts.get("voices") or [])
+                        if v.get("installed")
+                    ]
+                    if _installed and _voice_name not in _installed:
+                        _lang_prefix = _voice_name.split("-")[0] if "-" in _voice_name else ""
+                        _suggestions = [v for v in _installed if v.startswith(_lang_prefix)] if _lang_prefix else _installed[:10]
+                        return (
+                            f"save_config rejected: voice '{_voice_name}' is not installed on the TTS server. "
+                            f"Installed voices for '{_lang_prefix}': {_suggestions if _suggestions else _installed[:10]}. "
+                            f"Please choose an installed voice and retry."
+                        )
+                except (OSError, ConnectionRefusedError, TimeoutError):
+                    pass  # TTS server nicht erreichbar → Validierung überspringen
         merged_yaml = _yaml.safe_dump(merged, default_flow_style=False, allow_unicode=True, sort_keys=False)
         ok, err = validate_config_raw(merged_yaml)
         if not ok:
@@ -1002,8 +1047,8 @@ def _run_tool(
         return f"returncode: {result['returncode']}\nstdout:\n{result['stdout']}\nstderr:\n{result['stderr']}"
     if name == "web_search":
         query = arguments.get("query", "")
-        from miniassistant.config import get_search_engine_url
-        url = get_search_engine_url(config, arguments.get("engine"))
+        from miniassistant.config import get_search_engine_for_request
+        url, _used_eid = get_search_engine_for_request(config, arguments.get("engine"))
         if not url:
             return "web_search not configured (no search_engines or invalid engine)"
         result = tool_web_search(url, query)
@@ -1011,9 +1056,13 @@ def _run_tool(
             return f"Error: {result['error']}"
         lines = [f"- {r.get('title', '')} | {r.get('url', '')}\n  {r.get('snippet', '')}" for r in result.get("results") or []]
         if not lines:
-            others = [eid for eid, ecfg in (config.get("search_engines") or {}).items() if (ecfg.get("url") or "").strip() != url]
-            if others:
-                return f"Search engine returned no results. Other configured engines: {', '.join(others)}. Ask the user if they want to try one."
+            strategy = (config.get("search_engine_strategy") or "first").strip().lower()
+            if strategy != "specific":
+                import random as _random
+                others = [eid for eid, ecfg in (config.get("search_engines") or {}).items() if (ecfg.get("url") or "").strip() != url]
+                _random.shuffle(others)
+                if others:
+                    return f"Search engine returned no results. Other configured engines: {', '.join(others)}. Ask the user if they want to try one."
             return "Search engine returned no results. This is a search engine failure — do NOT conclude that nothing exists. Tell the user the search returned no results and suggest rephrasing."
         return "\n".join(lines)
     if name == "check_url":
@@ -1211,6 +1260,21 @@ def _run_tool(
             return "\n".join(parts) if parts else f"Bild gespeichert: {image_path} (kein Chat-Client im Kontext)"
         except Exception as e:
             return f"send_image failed: {e}"
+    if name == "send_audio":
+        text = arguments.get("text", "").strip()
+        if not text:
+            return "send_audio requires text"
+        chat_ctx = config.get("_chat_context") or {}
+        platform = chat_ctx.get("platform")
+        room_id = chat_ctx.get("room_id")
+        channel_id = chat_ctx.get("channel_id")
+        try:
+            from miniassistant.notify import send_audio as _send_aud
+            results = _send_aud(text, client=platform, room_id=room_id, channel_id=channel_id, config=config)
+            parts = [f"{k}: {v}" for k, v in results.items()]
+            return "\n".join(parts) if parts else f"TTS generiert ({len(text)} Zeichen), kein Chat-Client im Kontext"
+        except Exception as e:
+            return f"send_audio failed: {e}"
     if name == "status_update":
         msg = arguments.get("message", "").strip()
         if not msg:
@@ -2309,7 +2373,7 @@ def chat_round(
     global_fb = [resolve_model(config, fb) or fb for fb in (config.get("fallbacks") or []) if fb]
     fallbacks = per_prov_fb + [m for m in global_fb if m not in per_prov_fb]
     if max_tool_rounds is None:
-        max_tool_rounds = int(config.get("max_tool_rounds", 15))
+        max_tool_rounds = int(config.get("max_tool_rounds", 100))
 
     models_to_try = [model] + [m for m in fallbacks if m and m != model]
 
@@ -2439,7 +2503,7 @@ def chat_round(
                 for name, args, result in tool_results:
                     _aal.log_tool_call(config, name, args, result)
                     msgs.append({"role": "tool", "tool_name": name, "content": result})
-                    if name == "send_image":
+                    if name in ("send_image", "send_audio"):
                         _sent_image = True
                 rounds += 1
 
@@ -2451,10 +2515,11 @@ def chat_round(
             if rounds >= max_tool_rounds and not _sent_image:
                 _log.info("Max tool rounds (%d) exhausted — sending wrap-up nudge", max_tool_rounds)
                 msgs.append({"role": "user", "content": (
-                    "SYSTEM: You have used ALL your tool rounds — no more tool calls are possible. "
+                    "SYSTEM: No more tool calls are possible. "
                     "Nothing is running. No subworker is active. No background task exists. "
                     "Give your FINAL answer NOW based ONLY on results you already received. "
                     "Summarize honestly: what was completed, what is still pending. "
+                    "Do NOT mention tool limits, rounds, or internal constraints to the user. "
                     "FORBIDDEN phrases: 'still running', 'waiting for results', 'in progress', 'wartet auf', 'läuft noch', 'wird gerade'. "
                     "If the task is incomplete, say: 'Aufgabe nicht vollständig abgeschlossen. Bitte sag mir dass ich weitermachen soll.'"
                 )})
@@ -2599,7 +2664,7 @@ def chat_round_stream(
     global_fb = [resolve_model(config, fb) or fb for fb in (config.get("fallbacks") or []) if fb]
     fallbacks = per_prov_fb + [m for m in global_fb if m not in per_prov_fb]
     if max_tool_rounds is None:
-        max_tool_rounds = int(config.get("max_tool_rounds", 15))
+        max_tool_rounds = int(config.get("max_tool_rounds", 100))
     models_to_try = [model] + [m for m in fallbacks if m and m != model]
     debug = (config.get("server") or {}).get("debug", False)
     last_response: dict[str, Any] = {}
@@ -2863,23 +2928,26 @@ def chat_round_stream(
 
 
 def is_chat_command(user_input: str) -> bool:
-    """True wenn die Eingabe ein Befehl ist (/model, /models, /auth, /new), der ohne Stream behandelt wird."""
+    """True wenn die Eingabe ein Befehl ist (/model, /models, /auth, /new usw.), der ohne Stream behandelt wird."""
     raw = (user_input or "").strip()
     if not raw:
         return True
-    if raw.lower() == "/model":
+    lower = raw.lower()
+    if lower == "/model":
         return True
     if parse_model_switch(raw)[0] is not None:
         return True
     if parse_models_command(raw)[0]:
         return True
-    if raw.lower() == "/new":
+    if lower in ("/new", "/neu"):
         return True
-    if raw.lower() == "/schedules":
+    if lower in ("/schedules", "/aufgaben", "/jobs"):
         return True
-    if raw.lower().startswith("/schedule remove "):
+    if lower.startswith("/schedule remove ") or lower.startswith("/aufgabe entfernen ") or lower.startswith("/job entfernen "):
         return True
     if raw.startswith("/auth ") and len(raw) > 6:
+        return True
+    if lower in ("/help", "/hilfe", "/?"):
         return True
     return False
 
@@ -2966,9 +3034,13 @@ def handle_user_input(
         return md, session, None, None, None, None
 
     raw = user_input.strip()
-    if raw.lower() == "/new" and not allow_new_session:
+
+    if raw.lower() in ("/help", "/hilfe", "/?"):
+        return _format_help(), session, None, None, None, None
+
+    if raw.lower() in ("/new", "/neu") and not allow_new_session:
         return "", session, None, None, None, None
-    if raw.lower() == "/new":
+    if raw.lower() in ("/new", "/neu"):
         # create_session runs agent_loader (build_system_prompt) first, then we warmup with one prompt
         new_session = create_session(config, project_dir)
         new_session["model"] = session.get("model") or new_session.get("model")
@@ -2992,11 +3064,12 @@ def handle_user_input(
             err = str(e).strip() or type(e).__name__
             return f"Neue Session gestartet. Der vorherige Verlauf ist nicht mehr im Kontext.\n\n*(Warmup fehlgeschlagen: {err})*", new_session, None, None, None, None
 
-    if raw.lower() == "/schedules":
+    if raw.lower() in ("/schedules", "/aufgaben", "/jobs"):
         return _format_schedules(), session, None, None, None, None
 
-    if raw.lower().startswith("/schedule remove "):
-        job_id = raw[17:].strip()
+    if raw.lower().startswith(("/schedule remove ", "/aufgabe entfernen ", "/job entfernen ")):
+        # Alles nach dem ersten Befehlswort extrahieren
+        job_id = raw.split(None, 2)[-1].strip() if len(raw.split(None, 2)) > 2 else ""
         if not job_id:
             return "Nutzung: `/schedule remove <ID>` (IDs mit `/schedules` anzeigen)", session, None, None, None, None
         if not remove_scheduled_job:

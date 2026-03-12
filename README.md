@@ -93,3 +93,11 @@ Alle Einträge sind **optional**. Fehlt etwas in der Config, werden Defaults bzw
 Ausführlich und strukturiert: **[CONFIGURATION.md](CONFIGURATION.md)** (wo die Config liegt, alle Bereiche, Optionen, Beispiele). Die Doku wird mit dem Code mitgepflegt.
 
 - **Smart Compacting:** Wenn der Chatverlauf den Kontext füllt, werden ältere Messages automatisch zusammengefasst. Steuerbar via `chat.context_quota` (Default: 0.85 = 85% von `num_ctx`). Skaliert automatisch mit der Modellgröße.
+
+## Plan
+
+Siehe [MINIASSISTANT_PLAN.md](MINIASSISTANT_PLAN.md) für Features: mehrere Modelle + Aliase, Memory bei Modellwechsel, Bootup-Assistent, SOUL selbst schreiben, Matrix optional.
+
+## Lizenz
+
+MIT

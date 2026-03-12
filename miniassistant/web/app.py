@@ -376,7 +376,7 @@ async def config_page(request: Request):
     # Sensitive Werte maskieren (nur Anzeige, beim Speichern bleibt Original wenn nicht geändert)
     import re
     def _mask_secrets(text: str) -> str:
-        pattern = r'((?:api_key|token|bot_token|github_token):\s*)(\S+)'
+        pattern = r'((?:api_key|token|bot_token|github_token|password|secret):\s*)(\S+)'
         return re.sub(pattern, lambda m: m.group(1) + m.group(2)[:4] + '****' if len(m.group(2)) > 4 else m.group(0), text)
     display_raw = _mask_secrets(raw)
     raw_b64 = base64.b64encode(display_raw.encode("utf-8")).decode("ascii")
@@ -529,9 +529,17 @@ async def schedules_page(request: Request):
             once_tag = ' <span style="color:var(--muted);font-size:0.8em;">einmalig</span>' if j.get("once") else ""
             watch_badge = ' <span class="badge-watch" title="Watch-Job">👁 Watch</span>' if j.get("watch") else ""
             full_id = _escape(j.get("id", ""))
+            prompt_js = _js_escape(j.get("prompt") or "")
+            raw_when = when if trigger == "cron" else ""
+            model_js = _js_escape(j.get("model") or "")
+            edit_btn = (
+                f'<button class="btn-edit" data-id="{full_id}" data-prompt={prompt_js}'
+                f' data-when={_js_escape(raw_when)} data-model={model_js}'
+                f' title="Bearbeiten">&#9998;</button>'
+            ) if (j.get("prompt") or trigger == "cron") and not j.get("watch") else ""
             rows += (
                 f'<tr><td><code>{_escape(when)}</code>{once_tag}{watch_badge}</td><td>{task}</td><td>{client}</td><td>{model}</td><td>{added}</td>'
-                f'<td><code>{jid}</code> <button class="btn-del" data-id="{full_id}" title="Loeschen">&#10005;</button></td></tr>'
+                f'<td><code>{jid}</code> {edit_btn}<button class="btn-del" data-id="{full_id}" title="Loeschen">&#10005;</button></td></tr>'
             )
     html = f"""
     <!DOCTYPE html><html><head><meta charset="utf-8"><title>Schedules – MiniAssistant</title>
@@ -555,6 +563,17 @@ async def schedules_page(request: Request):
     details {{ cursor: pointer; }}
     details summary {{ display: inline; }}
     details .prompt-full {{ margin-top: 0.4em; white-space: pre-wrap; word-break: break-word; padding: 0.4em; background: var(--bg-secondary, #f5f5f5); border-radius: 4px; font-size: 0.9em; }}
+    .btn-edit {{ background: none; border: 1.5px solid #888; color: #555; border-radius: 4px;
+      cursor: pointer; padding: 0.15em 0.4em; font-size: 0.85em; line-height: 1; margin-right: 0.3em; transition: background 0.15s; }}
+    .btn-edit:hover {{ background: #eee; }}
+    .modal-overlay {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,0.45); z-index:1000; align-items:center; justify-content:center; }}
+    .modal-overlay.open {{ display:flex; }}
+    .modal-box {{ background:#fff; border-radius:8px; padding:1.5em; max-width:540px; width:90%; box-shadow:0 4px 24px rgba(0,0,0,0.18); }}
+    .modal-box h2 {{ margin:0 0 0.8em; font-size:1.1em; }}
+    .modal-box textarea {{ width:100%; box-sizing:border-box; min-height:120px; font-size:0.95em; padding:0.5em; border:1px solid #ccc; border-radius:4px; resize:vertical; }}
+    .modal-box label {{ display:block; font-size:0.88em; color:var(--muted); margin-bottom:0.25em; margin-top:0.7em; }}
+    .modal-box input[type=text], .modal-box select {{ width:100%; box-sizing:border-box; font-size:0.93em; padding:0.4em 0.5em; border:1px solid #ccc; border-radius:4px; }}
+    .modal-actions {{ display:flex; gap:0.6em; justify-content:flex-end; margin-top:0.8em; }}
     </style>
     </head><body>
     <div class="sched-wrap">
@@ -573,12 +592,86 @@ async def schedules_page(request: Request):
         <span class="text-muted" style="margin-left:1em;">Im Chat: <code>/schedules</code>, <code>/schedule remove &lt;ID&gt;</code></span>
       </div>
     </div>
+    <div class="modal-overlay" id="editModal">
+      <div class="modal-box">
+        <h2>Job bearbeiten</h2>
+        <div id="editWhenRow">
+          <label for="editWhenText">Zeitplan (Cron, z.B. <code>30 7 * * *</code>)</label>
+          <input type="text" id="editWhenText" placeholder="30 7 * * *" autocomplete="off">
+        </div>
+        <label for="editModelSelect">Modell</label>
+        <select id="editModelSelect"><option value="">Standard</option></select>
+        <label for="editPromptText">Prompt</label>
+        <textarea id="editPromptText" rows="5"></textarea>
+        <div class="modal-actions">
+          <button class="btn btn-outline" id="editCancel">Abbrechen</button>
+          <button class="btn" id="editSave">Speichern</button>
+        </div>
+      </div>
+    </div>
     <script>
+    var _editJobId = null;
+    var token = new URLSearchParams(window.location.search).get("token") || "";
+    // Modelle laden
+    (function() {{
+      var url = "/api/ollama/models" + (token ? "?token=" + encodeURIComponent(token) : "");
+      fetch(url).then(function(r) {{ return r.json(); }}).then(function(d) {{
+        var sel = document.getElementById("editModelSelect");
+        (d.models || []).forEach(function(m) {{
+          var opt = document.createElement("option"); opt.value = m; opt.textContent = m; sel.appendChild(opt);
+        }});
+      }}).catch(function() {{}});
+    }})();
+    document.querySelectorAll(".btn-edit").forEach(function(btn) {{
+      btn.addEventListener("click", function() {{
+        _editJobId = this.getAttribute("data-id");
+        var when = this.getAttribute("data-when") || "";
+        var model = this.getAttribute("data-model") || "";
+        document.getElementById("editPromptText").value = this.getAttribute("data-prompt") || "";
+        document.getElementById("editWhenText").value = when;
+        document.getElementById("editWhenRow").style.display = when ? "" : "none";
+        var sel = document.getElementById("editModelSelect");
+        sel.value = model;
+        if (sel.value !== model) {{
+          // Modell noch nicht in Liste (z.B. Provider-Prefix) – als Option hinzufügen
+          if (model) {{
+            var opt = document.createElement("option"); opt.value = model; opt.textContent = model; sel.insertBefore(opt, sel.children[1]);
+          }}
+          sel.value = model;
+        }}
+        document.getElementById("editModal").classList.add("open");
+        document.getElementById("editPromptText").focus();
+      }});
+    }});
+    document.getElementById("editCancel").addEventListener("click", function() {{
+      document.getElementById("editModal").classList.remove("open");
+    }});
+    document.getElementById("editSave").addEventListener("click", function() {{
+      var newPrompt = document.getElementById("editPromptText").value.trim();
+      var newWhen = document.getElementById("editWhenText").value.trim();
+      var whenRow = document.getElementById("editWhenRow").style.display !== "none";
+      var newModel = document.getElementById("editModelSelect").value;
+      if (!newPrompt && !newModel && !(whenRow && newWhen)) {{ alert("Bitte mindestens ein Feld ausfüllen."); return; }}
+      var payload = {{}};
+      if (newPrompt) payload.prompt = newPrompt;
+      if (newModel !== undefined) payload.model = newModel;
+      if (whenRow && newWhen) payload.when = newWhen;
+      fetch("/api/schedule/" + encodeURIComponent(_editJobId) + (token ? "?token=" + encodeURIComponent(token) : ""), {{
+        method: "PATCH",
+        headers: {{"Content-Type": "application/json"}},
+        body: JSON.stringify(payload)
+      }}).then(function(r) {{
+        if (r.ok) location.reload();
+        else r.json().then(function(d) {{ alert(d.detail || d.error || "Fehler"); }});
+      }});
+    }});
+    document.getElementById("editModal").addEventListener("click", function(e) {{
+      if (e.target === this) this.classList.remove("open");
+    }});
     document.querySelectorAll(".btn-del").forEach(function(btn) {{
       btn.addEventListener("click", function() {{
         var id = this.getAttribute("data-id");
         if (!confirm("Job " + id.slice(0,8) + " loeschen?")) return;
-        var token = new URLSearchParams(window.location.search).get("token") || "";
         fetch("/api/schedule/" + encodeURIComponent(id) + (token ? "?token=" + encodeURIComponent(token) : ""), {{
           method: "DELETE"
         }}).then(function(r) {{
@@ -1064,6 +1157,28 @@ async def api_auth_platform(request: Request, platform: str):
         return JSONResponse({"ok": False, "detail": "Code nicht gefunden (bereits eingelöst oder abgelaufen?). Im Matrix-/Discord-Chat einen neuen Code anfordern."}, status_code=400)
     except Exception as e:
         return JSONResponse({"ok": False, "detail": str(e)}, status_code=400)
+
+
+@app.patch("/api/schedule/{job_id}")
+async def api_schedule_update(request: Request, job_id: str):
+    """Schedule-Prompt, -Modell und/oder -Zeitplan aktualisieren. Token erforderlich."""
+    _require_token(request)
+    body = await request.json()
+    new_prompt = (body.get("prompt") or "").strip() or None
+    new_model = body.get("model")  # None = nicht ändern, "" = auf Standard zurücksetzen
+    new_when = (body.get("when") or "").strip() or None
+    if new_prompt is None and new_model is None and not new_when:
+        raise HTTPException(status_code=400, detail="Mindestens 'prompt', 'model' oder 'when' erforderlich")
+    try:
+        from miniassistant.scheduler import update_schedule_prompt
+        ok, msg = update_schedule_prompt(job_id, new_prompt, new_model=new_model, new_when=new_when)
+        if ok:
+            return JSONResponse({"ok": True, "message": msg})
+        raise HTTPException(status_code=404, detail=msg)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/api/schedule/{job_id}")

@@ -319,9 +319,15 @@ def _tools_schema(
     if search_engines:
         engine_ids = list(search_engines.keys())
         default_id = config.get("default_search_engine") or (engine_ids[0] if engine_ids else None)
-        desc = "Search the web via SearXNG. Use for current information, lookups. Optional: engine (one of: " + ", ".join(engine_ids) + "). Default is '" + (default_id or "") + "'."
+        strategy = (config.get("search_engine_strategy") or "first").strip().lower()
+        if strategy == "specific":
+            desc = "Search the web via SearXNG. Use engine '" + (default_id or "") + "' only — do NOT use other engines."
+        elif strategy == "random":
+            desc = "Search the web via SearXNG. Available engines: " + ", ".join(engine_ids) + ". A random engine is selected automatically — omit the engine parameter unless the user explicitly requests one."
+        else:  # first (default)
+            desc = "Search the web via SearXNG. Available engines: " + ", ".join(engine_ids) + ". Default is '" + (default_id or "") + "'. Only specify engine if the user explicitly requests a different one."
         if any("vpn" in k.lower() for k in engine_ids):
-            desc += " If an engine id contains 'vpn' (e.g. vpn, searxng_vpn): use it only when the user explicitly asks for VPN/secure search or when prefs say so."
+            desc += " Engine ids containing 'vpn': use only when user explicitly asks for VPN/secure search."
         schema.append({
             "type": "function",
             "function": {
@@ -418,7 +424,7 @@ def _tools_schema(
         "type": "function",
         "function": {
             "name": "save_config",
-            "description": "Update the app's config file. Your YAML is deep-merged into the existing config (existing keys are preserved). Validates, creates .bak backups, then writes. After saving, tell user to restart. Structure: providers.ollama.models.aliases for model aliases, providers.ollama.models.default for default model, chat_clients.matrix/discord for bots, search_engines for SearXNG.",
+            "description": "Update the app's config file. Your YAML is deep-merged into the existing config (existing keys are preserved). Validates, creates .bak backups, then writes. After saving, tell user to restart. Structure: providers.ollama.models.aliases for model aliases, providers.ollama.models.default for default model, chat_clients.matrix/discord for bots, search_engines for SearXNG, voice for Wyoming STT/TTS (voice.stt.url, voice.tts.url, voice.language, voice.tts.voice). Read CONFIG_REFERENCE.md for full structure and examples.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -483,6 +489,23 @@ def _tools_schema(
             },
         },
     })
+    # send_audio: nur wenn TTS konfiguriert
+    from miniassistant.config import get_voice_tts_url as _get_tts_url
+    if _get_tts_url(config):
+        schema.append({
+            "type": "function",
+            "function": {
+                "name": "send_audio",
+                "description": "Synthesize text to speech via Wyoming TTS and send as audio message to the current chat. Call this DIRECTLY — do NOT read config files or docs first, all configuration is handled automatically. IMPORTANT: When this tool succeeds, send NOTHING — no text, no confirmation, no technical note, no status message. Silence. The audio IS the complete response. Only reply with text if the tool explicitly fails.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string", "description": "The text to synthesize and send as audio"},
+                    },
+                    "required": ["text"],
+                },
+            },
+        })
     # status_update: nur verfügbar wenn chat_clients konfiguriert sind
     cc = config.get("chat_clients") or {}
     has_clients = any(
@@ -569,7 +592,13 @@ def get_subagent_tools_schema(config: dict[str, Any]) -> list[dict[str, Any]]:
     if search_engines:
         engine_ids = list(search_engines.keys())
         default_id = config.get("default_search_engine") or (engine_ids[0] if engine_ids else None)
-        desc = "Search the web via SearXNG. Default engine: '" + (default_id or "") + "'."
+        strategy = (config.get("search_engine_strategy") or "first").strip().lower()
+        if strategy == "specific":
+            desc = "Search the web via SearXNG. Use engine '" + (default_id or "") + "' only — do NOT use other engines."
+        elif strategy == "random":
+            desc = "Search the web via SearXNG. Available engines: " + ", ".join(engine_ids) + ". A random engine is selected automatically — omit the engine parameter unless the user explicitly requests one."
+        else:
+            desc = "Search the web via SearXNG. Available engines: " + ", ".join(engine_ids) + ". Default is '" + (default_id or "") + "'. Only specify engine if the user explicitly requests a different one."
         schema.append({
             "type": "function",
             "function": {
