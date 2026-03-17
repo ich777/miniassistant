@@ -33,14 +33,20 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 # In-Memory-Sessions (session_id -> session dict)
 _sessions: dict[str, dict] = {}
+_session_last_access: dict[str, float] = {}  # session_id -> timestamp (letzter Zugriff)
+_session_locks: dict[str, threading.Lock] = {}  # session_id -> Lock (verhindert gleichzeitige Modifikation)
+_session_meta_lock = threading.Lock()  # Schützt Zugriff auf _session_locks dict
+_SESSION_TTL = 86400.0  # 24 Stunden
+_config_save_lock = threading.Lock()  # Verhindert gleichzeitige Config-Speichervorgänge
 _onboarding_sessions: dict[str, dict] = {}  # session_id -> { "messages": [...] }
 
 # ---------------------------------------------------------------------------
 # Client-seitige Tool-Ausführung (Round-Trip-Protokoll)
 # ---------------------------------------------------------------------------
-_pending_tool_requests: dict[str, dict] = {}  # tool_id -> {"event": Event, "result": str|None}
+_pending_tool_requests: dict[str, dict] = {}  # tool_id -> {"event": Event, "result": str|None, "session_id": str}
 _tool_requests_lock = threading.Lock()
 _TOOL_REQUEST_TIMEOUT = 60.0  # Sekunden bis Fallback auf serverseitige Ausführung
+_TOOL_RESULT_MAX_BYTES = 100_000  # Max. Größe eines Tool-Results (100 KB)
 
 
 def _make_tool_hook(session_id: str) -> "Callable[[str, str, dict], str | None]":
@@ -48,7 +54,7 @@ def _make_tool_hook(session_id: str) -> "Callable[[str, str, dict], str | None]"
     def hook(req_id: str, tool_name: str, args: dict) -> "str | None":
         ev = threading.Event()
         with _tool_requests_lock:
-            _pending_tool_requests[req_id] = {"event": ev, "result": None}
+            _pending_tool_requests[req_id] = {"event": ev, "result": None, "session_id": session_id}
         # Warte auf Client-Antwort (POST /api/chat/tool_result)
         got = ev.wait(timeout=_TOOL_REQUEST_TIMEOUT)
         with _tool_requests_lock:
@@ -61,6 +67,17 @@ def _make_tool_hook(session_id: str) -> "Callable[[str, str, dict], str | None]"
 
 
 from typing import Callable  # noqa: E402 (nach den anderen Importen)
+
+
+def _get_session_lock(session_id: str) -> threading.Lock:
+    """Gibt den Lock für eine Session zurück, erstellt ihn bei Bedarf."""
+    with _session_meta_lock:
+        lock = _session_locks.get(session_id)
+        if lock is None:
+            lock = threading.Lock()
+            _session_locks[session_id] = lock
+        return lock
+
 
 # ---------------------------------------------------------------------------
 # Rate-Limiting (sliding window, per IP, kein externes Paket)
@@ -127,7 +144,8 @@ _discord_bot_task: asyncio.Task | None = None
 @app.on_event("startup")
 async def _startup() -> None:
     """Bei server.debug: Startup in debug/serve.log schreiben. Chat-Bots starten falls konfiguriert."""
-    global _matrix_bot_task, _discord_bot_task
+    global _matrix_bot_task, _discord_bot_task, _session_cleanup_task
+    _session_cleanup_task = asyncio.create_task(_cleanup_expired_sessions())
     try:
         project_dir = getattr(app.state, "project_dir", None)
         config = load_config(project_dir)
@@ -165,10 +183,31 @@ async def _startup() -> None:
         pass
 
 
+_session_cleanup_task: asyncio.Task | None = None
+
+
+async def _cleanup_expired_sessions() -> None:
+    """Entfernt Sessions die länger als _SESSION_TTL nicht genutzt wurden (läuft alle 10 Minuten)."""
+    while True:
+        await asyncio.sleep(600)
+        now = time.time()
+        expired = [sid for sid, ts in _session_last_access.items() if now - ts > _SESSION_TTL]
+        for sid in expired:
+            _sessions.pop(sid, None)
+            _session_last_access.pop(sid, None)
+            _onboarding_sessions.pop(sid, None)
+            with _session_meta_lock:
+                _session_locks.pop(sid, None)
+        if expired:
+            _log.info("Session-Cleanup: %d abgelaufene Session(s) entfernt", len(expired))
+
+
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    """Bot-Tasks abbrechen und auf Beendigung warten."""
-    global _matrix_bot_task, _discord_bot_task
+    """Bot-Tasks und Cleanup abbrechen."""
+    global _matrix_bot_task, _discord_bot_task, _session_cleanup_task
+    if _session_cleanup_task and not _session_cleanup_task.done():
+        _session_cleanup_task.cancel()
     for task in (_matrix_bot_task, _discord_bot_task):
         if task is not None and not task.done():
             task.cancel()
@@ -253,7 +292,8 @@ async def _token_cookie_middleware(request: Request, call_next):
             if params:
                 clean_url += "?" + urlencode(params)
             resp = _Redirect(url=clean_url, status_code=302)
-            resp.set_cookie("ma_token", url_token, httponly=True, samesite="strict", max_age=365 * 24 * 3600)
+            is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
+            resp.set_cookie("ma_token", url_token, httponly=True, samesite="strict", secure=is_https, max_age=365 * 24 * 3600)
             return resp
     response = await call_next(request)
     return response
@@ -1212,7 +1252,8 @@ async def api_ollama_models(request: Request):
         names = [m.get("name") or m.get("model") or "" for m in (raw or []) if (m.get("name") or m.get("model"))]
         return JSONResponse({"models": names})
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Ollama-Modelle konnten nicht geladen werden: {e}")
+        _log.warning("Ollama-Modelle konnten nicht geladen werden: %s", e)
+        raise HTTPException(status_code=502, detail="Ollama-Modelle konnten nicht geladen werden")
 
 
 @app.get("/api/config")
@@ -1229,46 +1270,48 @@ async def api_config_save(request: Request):
     _require_token(request)
     body = await request.body()
     content = body.decode("utf-8", errors="replace")
-    # Maskierte Secrets durch Originale ersetzen
-    if "****" in content:
+    with _config_save_lock:
+        # Maskierte Secrets durch Originale ersetzen
+        if "****" in content:
+            try:
+                original = load_config_raw()
+                import yaml
+                orig_data = yaml.safe_load(original) or {}
+                new_data = yaml.safe_load(content) or {}
+                # Provider api_keys
+                for prov_name, prov_cfg in (new_data.get("providers") or {}).items():
+                    if isinstance(prov_cfg, dict) and prov_cfg.get("api_key") and "****" in str(prov_cfg.get("api_key", "")):
+                        orig_key = ((orig_data.get("providers") or {}).get(prov_name) or {}).get("api_key")
+                        if orig_key:
+                            content = content.replace(str(prov_cfg["api_key"]), orig_key)
+                # server.token
+                new_srv = (new_data.get("server") or {}).get("token", "")
+                if new_srv and "****" in str(new_srv):
+                    orig_srv = (orig_data.get("server") or {}).get("token")
+                    if orig_srv:
+                        content = content.replace(str(new_srv), orig_srv)
+                # chat_clients.matrix.token
+                new_mx = ((new_data.get("chat_clients") or {}).get("matrix") or {}).get("token", "")
+                if new_mx and "****" in str(new_mx):
+                    orig_mx = ((orig_data.get("chat_clients") or {}).get("matrix") or {}).get("token")
+                    if orig_mx:
+                        content = content.replace(str(new_mx), orig_mx)
+                # chat_clients.discord.bot_token
+                new_dc = ((new_data.get("chat_clients") or {}).get("discord") or {}).get("bot_token", "")
+                if new_dc and "****" in str(new_dc):
+                    orig_dc = ((orig_data.get("chat_clients") or {}).get("discord") or {}).get("bot_token")
+                    if orig_dc:
+                        content = content.replace(str(new_dc), orig_dc)
+            except Exception:
+                pass
+        ok, err = validate_config_raw(content)
+        if not ok:
+            raise HTTPException(status_code=400, detail=err)
         try:
-            original = load_config_raw()
-            import yaml
-            orig_data = yaml.safe_load(original) or {}
-            new_data = yaml.safe_load(content) or {}
-            # Provider api_keys
-            for prov_name, prov_cfg in (new_data.get("providers") or {}).items():
-                if isinstance(prov_cfg, dict) and prov_cfg.get("api_key") and "****" in str(prov_cfg.get("api_key", "")):
-                    orig_key = ((orig_data.get("providers") or {}).get(prov_name) or {}).get("api_key")
-                    if orig_key:
-                        content = content.replace(str(prov_cfg["api_key"]), orig_key)
-            # server.token
-            new_srv = (new_data.get("server") or {}).get("token", "")
-            if new_srv and "****" in str(new_srv):
-                orig_srv = (orig_data.get("server") or {}).get("token")
-                if orig_srv:
-                    content = content.replace(str(new_srv), orig_srv)
-            # chat_clients.matrix.token
-            new_mx = ((new_data.get("chat_clients") or {}).get("matrix") or {}).get("token", "")
-            if new_mx and "****" in str(new_mx):
-                orig_mx = ((orig_data.get("chat_clients") or {}).get("matrix") or {}).get("token")
-                if orig_mx:
-                    content = content.replace(str(new_mx), orig_mx)
-            # chat_clients.discord.bot_token
-            new_dc = ((new_data.get("chat_clients") or {}).get("discord") or {}).get("bot_token", "")
-            if new_dc and "****" in str(new_dc):
-                orig_dc = ((orig_data.get("chat_clients") or {}).get("discord") or {}).get("bot_token")
-                if orig_dc:
-                    content = content.replace(str(new_dc), orig_dc)
-        except Exception:
-            pass
-    ok, err = validate_config_raw(content)
-    if not ok:
-        raise HTTPException(status_code=400, detail=err)
-    try:
-        write_config_raw(content)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            write_config_raw(content)
+        except Exception as e:
+            _log.error("Config konnte nicht gespeichert werden: %s", e)
+            raise HTTPException(status_code=500, detail="Config konnte nicht gespeichert werden")
     return JSONResponse({"ok": True})
 
 
@@ -1463,6 +1506,19 @@ def _save_chat_to_file(session: dict, user_msg: str, assistant_msg: str) -> None
 
 def _chat_stream_generator(session_id: str, session: dict, message: str):
     """Sync generator: NDJSON-Zeilen mit type thinking | content | tool_call | done; fügt session_id hinzu."""
+    lock = _get_session_lock(session_id)
+    if not lock.acquire(timeout=5.0):
+        import json as _json
+        yield _json.dumps({"type": "done", "session_id": session_id, "content": "", "error": "Session wird bereits verwendet"}, ensure_ascii=False) + "\n"
+        return
+    try:
+        yield from _chat_stream_generator_locked(session_id, session, message)
+    finally:
+        lock.release()
+
+
+def _chat_stream_generator_locked(session_id: str, session: dict, message: str):
+    """Interner Generator (mit Session-Lock gehalten)."""
     import json as _json
     for ev in chat_round_stream(
         config=session["config"],
@@ -1525,6 +1581,10 @@ async def api_chat_stream(request: Request):
         if body.get("track"):
             session["_track_chat"] = True
         _sessions[session_id] = session
+    _session_last_access[session_id] = time.time()
+
+    # Cancellation-User-ID setzen (damit chat_round_stream bei Disconnect abbrechen kann)
+    session["config"].setdefault("_chat_context", {})["user_id"] = f"web:{session_id}"
 
     # Lokale Tools: Client übergibt Liste der Tools die er selbst ausführt
     _local_tools = body.get("local_tools")
@@ -1559,8 +1619,39 @@ async def api_chat_stream(request: Request):
             payload["clear"] = True
         one = _json.dumps(payload, ensure_ascii=False) + "\n"
         return StreamingResponse(iter([one]), media_type="application/x-ndjson")
+    cancel_key = f"web:{session_id}"
+
+    async def _stream_with_disconnect():
+        """Wrapper: leitet sync generator weiter und signalisiert Cancellation bei Client-Disconnect."""
+        gen = _chat_stream_generator(session_id, session, message)
+        loop = asyncio.get_event_loop()
+        _done = False
+
+        async def _disconnect_watcher():
+            """Prueft periodisch ob der Client disconnected hat."""
+            while not _done:
+                await asyncio.sleep(2.0)
+                if await request.is_disconnected():
+                    from miniassistant.cancellation import request_cancel
+                    request_cancel(cancel_key, "stop")
+                    _log.info("Client disconnected (session %s) — Cancellation signalisiert", session_id)
+                    return
+
+        watcher = asyncio.create_task(_disconnect_watcher())
+        try:
+            # Sync generator in Threadpool ausfuehren
+            while True:
+                try:
+                    chunk = await loop.run_in_executor(None, next, gen)
+                    yield chunk
+                except StopIteration:
+                    break
+        finally:
+            _done = True
+            watcher.cancel()
+
     return StreamingResponse(
-        _chat_stream_generator(session_id, session, message),
+        _stream_with_disconnect(),
         media_type="application/x-ndjson",
     )
 
@@ -1568,19 +1659,26 @@ async def api_chat_stream(request: Request):
 @app.post("/api/chat/tool_result")
 async def api_chat_tool_result(request: Request):
     """Client meldet Ergebnis einer lokal ausgeführten Tool-Anfrage zurück.
-    Body: { tool_id: str, result: str }
+    Body: { tool_id: str, result: str, session_id: str }
     """
     _require_token(request)
     body = await request.json()
     tool_id = (body.get("tool_id") or "").strip()
     result = body.get("result")
+    caller_sid = (body.get("session_id") or "").strip()
     if not tool_id:
         raise HTTPException(status_code=400, detail="tool_id required")
     with _tool_requests_lock:
         entry = _pending_tool_requests.get(tool_id)
     if not entry:
         raise HTTPException(status_code=404, detail="tool_id not found or already expired")
-    entry["result"] = str(result) if result is not None else ""
+    # Session-Binding: nur die Session darf antworten, die den Request ausgelöst hat
+    if caller_sid and entry.get("session_id") and caller_sid != entry["session_id"]:
+        raise HTTPException(status_code=403, detail="session_id mismatch")
+    result_str = str(result) if result is not None else ""
+    if len(result_str.encode("utf-8", errors="replace")) > _TOOL_RESULT_MAX_BYTES:
+        result_str = result_str[:_TOOL_RESULT_MAX_BYTES] + "\n… (gekürzt)"
+    entry["result"] = result_str
     entry["event"].set()
     return JSONResponse({"ok": True})
 
@@ -1601,6 +1699,7 @@ async def api_chat(request: Request):
         project_dir = getattr(request.app.state, "project_dir", None)
         session = create_session(None, project_dir)
         _sessions[session_id] = session
+    _session_last_access[session_id] = time.time()
     result = handle_user_input(session, message)
     response_text = result[0]
     session = result[1]
@@ -2276,7 +2375,8 @@ async def api_restart(request: Request):
         method = "systemd" if "systemctl" in cmd else "init.d"
         return JSONResponse({"ok": True, "method": method, "message": f"Restart via {method} ausgelöst."})
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Restart fehlgeschlagen: {e}")
+        _log.error("Restart fehlgeschlagen: %s", e)
+        raise HTTPException(status_code=500, detail="Restart fehlgeschlagen")
 
 
 @app.get("/api/usage")

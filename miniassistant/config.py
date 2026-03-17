@@ -231,8 +231,18 @@ def write_config_raw(content: str, project_dir: str | None = None) -> Path:
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     backup_config(path)
-    path.write_text(content, encoding="utf-8")
-    path.chmod(0o600)
+    fd, tmp_str = tempfile.mkstemp(dir=path.parent, prefix=".config_tmp_", suffix=".yaml")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.chmod(tmp_str, 0o600)
+        os.replace(tmp_str, path)
+    except Exception:
+        try:
+            os.unlink(tmp_str)
+        except OSError:
+            pass
+        raise
     return path
 
 

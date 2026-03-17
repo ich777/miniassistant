@@ -6,8 +6,11 @@ Migriert automatisch alte Daten aus config/matrix/.
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import shutil
+import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -22,6 +25,7 @@ _RATE_LIMIT_WINDOW = 60  # seconds
 _failed_attempts: dict[str, list[float]] = {}  # key → list of timestamps
 
 _migration_done = False
+_auth_file_lock = threading.Lock()  # Schützt Read-Modify-Write auf JSON-Dateien
 
 
 def _auth_dir(config_dir: str | None = None) -> Path:
@@ -113,8 +117,17 @@ def _load_json(path: Path, default: dict | list) -> dict | list:
 
 def _save_json(path: Path, data: dict | list) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=0)
+    fd, tmp_str = tempfile.mkstemp(dir=path.parent, prefix=".auth_tmp_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=0)
+        os.replace(tmp_str, path)
+    except Exception:
+        try:
+            os.unlink(tmp_str)
+        except OSError:
+            pass
+        raise
 
 
 def _pending_data(config_dir: str | None = None) -> dict:
@@ -142,14 +155,15 @@ def get_or_generate_code(platform: str, user_id: str, config_dir: str | None = N
 def generate_code(platform: str, user_id: str, config_dir: str | None = None) -> str:
     """Erzeugt einen zufälligen Code, speichert ihn mit Ablaufzeit, gibt den Code zurück."""
     code = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(8))
-    path = _pending_path(config_dir)
-    data = _pending_data(config_dir)
-    data[code.upper()] = {
-        "platform": (platform or "").strip().lower(),
-        "user_id": (user_id or "").strip(),
-        "expires_at": time.time() + CODE_VALIDITY_SECONDS,
-    }
-    _save_json(path, data)
+    with _auth_file_lock:
+        path = _pending_path(config_dir)
+        data = _pending_data(config_dir)
+        data[code.upper()] = {
+            "platform": (platform or "").strip().lower(),
+            "user_id": (user_id or "").strip(),
+            "expires_at": time.time() + CODE_VALIDITY_SECONDS,
+        }
+        _save_json(path, data)
     return code
 
 
@@ -197,39 +211,42 @@ def consume_code(code: str, config_dir: str | None = None) -> tuple[str, str] | 
     rate_key = f"auth:{config_dir or 'default'}"
     if _check_rate_limit(rate_key):
         return None
-    path = _pending_path(config_dir)
-    data = _load_json(path, {})
-    if not isinstance(data, dict):
-        _record_failed_attempt(rate_key)
-        return None
-    entry = data.pop(code, None)
-    if not entry or not isinstance(entry, dict):
-        _record_failed_attempt(rate_key)
-        return None
-    expires = entry.get("expires_at") or 0
-    if time.time() > expires:
+    with _auth_file_lock:
+        path = _pending_path(config_dir)
+        data = _load_json(path, {})
+        if not isinstance(data, dict):
+            _record_failed_attempt(rate_key)
+            return None
+        entry = data.pop(code, None)
+        if not entry or not isinstance(entry, dict):
+            _record_failed_attempt(rate_key)
+            return None
+        expires = entry.get("expires_at") or 0
+        if time.time() > expires:
+            _save_json(path, data)
+            _record_failed_attempt(rate_key)
+            return None
+        platform = (entry.get("platform") or "").strip()
+        user_id = (entry.get("user_id") or "").strip()
+        if not platform or not user_id:
+            _save_json(path, data)
+            return None
         _save_json(path, data)
-        _record_failed_attempt(rate_key)
-        return None
-    platform = (entry.get("platform") or "").strip()
-    user_id = (entry.get("user_id") or "").strip()
-    if not platform or not user_id:
-        _save_json(path, data)
-        return None
-    _save_json(path, data)
     add_authorized(platform, user_id, config_dir)
     return (platform, user_id)
 
 
 def add_authorized(platform: str, user_id: str, config_dir: str | None = None) -> None:
     """Fügt einen Nutzer zur autorisierten Liste hinzu."""
-    path = _authorized_path(config_dir)
-    data = _load_json(path, [])
-    if not isinstance(data, list):
-        data = []
     plat = (platform or "").strip().lower()
     uid = (user_id or "").strip()
-    if plat and uid:
+    if not plat or not uid:
+        return
+    with _auth_file_lock:
+        path = _authorized_path(config_dir)
+        data = _load_json(path, [])
+        if not isinstance(data, list):
+            data = []
         # Duplikat-Check
         for entry in data:
             if isinstance(entry, dict) and entry.get("platform") == plat and entry.get("user_id") == uid:

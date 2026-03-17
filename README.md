@@ -47,12 +47,12 @@ Durchlauf: Ollama-URL, num_ctx, Bind (localhost oder 0.0.0.0), Port, Agent-Verze
 
 ## Ollama-Optionen (temperature, top_p, …)
 
-Unter `ollama.options` können alle von Ollama unterstützten **ModelOptions** gesetzt werden (werden bei jedem Chat-Request mitgeschickt):
+Unter `providers.ollama.options` können alle von Ollama unterstützten **ModelOptions** gesetzt werden (werden bei jedem Chat-Request mitgeschickt):
 
 - **temperature** (float): Zufälligkeit (niedriger = deterministischer, z. B. 0.2 für Fakten; höher = kreativer, z. B. 0.8–1.2). Default oft 0.8.
 - **top_p** (float): Nucleus Sampling (z. B. 0.9). Nur entweder temperature oder top_p stark verändern.
 - **top_k** (int): Nur die K wahrscheinlichsten nächsten Tokens (z. B. 40).
-- **num_ctx** (int): Kontextlänge in Tokens (kann auch oben unter `ollama.num_ctx` stehen).
+- **num_ctx** (int): Kontextlänge in Tokens (kann auch oben unter `providers.ollama.num_ctx` stehen).
 - **num_predict** (int): Maximale Anzahl zu generierender Tokens.
 - **seed** (int): Fester Zufallssamen für reproduzierbare Ausgaben.
 - **min_p** (float): Mindest-Wahrscheinlichkeit für Token-Auswahl.
@@ -61,14 +61,15 @@ Unter `ollama.options` können alle von Ollama unterstützten **ModelOptions** g
 Beispiel in `config.yaml` / `miniassistant.yaml`:
 
 ```yaml
-ollama:
-  base_url: http://127.0.0.1:11434
-  num_ctx: 8192
-  think: true
-  options:
-    temperature: 0.7
-    top_p: 0.9
-    top_k: 40
+providers:
+  ollama:
+    base_url: http://127.0.0.1:11434
+    num_ctx: 8192
+    think: true
+    options:
+      temperature: 0.7
+      top_p: 0.9
+      top_k: 40
 ```
 
 ## Nutzung

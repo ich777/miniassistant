@@ -69,6 +69,23 @@ curl -s -N http://localhost:8765/v1/chat/completions \
 Der Agent-Kontext (SOUL, IDENTITY, TOOLS, USER, Memory) wird automatisch als System-Prompt vorgeschaltet.
 Details: [OPENAI_API.md](../../OPENAI_API.md)
 
+## Client-side tool execution
+
+When using `local_tools` in `/api/chat/stream`, the server may send `tool_request` events. The client executes the tool locally and returns the result:
+
+```bash
+curl -s -X POST http://localhost:8765/api/chat/tool_result \
+  -H "Authorization: Bearer SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"tool_id": "uuid-from-tool-request", "result": "command output here", "session_id": "your-session-id"}'
+```
+
+- `tool_id` (required): The ID from the `tool_request` event
+- `result` (required): Tool execution output (max 100 KB, truncated if larger)
+- `session_id` (recommended): Must match the session that triggered the request
+
+Timeout: 60 seconds. If no result is received, the server executes the tool itself as fallback.
+
 ## Useful for schedules
 
 In a schedule prompt, the assistant runs with full tool access. To trigger from bash (e.g. after a backup script):
