@@ -133,6 +133,8 @@ def _system_and_runtime_section(is_root: bool) -> str:
         parts.append("Running as **root** – no sudo needed")
     else:
         parts.append("Not root – use **sudo** when needed")
+    import sys as _sys
+    parts.append(f"Python: **{_sys.executable}**")
     return f"## System\n**Heute:** {date_str}\n\n" + ". ".join(parts) + ".\n\n"
 
 
@@ -264,8 +266,14 @@ def _planning_section(config: dict[str, Any]) -> str:
 
 
 def _docs_dir_path(config: dict[str, Any]) -> Path | None:
-    """Path to docs/ directory. Uses agent_dir/docs/ (synced by docs loader) or package fallback."""
-    return _docs_dir_path_from_config(config)
+    """Path to docs/ directory. Uses agent_dir/docs/ (synced by docs loader) or package fallback.
+    Caches result on config dict to avoid redundant path lookups within a single build."""
+    cached = config.get("_docs_dir_cache")
+    if cached is not None:
+        return cached if cached else None
+    result = _docs_dir_path_from_config(config)
+    config["_docs_dir_cache"] = result or ""
+    return result
 
 
 def _docs_reference_section(config: dict[str, Any]) -> str:
@@ -296,18 +304,27 @@ def _docs_reference_section(config: dict[str, Any]) -> str:
         "| `DEBATE.md` | Multi-round AI debate |\n"
         "| `AVATARS.md` | Bot profile picture |\n"
         "| `EMAIL.md` | IMAP/SMTP, multi-account, tracking, auto-reply |\n"
-        "| `VOICE.md` | Wyoming STT/TTS, voice setup, supported formats |\n"
-        "| `CHAT_HISTORY.md` | How to find past conversations (date → memory file → summarize) |\n\n"
+        "| `VOICE.md` | Wyoming STT/TTS, voice setup, send_audio text formatting |\n"
+        "| `CHAT_HISTORY.md` | How to find past conversations (date → memory file → summarize) |\n"
+        "| `PROMPT_ENGINEERING.md` | Writing prompts/rules/instructions for LLMs |\n"
+        "| `WEB_FETCHING.md` | read_url JS rendering (Playwright) and proxies |\n"
+        "| `API_REFERENCE.md` | REST API endpoints, OpenAI-compatible API |\n\n"
     )
 
 
-def _memory_section(project_dir: str | None) -> str:
-    """Kurzer Memory-Auszug (letzte Tage, max Zeilen) für den System-Prompt."""
-    mem = get_memory_for_prompt(project_dir, max_lines=400, days=2)
-    header = "## Memory (letzte 2 Tage)\n"
+def _memory_section(project_dir: str | None, config: dict[str, Any] | None = None) -> str:
+    """Kurzer Memory-Auszug (letzte Tage, max Zeilen) für den System-Prompt. Uses memory config values."""
+    if config is None:
+        config = load_config(project_dir)
+    mem_cfg = config.get("memory") or {}
+    days = int(mem_cfg.get("days", 2) or 2)
+    max_tokens = int(mem_cfg.get("max_tokens", 4000) or 4000)
+    max_chars_per_line = int(mem_cfg.get("max_chars_per_line", 300) or 300)
+    mem = get_memory_for_prompt(project_dir, max_lines=400, days=days, max_chars_per_line=max_chars_per_line, max_tokens=max_tokens)
+    header = f"## Memory (letzte {days} Tage)\n"
     footer = "\n*(Ältere Gespräche: lies `CHAT_HISTORY.md` aus dem Docs-Verzeichnis — dort steht, wie du nach Datum suchst.)*\n\n"
     if not mem:
-        return header + "*(Keine Einträge für heute/gestern.)*" + footer
+        return header + "*(Keine Einträge.)*" + footer
     return header + mem + footer
 
 
@@ -347,8 +364,53 @@ def _knowledge_verification_section() -> str:
 
 
 def _tools_umgebung_section(tools_md: str, config: dict[str, Any]) -> str:
-    """TOOLS.md-Inhalt (Suchmaschinen-Info ist bereits im Tool-Schema)."""
-    return (tools_md or "").strip()
+    """TOOLS.md-Inhalt + Verbindungsübersicht (Proxies / Search Engines) falls konfiguriert."""
+    lines = []
+    if tools_md:
+        lines.append(tools_md.strip())
+
+    # Verfügbare Verbindungen: Proxies für read_url + passende Search Engines
+    from miniassistant.tools import get_read_url_proxy_names
+    ru_proxies = get_read_url_proxy_names(config)
+    search_engines = config.get("search_engines") or {}
+    if ru_proxies:
+        lines.append("\n## Available network connections")
+        lines.append(
+            "These are the named outbound connections on this system. "
+            "The user calls them 'VPN' or 'connection' — there are NO tunnel interfaces (tun0/wg0). "
+            "**For HTTP requests and IP checks: use `read_url` with `proxy=`. "
+            "For web searches: use `web_search` with `engine=`. "
+            "NEVER use `exec`/`curl`/`ip`/`ifconfig` to test connections or get public IPs.**\n"
+        )
+        lines.append("| Name | read_url proxy | web_search engine | Notes |")
+        lines.append("|------|---------------|-------------------|-------|")
+        # Baue Mapping: proxy-name → search-engine-name (nach Namensähnlichkeit)
+        engine_ids = list(search_engines.keys())
+        default_engine = (config.get("default_search_engine") or (engine_ids[0] if engine_ids else "")).strip()
+        ru_default = ((config.get("read_url") or {}).get("default_proxy") or (ru_proxies[0][0] if ru_proxies else "")).strip()
+        for pname, purl in ru_proxies:
+            # Suche passende Search Engine: gleicher Name oder ähnlich (vpn1↔vpn, direct↔main)
+            matched_engine = ""
+            if pname in engine_ids:
+                matched_engine = pname
+            else:
+                for eid in engine_ids:
+                    if eid in pname or pname in eid:
+                        matched_engine = eid
+                        break
+                if not matched_engine:
+                    # direct/no-proxy → default engine
+                    if not purl and default_engine:
+                        matched_engine = default_engine
+            proxy_cell = f"`{pname}`" + (" ← default" if pname == ru_default else "")
+            engine_cell = f"`{matched_engine}`" + (" ← default" if matched_engine == default_engine else "") if matched_engine else "–"
+            url_note = purl if purl else "no proxy / direct"
+            lines.append(f"| **{pname}** | {proxy_cell} | {engine_cell} | {url_note} |")
+        lines.append(
+            f"\nExample: `read_url(url=\"https://ifconfig.me/ip\", proxy=\"vpn1\")` → exit IP of vpn1. "
+            f"Return all at once in parallel: one `read_url` per connection in a single response."
+        )
+    return "\n".join(lines).strip()
 
 
 def _exec_behavior_section() -> str:
@@ -369,7 +431,8 @@ def _tools_section(config: dict[str, Any]) -> str:
             "prompt = plain language task (e.g. `'List open issues from GitHub repo OWNER/REPO'`) — "
             "NO shell commands, NO exec:/tool syntax, NO pre-written answers, NO result previews. "
             "After creating: confirm what was scheduled, when, and what it will do. "
-            f"Read `{docs_prefix}SCHEDULES.md` for edge cases (once, simple messages, editing, now+schedule)."
+            f"Read `{docs_prefix}SCHEDULES.md` for edge cases (once, simple messages, editing, now+schedule, prompt engineering for API/exec schedules). "
+            f"For complex schedule prompts (API calls, exec, self-deletion): also read `{docs_prefix}PROMPT_ENGINEERING.md`."
         )
     lines.append(
         "- `save_config`: **only for system config** (see Persistence section). Pass only keys to change (deep-merged). After saving, tell the user to restart **miniassistant**.\n"
@@ -394,10 +457,65 @@ def _tools_section(config: dict[str, Any]) -> str:
         )
     lines.append("- `check_url`: only when user explicitly asks to verify/check links.")
     lines.append(
-        "- `read_url`: Read the actual content of a web page. Use this to read URLs found during research, "
-        "or URLs the user sends you. **When the user sends a link and says 'schau dir das an' or 'lies das': "
-        "use `read_url` to read the content — do NOT guess what the page says.**"
+        "- **URL / web fetching rules:**\n"
+        "  (a) Never construct, guess, or assume URLs, API endpoints, or query parameters from memory — "
+        "training data is outdated. Always verify a URL is real and accessible before using it.\n"
+        "  (b) `read_url` can only READ static content — it CANNOT fill forms, click buttons, or navigate multi-step flows. "
+        "For any site that requires form interaction (package tracking, login, search forms): use `exec` with a Playwright script. "
+        "Read `WEB_FETCHING.md` for the exact inspect-first pattern.\n"
+        "  (c) **Escalation rule:** If `read_url` returns the homepage, an error, or generic content instead of the specific data you need: "
+        "the site requires form interaction. Do NOT give up. Do NOT tell the user the data is unavailable. "
+        "Immediately escalate to a Playwright script via `exec` — inspect the page first, then interact."
     )
+    # read_url: Basis-Regel + Proxy-Info falls konfiguriert
+    from miniassistant.tools import get_read_url_proxy_names
+    ru_proxies = get_read_url_proxy_names(config)
+    ru_default = ((config.get("read_url") or {}).get("default_proxy") or (ru_proxies[0][0] if ru_proxies else "")).strip()
+    if ru_proxies:
+        proxy_list = ", ".join(
+            f'`{name}`' + (" (direct/no proxy)" if not url else f" ({url})")
+            for name, url in ru_proxies
+        )
+        non_direct = [name for name, url in ru_proxies if url]
+        direct_names = [name for name, url in ru_proxies if not url]
+        exit_ip_example = (
+            f'`read_url(url="https://ifconfig.me/ip", proxy="{non_direct[0]}")` '
+            f'gives {non_direct[0]}\'s exit IP'
+            if non_direct else
+            f'`read_url(url="https://ifconfig.me/ip", proxy="{ru_proxies[0][0]}")` gives exit IP'
+        )
+        parallel_example = ""
+        if non_direct:
+            all_names = ([direct_names[0]] if direct_names else []) + non_direct
+            if len(all_names) >= 2:
+                calls = ", ".join(
+                    f'read_url(url="https://ifconfig.me/ip", proxy="{n}")'
+                    for n in all_names[:3]
+                )
+                parallel_example = (
+                    f"\n  To get ALL exit IPs at once, return them **in parallel** (one response): {calls}."
+                )
+        lines.append(
+            "- `read_url`: Read the actual content of a web page. Use this to read URLs found during research, "
+            "or URLs the user sends you. **When the user sends a link and says 'schau dir das an' or 'lies das': "
+            "use `read_url` to read the content — do NOT guess what the page says.**\n"
+            f"  **Proxies / VPN exits available:** {proxy_list}. Default: `{ru_default}`.\n"
+            "  These proxy entries are the VPN/proxy exit points — when the user asks about 'VPN IPs', 'proxy IPs', "
+            "or 'exit IPs', they mean these entries. Use `read_url` with the `proxy` parameter — "
+            "**NEVER use `exec`/`curl`/`ip`/`ifconfig` for checking exit IPs or proxy connectivity**, "
+            "as those only show local network interfaces, not proxy exits.\n"
+            "  **Session routing preference:** When the user says to use a specific connection or VPN"
+            " (e.g. 'use vpn1', 'route everything via VPN'), apply it to ALL subsequent `read_url` calls (proxy=)"
+            " AND all `web_search` calls (engine=) for the rest of the conversation. Proxy and engine names correspond:"
+            " e.g. proxy `vpn1` ↔ engine `vpn`, proxy `vpn2` ↔ engine `vpn2`, proxy `direct` ↔ engine `main`.\n"
+            f"  {exit_ip_example}.{parallel_example}"
+        )
+    else:
+        lines.append(
+            "- `read_url`: Read the actual content of a web page. Use this to read URLs found during research, "
+            "or URLs the user sends you. **When the user sends a link and says 'schau dir das an' or 'lies das': "
+            "use `read_url` to read the content — do NOT guess what the page says.**"
+        )
     lines.append(
         "- **Parallel execution:** When you return multiple tool calls in a single response, "
         "these tools run **concurrently** (in parallel): `web_search`, `read_url`, `check_url`, `read_email`, `invoke_model`. "
@@ -555,8 +673,10 @@ def build_system_prompt(
         config = load_config(project_dir)
     # basic_rules laden (kopiert Defaults nach agent_dir/basic_rules/ falls nötig, cached im RAM)
     _load_basic_rules(config)
-    # docs kopieren (kopiert Defaults nach agent_dir/docs/ falls nötig)
-    _ensure_docs(config)
+    # docs kopieren (kopiert Defaults nach agent_dir/docs/ falls nötig); Ergebnis direkt als Cache setzen
+    _docs_result = _ensure_docs(config)
+    if "_docs_dir_cache" not in config:
+        config["_docs_dir_cache"] = _docs_result or ""
     agent_dir = config.get("agent_dir") or ""
     max_chars = config.get("max_chars_per_file") or 500
     files = load_agent_files(agent_dir, max_chars)
@@ -567,8 +687,15 @@ def build_system_prompt(
         "You are the assistant of **MiniAssistant**. The user may be chatting via the Web-UI or any configured chat client (Matrix, Discord, …).",
         "**Core rules:** "
         "(1) **Just do it.** Use your tools immediately — don't explain what you *would* do, just do it. The user wants results, not your thought process. (Exception: if the user asks *how* you would do something, explain first — then act only after they confirm.) "
-        "(2) **Research actively.** Before answering any factual question: `web_search` first, then answer. Do not rely on your knowledge (= training data) — it is outdated. This applies to everything: technical questions, product info, current events, prices, weather, specs. "
-        "**Exception:** Questions about your own capabilities, tools, or behavior (e.g. 'kannst du suchen?', 'hast du ein Tool für X?') → answer from your system prompt, do NOT web_search. "
+        "(2) **Inform first, then act.** Before doing anything that touches an external system, file, page, or API: gather current state first with your tools — never assume, never use training-data memory. "
+        "The pattern is always: **look → think → act**. Never skip the look step. "
+        "Before answering a factual question → `web_search`. "
+        "Before interacting with a web page → load and inspect it first, then act. "
+        "Before editing a file → read it. "
+        "Before using an API or URL → verify it exists and is publicly accessible with a real request first. "
+        "**URLs and APIs: never construct, guess, or assume.** Your training data is outdated — site structures, API endpoints, and query parameters change constantly. "
+        "A URL you think exists may return 404, require auth, or be completely different. Always: (a) `web_search` to find the current official URL/API docs, then (b) `read_url` to verify it actually loads and is accessible, then (c) act. "
+        "**Exception:** Questions about your own capabilities or tools → answer from your system prompt, do NOT web_search. "
         "(3) **Step by step.** One tool call at a time, check the result, then next step. "
         "(4) **Real values, real results.** Never use placeholder strings (`HOMESERVER`, `BOT_TOKEN`) — read config first. End with a clear, verified answer — not guesses. "
         "(5) **Read docs yourself.** If you need a docs file, read it and follow the instructions — don't tell the user to read it. "
@@ -593,7 +720,7 @@ def build_system_prompt(
         "## USER (about your human)",
         files.get("USER.md", ""),
         "",
-        _memory_section(project_dir),
+        _memory_section(project_dir, config),
         _prefs_section(config),
         _language_section(config, files.get("IDENTITY.md") or ""),
         _knowledge_verification_section(),

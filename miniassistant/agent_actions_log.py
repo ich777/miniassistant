@@ -61,13 +61,53 @@ def log_thinking(config: dict[str, Any], thinking: str) -> None:
     _write(path, f"[{_ts()}] THINKING\n{t}\n")
 
 
-def log_response(config: dict[str, Any], content: str) -> None:
+def extract_tps(response: dict[str, Any], elapsed_s: float, content: str = "", thinking: str = "") -> tuple[float, bool] | None:
+    """Berechnet Tokens/Sekunde aus der API-Antwort.
+    Gibt (tps, exact) zurück:
+      exact=True  → Ollama lokal: eval_count / (eval_duration / 1e9)
+      exact=False → Näherung: token_count / elapsed_s  oder  chars/4 / elapsed_s
+
+    thinking: optionaler Thinking-Text — wird in die Schätzung einbezogen, da
+    elapsed_s die gesamte Denkzeit enthält und ohne Thinking-Token die t/s-Zahl
+    stark unterschätzt würde.
+    """
+    # Ollama lokal: eval_count (Tokens) und eval_duration (Nanosekunden) — exakt
+    # eval_count enthält alle generierten Token inkl. Thinking → korrekte Hardwarerate
+    eval_count = response.get("eval_count")
+    eval_duration = response.get("eval_duration")
+    if eval_count and eval_duration and eval_duration > 0:
+        return (eval_count / (eval_duration / 1e9), True)
+    # Andere Provider: token count aus usage + Wall-Clock-Zeit — Näherung
+    if elapsed_s and elapsed_s > 0:
+        usage = response.get("usage") or {}
+        tokens = (
+            usage.get("completion_tokens")   # OpenAI, vLLM, DeepSeek
+            or usage.get("output_tokens")    # Anthropic
+            or usage.get("candidatesTokenCount")  # Google
+        )
+        if tokens and tokens > 0:
+            return (tokens / elapsed_s, False)
+        # Letzter Fallback: Content + Thinking-Länge schätzen (~4 chars/token)
+        # Thinking-Token mitzählen, da elapsed_s auch die Denkzeit enthält
+        total_chars = len(content) + len(thinking)
+        if total_chars > 0:
+            estimated = total_chars / 4
+            return (estimated / elapsed_s, False)
+    return None
+
+
+def log_response(config: dict[str, Any], content: str, tps: tuple[float, bool] | None = None) -> None:
     """Loggt die Antwort der KI."""
     path = _log_path(config)
     if not path or not content:
         return
     c = content if len(content) <= 3000 else content[:3000] + "…"
-    _write(path, f"[{_ts()}] RESPONSE\n{c}\n")
+    if tps is not None:
+        value, exact = tps
+        tps_str = f"  ({value:.1f} t/s)" if exact else f"  (~{value:.1f} t/s)"
+    else:
+        tps_str = ""
+    _write(path, f"[{_ts()}] RESPONSE{tps_str}\n{c}\n")
 
 
 def log_tool_call(config: dict[str, Any], tool_name: str, arguments: dict[str, Any], result: str) -> None:

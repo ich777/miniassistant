@@ -32,24 +32,25 @@ fi
 
 # --- System-Pakete installieren (vor der Python-Prüfung); bei Fehler (z. B. ohne sudo) weitermachen ---
 # Für Matrix-E2EE: libolm-dev, cmake, make, python3-dev (Header für C-Erweiterungen wie python-olm)
-echo "System-Pakete (python3, venv, pip; für Matrix-E2EE: libolm-dev, cmake, make, python3-dev; für Voice: ffmpeg)..."
+echo "System-Pakete (python3, venv, pip; für Matrix-E2EE: libolm-dev, cmake, make, python3-dev; für Voice: ffmpeg; Emoji-Schrift: fonts-noto-color-emoji)..."
 if command -v apt-get >/dev/null 2>&1; then
-  ( $SUDO apt-get update -qq && $SUDO apt-get install -y python3 python3-venv python3-pip python3-dev python3-yaml libolm-dev cmake build-essential ffmpeg ) 2>/dev/null || {
-    ( $SUDO apt-get update -qq && $SUDO apt-get install -y python3 python3-venv python3-pip python3-dev python3-yaml libolm-dev cmake make ffmpeg ) 2>/dev/null || \
-    ( $SUDO apt-get update -qq && $SUDO apt-get install -y python3 python3-venv python3-pip python3-yaml ffmpeg ) 2>/dev/null || \
+  ( $SUDO apt-get update -qq && $SUDO apt-get install -y python3 python3-venv python3-pip python3-dev python3-yaml libolm-dev cmake build-essential ffmpeg fonts-noto-color-emoji ) 2>/dev/null || {
+    ( $SUDO apt-get update -qq && $SUDO apt-get install -y python3 python3-venv python3-pip python3-dev python3-yaml libolm-dev cmake make ffmpeg fonts-noto-color-emoji ) 2>/dev/null || \
+    ( $SUDO apt-get update -qq && $SUDO apt-get install -y python3 python3-venv python3-pip python3-yaml ffmpeg fonts-noto-color-emoji ) 2>/dev/null || \
+    ( $SUDO apt-get update -qq && $SUDO apt-get install -y python3 python3-venv python3-pip python3-yaml fonts-noto-color-emoji ) 2>/dev/null || \
     ( $SUDO apt-get update -qq && $SUDO apt-get install -y python3 python3-venv python3-pip python3-yaml ) 2>/dev/null || true
-    echo "  Hinweis: Installation fehlgeschlagen oder abgebrochen (z. B. ohne sudo). Für E2EE: libolm-dev, cmake, make, python3-dev. Für Voice: ffmpeg."
+    echo "  Hinweis: Installation fehlgeschlagen oder abgebrochen (z. B. ohne sudo). Für E2EE: libolm-dev, cmake, make, python3-dev. Für Voice: ffmpeg. Für Emoji-CLI: fonts-noto-color-emoji."
   }
 elif command -v dnf >/dev/null 2>&1; then
-  ( $SUDO dnf install -y python3 python3-virtualenv python3-pip python3-pyyaml olm-devel cmake make ffmpeg ) 2>/dev/null || \
-  ( $SUDO dnf install -y python3 python3-virtualenv python3-pip python3-pyyaml ffmpeg ) 2>/dev/null || \
+  ( $SUDO dnf install -y python3 python3-virtualenv python3-pip python3-pyyaml olm-devel cmake make ffmpeg google-noto-emoji-fonts ) 2>/dev/null || \
+  ( $SUDO dnf install -y python3 python3-virtualenv python3-pip python3-pyyaml ffmpeg google-noto-emoji-fonts ) 2>/dev/null || \
   ( $SUDO dnf install -y python3 python3-virtualenv python3-pip python3-pyyaml ) 2>/dev/null || true
 elif command -v apk >/dev/null 2>&1; then
-  ( $SUDO apk add python3 py3-pip py3-venv py3-yaml olm-dev cmake make ffmpeg ) 2>/dev/null || \
-  ( $SUDO apk add python3 py3-pip py3-venv py3-yaml ffmpeg ) 2>/dev/null || \
+  ( $SUDO apk add python3 py3-pip py3-venv py3-yaml olm-dev cmake make ffmpeg font-noto-emoji ) 2>/dev/null || \
+  ( $SUDO apk add python3 py3-pip py3-venv py3-yaml ffmpeg font-noto-emoji ) 2>/dev/null || \
   ( $SUDO apk add python3 py3-pip py3-venv py3-yaml ) 2>/dev/null || true
 else
-  echo "  Unbekannter Paketmanager. Bitte manuell: python3, python3-venv, python3-pip; für E2EE: libolm, cmake, make; für Voice: ffmpeg."
+  echo "  Unbekannter Paketmanager. Bitte manuell: python3, python3-venv, python3-pip; für E2EE: libolm, cmake, make; für Voice: ffmpeg; für Emoji: fonts-noto-color-emoji."
 fi
 echo ""
 
@@ -166,6 +167,16 @@ echo "Dann: miniassistant config   (Konfiguration / Ersteinrichtung)"
 echo "      miniassistant serve     (Web-UI starten)"
 echo "      miniassistant chat      (CLI-Chat)"
 echo "      miniassistant matrix-e2ee-check   (prüfen, ob Entschlüsselung aktiv)"
+echo ""
+echo ""
+echo "Optional: JS-Rendering (Playwright) für JavaScript-lastige Seiten (SPAs, React/Vue/Angular):"
+echo "  $VENV_DIR/bin/python3 -m pip install 'miniassistant[js]'"
+echo "  $VENV_DIR/bin/playwright install chromium   (~300 MB)"
+echo ""
+echo "Hinweis Emoji im CLI-Chat: fonts-noto-color-emoji wurde installiert."
+echo "  Für korrekte Darstellung wird ein modernes Terminal empfohlen"
+echo "  (GNOME Terminal, kitty, WezTerm, Windows Terminal)."
+echo "  Bei Bedarf: fc-cache -f  (Font-Cache aktualisieren)"
 if [ "$E2EE_OK" = "0" ] && "$VENV_DIR/bin/python3" -c "import nio" 2>/dev/null; then
   echo ""
   echo "Hinweis: Matrix-E2EE ist nicht aktiv. Für verschlüsselte Räume zuerst Build-Pakete installieren (s. o.), dann install.sh erneut ausführen oder: pip install matrix-nio[e2e]"

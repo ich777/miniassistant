@@ -16,6 +16,11 @@ from miniassistant.config import get_config_dir
 # Code gültig 30 Minuten
 CODE_VALIDITY_SECONDS = 1800
 
+# Rate limiting: max failed attempts per time window
+_MAX_FAILED_ATTEMPTS = 5
+_RATE_LIMIT_WINDOW = 60  # seconds
+_failed_attempts: dict[str, list[float]] = {}  # key → list of timestamps
+
 _migration_done = False
 
 
@@ -159,6 +164,25 @@ def _normalize_code(raw: str) -> str:
     return "".join(c for c in raw.upper() if c in "ABCDEFGHJKLMNPQRSTUVWXYZ23456789")
 
 
+def _check_rate_limit(key: str) -> bool:
+    """Returns True if the key is rate-limited (too many failed attempts)."""
+    now = time.time()
+    attempts = _failed_attempts.get(key, [])
+    # Remove expired entries
+    attempts = [t for t in attempts if now - t < _RATE_LIMIT_WINDOW]
+    _failed_attempts[key] = attempts
+    return len(attempts) >= _MAX_FAILED_ATTEMPTS
+
+
+def _record_failed_attempt(key: str) -> None:
+    """Record a failed auth attempt for rate limiting."""
+    now = time.time()
+    attempts = _failed_attempts.get(key, [])
+    attempts = [t for t in attempts if now - t < _RATE_LIMIT_WINDOW]
+    attempts.append(now)
+    _failed_attempts[key] = attempts
+
+
 def consume_code(code: str, config_dir: str | None = None) -> tuple[str, str] | None:
     """
     Prüft den Code; wenn gültig, trägt den Nutzer in die autorisierte Liste ein,
@@ -169,16 +193,23 @@ def consume_code(code: str, config_dir: str | None = None) -> tuple[str, str] | 
     code = _normalize_code(code)
     if not code:
         return None
+    # Rate limit check based on normalized code prefix (first 4 chars as key to group attempts)
+    rate_key = f"auth:{config_dir or 'default'}"
+    if _check_rate_limit(rate_key):
+        return None
     path = _pending_path(config_dir)
     data = _load_json(path, {})
     if not isinstance(data, dict):
+        _record_failed_attempt(rate_key)
         return None
     entry = data.pop(code, None)
     if not entry or not isinstance(entry, dict):
+        _record_failed_attempt(rate_key)
         return None
     expires = entry.get("expires_at") or 0
     if time.time() > expires:
         _save_json(path, data)
+        _record_failed_attempt(rate_key)
         return None
     platform = (entry.get("platform") or "").strip()
     user_id = (entry.get("user_id") or "").strip()

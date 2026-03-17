@@ -1,8 +1,9 @@
-"""Wyoming-Protokoll-Client für STT (faster-whisper) und TTS (Piper).
+"""Wyoming-Protokoll-Client für STT (faster-whisper) und TTS (Piper/Kokoro).
 
 Wyoming: simples TCP-Protokoll mit newline-terminierten JSON-Events + optionalen Binär-Payloads.
 STT: transcribe → audio-start → audio-chunk(s) → audio-stop → transcript
-TTS: synthesize → audio-start + audio-chunk(s) + audio-stop
+TTS Wyoming: synthesize → audio-start + audio-chunk(s) + audio-stop
+TTS HTTP:   POST /v1/audio/speech (OpenAI-compat, z.B. Kokoro-FastAPI)
 """
 from __future__ import annotations
 
@@ -138,6 +139,30 @@ def transcribe(audio_bytes: bytes, url: str, language: str = "de") -> str:
     return ""
 
 
+def _synthesize_http(text: str, url: str, voice: str | None = None) -> bytes:
+    """TTS via HTTP OpenAI-kompatibler API (Kokoro-FastAPI o.ä.).
+
+    Erwartet: POST {url}/v1/audio/speech
+    Body: {"model": "kokoro", "voice": VOICE, "input": TEXT, "response_format": "wav"}
+    Antwort: rohe WAV-Bytes.
+    """
+    import httpx as _httpx
+    endpoint = url.rstrip("/") + "/v1/audio/speech"
+    payload = {
+        "model": "kokoro",
+        "input": text,
+        "response_format": "wav",
+    }
+    if voice:
+        payload["voice"] = voice
+    _log.info("HTTP TTS: %d Zeichen → %s (voice=%s)", len(text), endpoint, voice or "default")
+    resp = _httpx.post(endpoint, json=payload, timeout=120.0)
+    resp.raise_for_status()
+    wav = resp.content
+    _log.info("HTTP TTS: %d bytes WAV empfangen", len(wav))
+    return wav
+
+
 def synthesize(
     text: str,
     url: str,
@@ -147,14 +172,18 @@ def synthesize(
     length_scale: float | None = None,
     sentence_silence: float | None = None,
 ) -> bytes:
-    """Synthetisiert Text zu WAV-Audio via Wyoming TTS (Piper).
+    """Synthetisiert Text zu WAV-Audio.
 
-    Synthesis-Optionen (Piper-spezifisch, alle optional):
-      noise_scale:       Variabilität/Ausdrucksstärke der Stimme    (Default: 0.667)
-      noise_w:           Dauer-Variabilität der Phoneme              (Default: 0.8)
-      length_scale:      Sprechgeschwindigkeit (>1 = langsamer)      (Default: 1.0)
-      sentence_silence:  Pause nach Sätzen in Sekunden               (Default: 0.2)
+    URL-Schema bestimmt das Backend:
+      http:// / https://  → HTTP OpenAI-compat API (Kokoro-FastAPI o.ä.)
+      tcp:// / wyoming:// → Wyoming TCP-Protokoll (Piper)
+
+    Piper-spezifische Optionen (Wyoming only):
+      noise_scale, noise_w, length_scale, sentence_silence
     """
+    if url.startswith("http://") or url.startswith("https://"):
+        return _synthesize_http(text, url, voice=voice)
+
     _log.info("Wyoming TTS: %d Zeichen → %s", len(text), url)
     host, port = _parse_url(url)
     voice_data: dict[str, Any] = {}

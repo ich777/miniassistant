@@ -5,6 +5,7 @@ Speicherort: ~/.config/miniassistant/config.yaml oder ./miniassistant.yaml
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -502,6 +503,7 @@ def _merge_with_defaults(data: dict[str, Any]) -> dict[str, Any]:
         "github_token": (data.get("github_token") or "").strip() or None,
         "email": _normalize_email(data),
         "voice": data.get("voice") or None,
+        "read_url": data.get("read_url") or {},
     }
 
 
@@ -601,9 +603,27 @@ def save_config(config: dict[str, Any], project_dir: str | None = None) -> Path:
     email_norm = _normalize_email(config)
     if email_norm:
         out["email"] = email_norm
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(out, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-    path.chmod(0o600)
+    # Atomarer Schreibvorgang: erst temp-Datei, dann os.replace() (POSIX-atomar)
+    # Verhindert halb-geschriebene Config bei parallelem Start (z.B. serve + token)
+    try:
+        fd, tmp_str = tempfile.mkstemp(dir=path.parent, prefix=".config_tmp_", suffix=".yaml")
+        tmp = Path(tmp_str)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                yaml.safe_dump(out, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            tmp.chmod(0o600)
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+    except Exception:
+        # Fallback auf direktes Schreiben wenn temp-Datei nicht möglich
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(out, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        path.chmod(0o600)
     return path
 
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,7 @@ RULE_FILES = [
 # RAM-Cache: {dateiname: inhalt}
 _cache: dict[str, str] = {}
 _cache_loaded: bool = False
+_cache_lock = threading.Lock()
 
 
 def _ensure_rules_dir(agent_dir: str) -> Path | None:
@@ -53,44 +55,45 @@ def ensure_and_load(config: dict[str, Any]) -> dict[str, str]:
     Returns: dict {dateiname: inhalt}
     """
     global _cache, _cache_loaded
-    if _cache_loaded and _cache:
-        return dict(_cache)
+    with _cache_lock:
+        if _cache_loaded and _cache:
+            return dict(_cache)
 
-    agent_dir = (config.get("agent_dir") or "").strip()
-    rules_dir = _ensure_rules_dir(agent_dir)
+        agent_dir = (config.get("agent_dir") or "").strip()
+        rules_dir = _ensure_rules_dir(agent_dir)
 
-    if rules_dir:
-        # Fehlende Dateien aus Defaults kopieren
-        for fname in RULE_FILES:
-            target = rules_dir / fname
-            if not target.exists():
+        if rules_dir:
+            # Fehlende Dateien aus Defaults kopieren
+            for fname in RULE_FILES:
+                target = rules_dir / fname
+                if not target.exists():
+                    source = _DEFAULTS_DIR / fname
+                    if source.exists():
+                        try:
+                            shutil.copy2(source, target)
+                            _log.info("basic_rules/%s erstellt (Default kopiert)", fname)
+                        except Exception as e:
+                            _log.warning("Konnte %s nicht kopieren: %s", fname, e)
+
+            # Alle .md-Dateien aus dem User-Verzeichnis lesen (auch eigene)
+            for p in sorted(rules_dir.iterdir()):
+                if p.is_file() and p.suffix.lower() == ".md":
+                    try:
+                        _cache[p.name] = p.read_text(encoding="utf-8").strip()
+                    except Exception as e:
+                        _log.warning("Konnte %s nicht lesen: %s", p.name, e)
+        else:
+            # Kein agent_dir → Defaults aus Package direkt laden
+            for fname in RULE_FILES:
                 source = _DEFAULTS_DIR / fname
                 if source.exists():
                     try:
-                        shutil.copy2(source, target)
-                        _log.info("basic_rules/%s erstellt (Default kopiert)", fname)
-                    except Exception as e:
-                        _log.warning("Konnte %s nicht kopieren: %s", fname, e)
+                        _cache[fname] = source.read_text(encoding="utf-8").strip()
+                    except Exception:
+                        pass
 
-        # Alle .md-Dateien aus dem User-Verzeichnis lesen (auch eigene)
-        for p in sorted(rules_dir.iterdir()):
-            if p.is_file() and p.suffix.lower() == ".md":
-                try:
-                    _cache[p.name] = p.read_text(encoding="utf-8").strip()
-                except Exception as e:
-                    _log.warning("Konnte %s nicht lesen: %s", p.name, e)
-    else:
-        # Kein agent_dir → Defaults aus Package direkt laden
-        for fname in RULE_FILES:
-            source = _DEFAULTS_DIR / fname
-            if source.exists():
-                try:
-                    _cache[fname] = source.read_text(encoding="utf-8").strip()
-                except Exception:
-                    pass
-
-    _cache_loaded = True
-    return dict(_cache)
+        _cache_loaded = True
+        return dict(_cache)
 
 
 def get_rule(name: str) -> str:
@@ -102,10 +105,3 @@ def get_all_rules() -> dict[str, str]:
     """Gibt alle gecachten Regeln zurück."""
     return dict(_cache)
 
-
-def reload(config: dict[str, Any]) -> dict[str, str]:
-    """Cache leeren und neu laden (z.B. nach Config-Änderung)."""
-    global _cache, _cache_loaded
-    _cache = {}
-    _cache_loaded = False
-    return ensure_and_load(config)

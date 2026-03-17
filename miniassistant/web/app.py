@@ -11,6 +11,8 @@ import datetime
 import logging
 import os
 import shutil
+import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -33,8 +35,81 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 _sessions: dict[str, dict] = {}
 _onboarding_sessions: dict[str, dict] = {}  # session_id -> { "messages": [...] }
 
+# ---------------------------------------------------------------------------
+# Client-seitige Tool-Ausführung (Round-Trip-Protokoll)
+# ---------------------------------------------------------------------------
+_pending_tool_requests: dict[str, dict] = {}  # tool_id -> {"event": Event, "result": str|None}
+_tool_requests_lock = threading.Lock()
+_TOOL_REQUEST_TIMEOUT = 60.0  # Sekunden bis Fallback auf serverseitige Ausführung
+
+
+def _make_tool_hook(session_id: str) -> "Callable[[str, str, dict], str | None]":
+    """Gibt einen Hook zurück, der den Generator blockiert bis der Client antwortet."""
+    def hook(req_id: str, tool_name: str, args: dict) -> "str | None":
+        ev = threading.Event()
+        with _tool_requests_lock:
+            _pending_tool_requests[req_id] = {"event": ev, "result": None}
+        # Warte auf Client-Antwort (POST /api/chat/tool_result)
+        got = ev.wait(timeout=_TOOL_REQUEST_TIMEOUT)
+        with _tool_requests_lock:
+            entry = _pending_tool_requests.pop(req_id, {})
+        if not got:
+            _log.warning("tool_request %s (%s) Timeout nach %.0fs — Fallback serverseitig", req_id, tool_name, _TOOL_REQUEST_TIMEOUT)
+            return None
+        return entry.get("result") or ""
+    return hook  # type: ignore[return-value]
+
+
+from typing import Callable  # noqa: E402 (nach den anderen Importen)
+
+# ---------------------------------------------------------------------------
+# Rate-Limiting (sliding window, per IP, kein externes Paket)
+# ---------------------------------------------------------------------------
+_rate_buckets: dict[str, list[float]] = {}   # ip -> liste von Request-Timestamps
+_rate_lock = threading.Lock()
+_rate_config_cache: tuple[float, int] = (0.0, 100)  # (cached_at, limit)
+_RATE_WINDOW = 60.0  # Sekunden
+
+
+def _get_rate_limit() -> int:
+    """Liest server.rate_limit aus der Config; cached 30 Sekunden."""
+    global _rate_config_cache
+    now = time.monotonic()
+    cached_at, cached_limit = _rate_config_cache
+    if now - cached_at < 30.0:
+        return cached_limit
+    try:
+        cfg = load_config()
+        limit = int((cfg.get("server") or {}).get("rate_limit", 100) or 100)
+    except Exception:
+        limit = 100
+    _rate_config_cache = (now, limit)
+    return limit
+
+
+def _check_rate_limit(ip: str) -> bool:
+    """True = Anfrage erlaubt, False = Rate-Limit überschritten."""
+    limit = _get_rate_limit()
+    if limit <= 0:
+        return True  # 0 = deaktiviert
+    now = time.time()
+    with _rate_lock:
+        timestamps = _rate_buckets.get(ip, [])
+        # Einträge außerhalb des Fensters entfernen
+        timestamps = [t for t in timestamps if now - t < _RATE_WINDOW]
+        if len(timestamps) >= limit:
+            _rate_buckets[ip] = timestamps
+            return False
+        timestamps.append(now)
+        _rate_buckets[ip] = timestamps
+    return True
+
 app = FastAPI(title="MiniAssistant", version="0.1.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+# OpenAI-kompatible API (/v1/models, /v1/chat/completions)
+from miniassistant.web.openai_compat import router as _openai_router
+app.include_router(_openai_router)
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -106,6 +181,23 @@ async def _shutdown() -> None:
 
 
 @app.middleware("http")
+async def _rate_limit_middleware(request: Request, call_next):
+    """Sliding-Window Rate-Limiter pro IP. Limit: server.rate_limit req/min (default 100). 0 = deaktiviert."""
+    # Statische Dateien und Favicon ausnehmen
+    path = request.url.path
+    if path.startswith("/static/") or path == "/favicon.ico":
+        return await call_next(request)
+    ip = (request.client.host if request.client else None) or "unknown"
+    if not _check_rate_limit(ip):
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded – too many requests. Please slow down."},
+            headers={"Retry-After": "60"},
+        )
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def _debug_log_requests(request: Request, call_next):
     """Bei server.debug: Jeden Request in debug/serve.log schreiben."""
     response = await call_next(request)
@@ -130,12 +222,13 @@ def _get_token_from_request(request: Request) -> str | None:
 
 
 def _require_token(request: Request) -> str:
+    import secrets as _secrets
     config = load_config()
     expected = (config.get("server") or {}).get("token")
     if not expected:
         return ""  # no token configured yet -> allow (e.g. first run)
     token = _get_token_from_request(request)
-    if token and token == expected:
+    if token and _secrets.compare_digest(token, expected):
         return token
     raise HTTPException(status_code=401, detail="Invalid or missing token")
 
@@ -160,7 +253,7 @@ async def _token_cookie_middleware(request: Request, call_next):
             if params:
                 clean_url += "?" + urlencode(params)
             resp = _Redirect(url=clean_url, status_code=302)
-            resp.set_cookie("ma_token", url_token, httponly=False, samesite="strict", max_age=365 * 24 * 3600)
+            resp.set_cookie("ma_token", url_token, httponly=True, samesite="strict", max_age=365 * 24 * 3600)
             return resp
     response = await call_next(request)
     return response
@@ -285,7 +378,7 @@ async def index(request: Request):
     token_esc = _escape(effective_token) if effective_token else ""
     config_links = ""
     if has_token:
-        config_links = '<li><a href="/config' + tq + '">Konfiguration</a></li><li><a href="/nutzung' + tq + '">Nutzung</a></li><li><a href="/schedules' + tq + '">Geplante Jobs</a></li><li><a href="/logs' + tq + '">Logs</a></li><li><a href="/workspace' + tq + '">Workspace Explorer</a></li><li><a href="/api/config' + tq + '">API: Config (JSON)</a></li>'
+        config_links = '<li><a href="/config' + tq + '">Konfiguration</a></li><li><a href="/nutzung' + tq + '">Nutzung</a></li><li><a href="/schedules' + tq + '">Geplante Jobs</a></li><li><a href="/workspace' + tq + '">Workspace Explorer</a></li><li><a href="/logs' + tq + '">Logs</a></li>'
     logout_btn = '<button type="button" class="btn btn-outline" id="logout-btn" style="margin-left:0.5em;">Logout</button>' if is_authed else ""
     html = f"""
     <!DOCTYPE html>
@@ -720,6 +813,7 @@ async def chat_page(request: Request):
     <title>Chat – MiniAssistant</title>
     <link rel="icon" href="/favicon.ico">
     <script src="/static/marked.umd.js"></script>
+    <script src="/static/purify.min.js"></script>
     <style>
     {_COMMON_CSS}
     .chat-wrap {{ display: flex; flex-direction: column; height: 100vh; max-width: min(900px, 98vw); margin: 0 auto; padding: 0.8em 1em; }}
@@ -834,7 +928,7 @@ async def chat_page(request: Request):
               wrap.appendChild(uDiv);
               const aDiv = document.createElement("div");
               aDiv.className = "markdown";
-              aDiv.innerHTML = typeof marked !== "undefined" ? marked.parse(ex.assistant || "") : (ex.assistant || "");
+              aDiv.innerHTML = typeof marked !== "undefined" ? DOMPurify.sanitize(marked.parse(ex.assistant || "")) : (ex.assistant || "");
               aDiv.style.marginBottom = "0.6rem";
               wrap.appendChild(aDiv);
             }});
@@ -864,7 +958,7 @@ async def chat_page(request: Request):
       const content = document.createElement("div");
       content.className = "content" + (isMarkdown ? " markdown" : "");
       if (isMarkdown && typeof marked !== "undefined")
-        content.innerHTML = marked.parse(text || "");
+        content.innerHTML = DOMPurify.sanitize(marked.parse(text || ""));
       else
         content.textContent = text || "";
       p.appendChild(content);
@@ -898,7 +992,7 @@ async def chat_page(request: Request):
       if (answer) {{
         const md = document.createElement("div");
         md.className = "markdown";
-        md.innerHTML = typeof marked !== "undefined" ? marked.parse(answer) : escapeHtml(answer);
+        md.innerHTML = typeof marked !== "undefined" ? DOMPurify.sanitize(marked.parse(answer)) : escapeHtml(answer);
         wrap.appendChild(md);
       }}
       p.appendChild(wrap);
@@ -945,12 +1039,12 @@ async def chat_page(request: Request):
         wrap.appendChild(details);
         const md = document.createElement("div");
         md.className = "markdown";
-        md.innerHTML = typeof marked !== "undefined" ? marked.parse(contentText) : escapeHtml(contentText);
+        md.innerHTML = typeof marked !== "undefined" ? DOMPurify.sanitize(marked.parse(contentText)) : escapeHtml(contentText);
         wrap.appendChild(md);
       }} else if (contentText) {{
         const md = document.createElement("div");
         md.className = "markdown";
-        md.innerHTML = typeof marked !== "undefined" ? marked.parse(contentText) : escapeHtml(contentText);
+        md.innerHTML = typeof marked !== "undefined" ? DOMPurify.sanitize(marked.parse(contentText)) : escapeHtml(contentText);
         wrap.appendChild(md);
       }} else if (thinkingText) {{
         const note = document.createElement("p");
@@ -959,7 +1053,7 @@ async def chat_page(request: Request):
         wrap.appendChild(note);
         const md = document.createElement("div");
         md.className = "markdown";
-        md.innerHTML = typeof marked !== "undefined" ? marked.parse(thinkingText) : escapeHtml(thinkingText);
+        md.innerHTML = typeof marked !== "undefined" ? DOMPurify.sanitize(marked.parse(thinkingText)) : escapeHtml(thinkingText);
         wrap.appendChild(md);
       }} else if (!doneData || !doneData.error) {{
         const empty = document.createElement("p");
@@ -978,6 +1072,13 @@ async def chat_page(request: Request):
         err.style.color = "var(--danger)";
         err.textContent = "Fehler: " + doneData.error;
         wrap.appendChild(err);
+      }}
+      if (doneData && doneData.tps) {{
+        const tpsEl = document.createElement("p");
+        tpsEl.style.cssText = "color:var(--muted);font-size:0.75em;margin:0.3em 0 0;text-align:right;";
+        const tpsVal = doneData.tps[0], tpsExact = doneData.tps[1];
+        tpsEl.textContent = (tpsExact ? "" : "~") + Math.round(tpsVal) + " t/s";
+        wrap.appendChild(tpsEl);
       }}
       container.id = "";
       log.scrollTop = log.scrollHeight;
@@ -1182,6 +1283,38 @@ async def api_show_token(request: Request):
     return JSONResponse({"token": ensure_token(cfg)})
 
 
+@app.post("/api/title")
+async def api_generate_title(request: Request):
+    """Generiert einen kurzen Chat-Titel via LLM. POST { message } -> { title }."""
+    _require_token(request)
+    body = await request.json()
+    message = (body.get("message") or "").strip()[:300]
+    if not message:
+        raise HTTPException(status_code=400, detail="message required")
+    import asyncio
+    from miniassistant.ollama_client import chat as _oc, get_base_url_for_model, get_api_key_for_model
+    config = load_config()
+    project_dir = getattr(request.app.state, "project_dir", None)
+    model = resolve_model(config, None) or ""
+    if not model:
+        return JSONResponse({"title": message[:50]})
+    try:
+        base_url = get_base_url_for_model(config, model)
+        api_key = get_api_key_for_model(config, model)
+        prompt = (f"Create a short title (max 5 words, same language as the message, "
+                  f"no quotes, no punctuation at end) for a conversation starting with:\n{message}\n"
+                  f"Reply with ONLY the title, nothing else.")
+        resp = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: _oc(base_url, [{"role": "user", "content": prompt}],
+                               model=model, api_key=api_key, timeout=20.0, num_ctx=512))
+        title = (resp.get("message", {}).get("content") or "").strip().strip('"').strip("'")
+        if len(title) > 50:
+            title = title[:50] + "…"
+        return JSONResponse({"title": title or message[:50]})
+    except Exception:
+        return JSONResponse({"title": message[:50]})
+
+
 @app.post("/api/auth/{platform}")
 async def api_auth_platform(request: Request, platform: str):
     """Auth: Code einlösen und Nutzer freischalten. Plattform: matrix, discord. Erfordert gültiges Token."""
@@ -1285,7 +1418,9 @@ def _generate_title_bg(session: dict, user_msg: str) -> None:
                       f"Antworte NUR mit dem Titel, keine Erklärung.")
             resp = _oc(base_url, [{"role": "user", "content": prompt}],
                        model=model, api_key=api_key, timeout=20.0, num_ctx=512)
-            title = (resp.get("message", {}).get("content") or "").strip().strip('"').strip("'")[:80]
+            title = (resp.get("message", {}).get("content") or "").strip().strip('"').strip("'")
+            if len(title) > 50:
+                title = title[:50] + "…"
             if title:
                 fpath = Path(session["_chat_file"])
                 if fpath.exists():
@@ -1372,16 +1507,34 @@ async def api_chat_stream(request: Request):
     message = (body.get("message") or "").strip()
     if not message:
         raise HTTPException(status_code=400, detail="message required")
-    session_id = body.get("session_id") or ""
-    if session_id and session_id in _sessions:
-        session = _sessions[session_id]
+    requested_sid = body.get("session_id") or ""
+    if requested_sid and requested_sid in _sessions:
+        session = _sessions[requested_sid]
+        session_id = requested_sid
     else:
-        session_id = str(uuid.uuid4())
+        restore_msgs = body.get("restore_messages")
+        # Client sendet session_id + restore_messages → Session nach Server-Neustart wiederherstellen
+        if requested_sid and restore_msgs and isinstance(restore_msgs, list):
+            session_id = requested_sid
+        else:
+            session_id = str(uuid.uuid4())
         project_dir = getattr(request.app.state, "project_dir", None)
         session = create_session(None, project_dir)
+        if restore_msgs and isinstance(restore_msgs, list):
+            session["messages"] = [m for m in restore_msgs if isinstance(m, dict)]
         if body.get("track"):
             session["_track_chat"] = True
         _sessions[session_id] = session
+
+    # Lokale Tools: Client übergibt Liste der Tools die er selbst ausführt
+    _local_tools = body.get("local_tools")
+    if _local_tools and isinstance(_local_tools, list):
+        session["config"]["_client_tools"] = [str(t) for t in _local_tools]
+        session["config"]["_tool_request_hook"] = _make_tool_hook(session_id)
+    else:
+        session["config"].pop("_client_tools", None)
+        session["config"].pop("_tool_request_hook", None)
+
     if is_chat_command(message):
         is_new = message.strip().lower() == "/new"
         is_model_switch = message.strip().lower().startswith("/model ")
@@ -1410,6 +1563,26 @@ async def api_chat_stream(request: Request):
         _chat_stream_generator(session_id, session, message),
         media_type="application/x-ndjson",
     )
+
+
+@app.post("/api/chat/tool_result")
+async def api_chat_tool_result(request: Request):
+    """Client meldet Ergebnis einer lokal ausgeführten Tool-Anfrage zurück.
+    Body: { tool_id: str, result: str }
+    """
+    _require_token(request)
+    body = await request.json()
+    tool_id = (body.get("tool_id") or "").strip()
+    result = body.get("result")
+    if not tool_id:
+        raise HTTPException(status_code=400, detail="tool_id required")
+    with _tool_requests_lock:
+        entry = _pending_tool_requests.get(tool_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="tool_id not found or already expired")
+    entry["result"] = str(result) if result is not None else ""
+    entry["event"].set()
+    return JSONResponse({"ok": True})
 
 
 @app.post("/api/chat")
@@ -1462,6 +1635,7 @@ async def onboarding_page(request: Request):
     <title>Onboarding – MiniAssistant</title>
     <link rel="icon" href="/favicon.ico">
     <script src="/static/marked.umd.js"></script>
+    <script src="/static/purify.min.js"></script>
     <style>
     {_COMMON_CSS}
     .chat-wrap {{ display: flex; flex-direction: column; height: 100vh; max-width: min(900px, 98vw); margin: 0 auto; padding: 0.8em 1em; }}
@@ -1549,7 +1723,7 @@ async def onboarding_page(request: Request):
       const content = document.createElement("div");
       content.className = "content" + (isMd ? " markdown" : "");
       if (isMd && typeof marked !== "undefined")
-        content.innerHTML = marked.parse(text || "");
+        content.innerHTML = DOMPurify.sanitize(marked.parse(text || ""));
       else
         content.textContent = text || "";
       p.appendChild(content);
@@ -1574,7 +1748,7 @@ async def onboarding_page(request: Request):
       if (contentText) {{
         const md = document.createElement("div");
         md.className = "markdown";
-        md.innerHTML = typeof marked !== "undefined" ? marked.parse(contentText) : escapeHtml(contentText);
+        md.innerHTML = typeof marked !== "undefined" ? DOMPurify.sanitize(marked.parse(contentText)) : escapeHtml(contentText);
         wrap.appendChild(md);
       }}
       p.appendChild(wrap);
@@ -2385,6 +2559,7 @@ async def workspace_page(request: Request):
 .ws-filename {{font-weight:600;margin-bottom:0.8rem;color:var(--primary);font-size:0.95rem;word-break:break-all}}
 </style>
 <script src="/static/marked.umd.js"></script>
+    <script src="/static/purify.min.js"></script>
 </head>
 <body>
 <div class="container">
@@ -2455,10 +2630,17 @@ function wsLoadTree(path) {{
       }}
       data.items.forEach(function(item) {{
         if (item.type === 'dir') {{
-          html += '<li><a data-dir="' + wsEscape(item.path) + '" title="' + wsEscape(item.name) + '">' + wsIcon(item) + ' ' + wsEscape(item.name) + '</a></li>';
+          html += '<li class="ws-frow"><a data-dir="' + wsEscape(item.path) + '" title="' + wsEscape(item.name) + '" style="flex:1">' + wsIcon(item) + ' ' + wsEscape(item.name) + '</a>'
+                + '<button class="ws-del-btn" data-delete="' + wsEscape(item.path) + '" title="In Papierkorb verschieben">🗑️</button></li>';
         }} else {{
-          html += '<li class="ws-frow"><a data-file="' + wsEscape(item.path) + '" title="' + wsEscape(item.name) + '">' + wsIcon(item) + ' ' + wsEscape(item.name)
-                + '<span style="color:var(--muted);font-size:0.75rem;margin-left:auto;flex-shrink:0">' + wsEscape(item.size) + '</span></a>'
+          var mtime = item.mtime ? '<div style="font-size:0.7rem;color:var(--muted);margin-top:1px">' + wsEscape(item.mtime) + '</div>' : '';
+          html += '<li class="ws-frow"><a data-file="' + wsEscape(item.path) + '" title="' + wsEscape(item.name) + '" style="align-items:flex-start">'
+                + '<span style="margin-top:2px">' + wsIcon(item) + '</span>'
+                + '<span style="flex:1;min-width:0">'
+                + '<div style="display:flex;align-items:baseline;gap:0.3rem"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + wsEscape(item.name) + '</span>'
+                + '<span style="color:var(--muted);font-size:0.75rem;flex-shrink:0;margin-left:auto">' + wsEscape(item.size) + '</span></div>'
+                + mtime
+                + '</span></a>'
                 + '<button class="ws-del-btn" data-delete="' + wsEscape(item.path) + '" title="In Papierkorb verschieben">🗑️</button></li>';
         }}
       }});
@@ -2540,7 +2722,7 @@ function wsLoadFile(path) {{
       if (data.type === 'image') {{
         html += '<img src="' + wsApiUrl('raw', {{path: path}}) + '" alt="' + wsEscape(name) + '">';
       }} else if (data.type === 'markdown') {{
-        html += '<div class="md-body">' + marked.parse(data.content) + '</div>';
+        html += '<div class="md-body">' + DOMPurify.sanitize(marked.parse(data.content)) + '</div>';
       }} else {{
         html += '<pre>' + wsEscape(data.content) + '</pre>';
       }}
@@ -2563,7 +2745,7 @@ function wsLoadTrashFile(path) {{
       if (data.type === 'image') {{
         html += '<img src="' + wsApiUrl('trash/raw', {{path: path}}) + '" alt="' + wsEscape(name) + '">';
       }} else if (data.type === 'markdown') {{
-        html += '<div class="md-body">' + marked.parse(data.content) + '</div>';
+        html += '<div class="md-body">' + DOMPurify.sanitize(marked.parse(data.content)) + '</div>';
       }} else {{
         html += '<pre>' + wsEscape(data.content) + '</pre>';
       }}
@@ -2595,16 +2777,24 @@ async def api_workspace_files(request: Request):
     if not target.is_dir():
         return JSONResponse({"error": "Kein Verzeichnis", "items": []})
     items = []
+    import time as _time
+    _cur_year = datetime.datetime.now().year
     for p in sorted(target.iterdir(), key=lambda x: (x.is_file(), x.name.lower())):
         if p.name.startswith("."):
             continue
         rel_path = str(p.relative_to(workspace))
+        st = p.stat()
         if p.is_dir():
             items.append({"name": p.name, "type": "dir", "path": rel_path, "size": ""})
         else:
-            size = p.stat().st_size
+            size = st.st_size
             size_str = f"{size}B" if size < 1024 else (f"{size//1024}KB" if size < 1024*1024 else f"{size//1024//1024}MB")
-            items.append({"name": p.name, "type": "file", "path": rel_path, "size": size_str})
+            mt = datetime.datetime.fromtimestamp(st.st_mtime)
+            if mt.year == _cur_year:
+                mtime_str = mt.strftime("%d.%m. %H:%M")
+            else:
+                mtime_str = mt.strftime("%d.%m.%y %H:%M")
+            items.append({"name": p.name, "type": "file", "path": rel_path, "size": size_str, "mtime": mtime_str})
     return JSONResponse({"items": items, "path": str(rel)})
 
 
@@ -2669,18 +2859,17 @@ async def api_workspace_delete(request: Request):
     if not str(target).startswith(str(workspace)):
         raise HTTPException(status_code=403, detail="Pfad außerhalb des Workspace")
     if not target.exists():
-        return JSONResponse({"error": "Datei nicht gefunden"})
-    if target.is_dir():
-        return JSONResponse({"error": "Verzeichnisse können nicht einzeln gelöscht werden"})
+        return JSONResponse({"error": "Nicht gefunden"})
     trash_dir = Path(config.get("trash_dir") or "~/.trash").expanduser().resolve()
     trash_dir.mkdir(parents=True, exist_ok=True)
+    stem = target.name
+    suf = "" if target.is_dir() else target.suffix
+    base = target.stem if not target.is_dir() else target.name
     dest = trash_dir / target.name
-    if dest.exists():
-        stem, suf = dest.stem, dest.suffix
-        i = 1
-        while dest.exists():
-            dest = trash_dir / f"{stem}_{i}{suf}"
-            i += 1
+    i = 1
+    while dest.exists():
+        dest = trash_dir / f"{base}_{i}{suf}"
+        i += 1
     shutil.move(str(target), str(dest))
     return JSONResponse({"ok": True})
 
@@ -2821,6 +3010,7 @@ async def chats_page(request: Request):
 .ch-resume-btn:hover {{opacity:0.85}}
 </style>
 <script src="/static/marked.umd.js"></script>
+    <script src="/static/purify.min.js"></script>
 </head>
 <body>
 <div class="container">
@@ -2896,13 +3086,24 @@ function chLoadChat(stem) {{
         body += '<div class="msg msg-user"><div class="msg-role user">Du</div>'
               + '<div class="content">' + chEscape(ex.user) + '</div></div>'
               + '<div class="msg msg-assistant"><div class="msg-role assistant">Assistent</div>'
-              + '<div class="content markdown">' + marked.parse(ex.assistant || '') + '</div></div>';
+              + '<div class="content markdown">' + DOMPurify.sanitize(marked.parse(ex.assistant || '')) + '</div></div>';
       }});
       viewer.innerHTML = '<div class="ch-actions"><button class="ch-resume-btn" id="ch-resume-btn">&#9654; Fortsetzen</button></div>'
                        + '<p style="font-size:0.8rem;color:var(--muted);margin:0 0 1rem">'
                        + chEscape((data.title || '') + (data.model ? ' · ' + data.model : '')) + '</p>'
                        + (body || '<div class="ws-empty">Keine Nachrichten</div>');
       document.getElementById('ch-resume-btn').addEventListener('click', function() {{ chResume(stem); }});
+      // Titel im Listeneintrag aktualisieren falls Hintergrundthread ihn inzwischen gesetzt hat
+      if (data.title) {{
+        var listLink = document.querySelector('#ch-list a[data-stem="' + stem.replace(/"/g,'\\"') + '"]');
+        if (listLink) {{
+          var titleEl = listLink.querySelector('.ch-title');
+          if (titleEl && titleEl.textContent !== data.title) {{
+            titleEl.textContent = data.title;
+            listLink.title = data.title;
+          }}
+        }}
+      }}
     }})
     .catch(function(err) {{ viewer.innerHTML = '<div class="ws-empty">Fehler: ' + chEscape(String(err)) + '</div>'; }});
 }}
@@ -2918,6 +3119,8 @@ function chResume(stem) {{
 }}
 
 chLoadList();
+// Nochmal nach 4s laden — Hintergrundthread für Titelgenerierung hat dann Zeit fertig zu werden
+setTimeout(chLoadList, 4000);
 </script>
 {_THEME_JS}
 </body>
@@ -2957,7 +3160,9 @@ async def api_chats_file(request: Request):
     _require_token(request)
     config = load_config()
     chats_dir = _get_chats_dir(config)
-    stem = request.query_params.get("stem", "").strip().replace("/", "").replace("..", "")
+    raw_stem = request.query_params.get("stem", "").strip()
+    # Strip all path separators and directory traversal components, then use Path.name as final safeguard
+    stem = Path(raw_stem.replace("/", "").replace("\\", "").replace("..", "")).name
     if not stem:
         return JSONResponse({"error": "Kein stem angegeben"})
     target = (chats_dir / (stem + ".json")).resolve()
@@ -2968,7 +3173,7 @@ async def api_chats_file(request: Request):
     try:
         return JSONResponse(_json.loads(target.read_text(encoding="utf-8")))
     except Exception as e:
-        return JSONResponse({"error": str(e)})
+        return JSONResponse({"error": "Fehler beim Lesen der Datei"})
 
 
 @app.post("/api/chats/resume")
@@ -2977,7 +3182,8 @@ async def api_chats_resume(request: Request):
     import json as _json
     _require_token(request)
     body = await request.json()
-    stem = (body.get("stem") or "").strip().replace("/", "").replace("..", "")
+    raw_stem = (body.get("stem") or "").strip()
+    stem = Path(raw_stem.replace("/", "").replace("\\", "").replace("..", "")).name
     if not stem:
         return JSONResponse({"error": "Kein stem angegeben"})
     config = load_config()
@@ -2990,7 +3196,7 @@ async def api_chats_resume(request: Request):
     try:
         saved = _json.loads(sidecar.read_text(encoding="utf-8"))
     except Exception as e:
-        return JSONResponse({"error": f"Fehler beim Laden: {e}"})
+        return JSONResponse({"error": "Fehler beim Laden der Session"})
     project_dir = getattr(request.app.state, "project_dir", None)
     session = create_session(None, project_dir)
     session["messages"] = saved.get("messages", [])

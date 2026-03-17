@@ -23,7 +23,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "httpx>=0.25",
+    "httpx[socks]>=0.25",
     "pyyaml>=6.0",
     "click>=8.0",
     "rich>=13.0",
@@ -38,6 +38,12 @@ matrix = ["matrix-nio>=0.25", "mistune>=3.0"]
 matrix-e2e = ["matrix-nio[e2e]>=0.25", "mistune>=3.0"]
 discord = ["discord.py>=2.3"]
 scheduler = ["apscheduler>=3.10"]
+# voice: requires ffmpeg (system package) for audio conversion; Wyoming STT/TTS servers run separately
+voice = []
+# browser: curl_cffi for Chrome TLS impersonation (bypasses Cloudflare/bot-detection on read_url)
+browser = ["curl_cffi>=0.7"]
+# js: Playwright für JavaScript-lastige Seiten (SPAs, React/Vue/Angular); lädt ~300MB Chromium
+js = ["playwright>=1.40"]
 
 [project.scripts]
 miniassistant = "miniassistant.cli:main"

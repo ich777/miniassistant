@@ -7,6 +7,7 @@ import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -1080,10 +1081,13 @@ def _run_tool(
         url_arg = arguments.get("url", "").strip()
         if not url_arg:
             return "read_url requires url"
-        result = tool_read_url(url_arg, config=config)
+        result = tool_read_url(url_arg, config=config, proxy=arguments.get("proxy"), js=bool(arguments.get("js", False)))
+        conn = result.get("connection", "")
         if result.get("ok"):
-            return result.get("content", "")
-        return f"Error reading URL: {result.get('error', 'unknown error')}"
+            content = result.get("content", "")
+            return f"[connection: {conn}]\n{content}" if conn else content
+        err = result.get("error", "unknown error")
+        return f"[connection: {conn}] Error reading URL: {err}" if conn else f"Error reading URL: {err}"
     if name == "send_email":
         # Guardrail: In Scheduled Tasks nur erlauben wenn der Original-Prompt
         # explizit E-Mail/Mail erwaehnt — verhindert unsolicited E-Mails
@@ -1407,6 +1411,18 @@ def _run_tool(
             sub_system += "\n\nRunning as **root** (euid 0) — no sudo needed."
         else:
             sub_system += "\n\nNot running as root — use **sudo** when needed."
+        # Language aus IDENTITY.md an Subagent weitergeben
+        _sub_agent_dir = (config.get("agent_dir") or "").strip()
+        _sub_lang = "Deutsch"
+        if _sub_agent_dir:
+            _identity_path = Path(_sub_agent_dir).expanduser().resolve() / "IDENTITY.md"
+            if _identity_path.exists():
+                try:
+                    from miniassistant.agent_loader import _language_from_identity_md
+                    _sub_lang = _language_from_identity_md(_identity_path.read_text(encoding="utf-8")) or "Deutsch"
+                except Exception:
+                    pass
+        sub_system += f"\n\nAlways respond in **{_sub_lang}**. Use 'du' (informal), never 'Sie'."
         # Workspace-Info an Subagent weitergeben
         _ws = (config.get("workspace") or "").strip()
         if _ws:
@@ -1926,8 +1942,14 @@ def _run_subagent_anthropic(
                 if _cu_r.get("error"): _cu_parts.append(f"error: {_cu_r['error']}")
                 tool_result = "\n".join(_cu_parts)
             elif tc_name == "read_url":
-                _ru_r = tool_read_url(tc_args.get("url", ""), config=config)
-                tool_result = _ru_r.get("content", "") if _ru_r.get("ok") else f"Error reading URL: {_ru_r.get('error', 'unknown error')}"
+                _ru_r = tool_read_url(tc_args.get("url", ""), config=config, proxy=tc_args.get("proxy"), js=bool(tc_args.get("js", False)))
+                _ru_conn = _ru_r.get("connection", "")
+                if _ru_r.get("ok"):
+                    _ru_content = _ru_r.get("content", "")
+                    tool_result = f"[connection: {_ru_conn}]\n{_ru_content}" if _ru_conn else _ru_content
+                else:
+                    _ru_err = _ru_r.get("error", "unknown error")
+                    tool_result = f"[connection: {_ru_conn}] Error reading URL: {_ru_err}" if _ru_conn else f"Error reading URL: {_ru_err}"
             else:
                 tool_result = f"Unknown tool: {tc_name}"
             _aal.log_tool_call(config, f"subagent:{tc_name}", tc_args, tool_result)
@@ -2019,8 +2041,14 @@ def _run_subagent_google(
                 if _cu_r.get("error"): _cu_parts.append(f"error: {_cu_r['error']}")
                 tool_result = "\n".join(_cu_parts)
             elif tc_name == "read_url":
-                _ru_r = tool_read_url(tc_args.get("url", ""), config=config)
-                tool_result = _ru_r.get("content", "") if _ru_r.get("ok") else f"Error reading URL: {_ru_r.get('error', 'unknown error')}"
+                _ru_r = tool_read_url(tc_args.get("url", ""), config=config, proxy=tc_args.get("proxy"), js=bool(tc_args.get("js", False)))
+                _ru_conn = _ru_r.get("connection", "")
+                if _ru_r.get("ok"):
+                    _ru_content = _ru_r.get("content", "")
+                    tool_result = f"[connection: {_ru_conn}]\n{_ru_content}" if _ru_conn else _ru_content
+                else:
+                    _ru_err = _ru_r.get("error", "unknown error")
+                    tool_result = f"[connection: {_ru_conn}] Error reading URL: {_ru_err}" if _ru_conn else f"Error reading URL: {_ru_err}"
             else:
                 tool_result = f"Unknown tool: {tc_name}"
             _aal.log_tool_call(config, f"subagent:{tc_name}", tc_args, tool_result)
@@ -2168,8 +2196,14 @@ def _run_subagent_openai(
                 if _cu_r.get("error"): _cu_parts.append(f"error: {_cu_r['error']}")
                 tool_result = "\n".join(_cu_parts)
             elif tc_name == "read_url":
-                _ru_r = tool_read_url(tc_args.get("url", ""), config=config)
-                tool_result = _ru_r.get("content", "") if _ru_r.get("ok") else f"Error reading URL: {_ru_r.get('error', 'unknown error')}"
+                _ru_r = tool_read_url(tc_args.get("url", ""), config=config, proxy=tc_args.get("proxy"), js=bool(tc_args.get("js", False)))
+                _ru_conn = _ru_r.get("connection", "")
+                if _ru_r.get("ok"):
+                    _ru_content = _ru_r.get("content", "")
+                    tool_result = f"[connection: {_ru_conn}]\n{_ru_content}" if _ru_conn else _ru_content
+                else:
+                    _ru_err = _ru_r.get("error", "unknown error")
+                    tool_result = f"[connection: {_ru_conn}] Error reading URL: {_ru_err}" if _ru_conn else f"Error reading URL: {_ru_err}"
             else:
                 tool_result = f"Unknown tool: {tc_name}"
             _aal.log_tool_call(config, f"subagent:{tc_name}", tc_args, tool_result)
@@ -2279,8 +2313,14 @@ def _run_subagent_with_tools(
                 if _cu_r.get("error"): _cu_parts.append(f"error: {_cu_r['error']}")
                 tool_result = "\n".join(_cu_parts)
             elif tc_name == "read_url":
-                _ru_r = tool_read_url(tc_args.get("url", ""), config=config)
-                tool_result = _ru_r.get("content", "") if _ru_r.get("ok") else f"Error reading URL: {_ru_r.get('error', 'unknown error')}"
+                _ru_r = tool_read_url(tc_args.get("url", ""), config=config, proxy=tc_args.get("proxy"), js=bool(tc_args.get("js", False)))
+                _ru_conn = _ru_r.get("connection", "")
+                if _ru_r.get("ok"):
+                    _ru_content = _ru_r.get("content", "")
+                    tool_result = f"[connection: {_ru_conn}]\n{_ru_content}" if _ru_conn else _ru_content
+                else:
+                    _ru_err = _ru_r.get("error", "unknown error")
+                    tool_result = f"[connection: {_ru_conn}] Error reading URL: {_ru_err}" if _ru_conn else f"Error reading URL: {_ru_err}"
             else:
                 tool_result = f"Unknown tool: {tc_name}"
             _aal.log_tool_call(config, f"subagent:{tc_name}", tc_args, tool_result)
@@ -2473,7 +2513,7 @@ def chat_round(
                     msgs.append({"role": "assistant", "content": msg.get("content") or "", "thinking": msg.get("thinking") or ""})
                     _aal.log_thinking(config, msg.get("thinking") or "")
                     if msg.get("content"):
-                        _aal.log_response(config, msg["content"])
+                        _aal.log_response(config, msg["content"], tps=_aal.extract_tps(response, time.monotonic() - _t0, msg["content"], msg.get("thinking") or ""))
                         _response_logged = True
                     break
 
@@ -2562,7 +2602,7 @@ def chat_round(
             # Response loggen — nur wenn noch nicht innerhalb der Schleife geloggt
             # (Wrapup, Nudge, oder Cancellation-Fälle)
             if not _response_logged and total_content.strip():
-                _aal.log_response(config, total_content.strip())
+                _aal.log_response(config, total_content.strip(), tps=_aal.extract_tps(last_response, time.monotonic() - _t0, total_content.strip(), total_thinking))
 
             # send_image war erfolgreich → Content unterdrücken (Bild IST die Antwort, kein Text nötig)
             if _sent_image and total_content.strip():
@@ -2687,6 +2727,8 @@ def chat_round_stream(
     total_content = ""
     _sent_image = False
     rounds = 0
+    _stream_start = time.monotonic()  # Gesamtzeit für TPS-Berechnung im done-Event
+    _ctx_max = _compact_num_ctx  # num_ctx für Kontext-Auslastungsanzeige (bereits berechnet)
 
     while rounds < max_tool_rounds:
         try_model = models_to_try[0] if rounds == 0 else effective_model
@@ -2764,7 +2806,7 @@ def chat_round_stream(
                 _usage_record(config, try_model, _stream_usage_type + "_error", time.monotonic() - _t0_stream)
             except Exception:
                 pass
-            yield {"type": "done", "error": str(e), "thinking": total_thinking, "content": total_content, "new_messages": msgs, "debug_info": None, "switch_info": switch_info}
+            yield {"type": "done", "error": str(e), "thinking": total_thinking, "content": total_content, "new_messages": msgs, "debug_info": None, "switch_info": switch_info, "ctx": [_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs), _ctx_max]}
             return
 
         total_thinking += round_thinking
@@ -2779,7 +2821,9 @@ def chat_round_stream(
             # Content/Thinking aus den gestreamten Deltas verwenden (Done-Chunk hat oft leere Werte)
             msgs.append({"role": "assistant", "content": round_content or full_msg.get("content") or "", "thinking": round_thinking or full_msg.get("thinking") or ""})
             _aal.log_thinking(config, round_thinking or full_msg.get("thinking") or "")
-            _aal.log_response(config, round_content or full_msg.get("content") or "")
+            _rc = round_content or full_msg.get("content") or ""
+            _rt = round_thinking or full_msg.get("thinking") or ""
+            _aal.log_response(config, _rc, tps=_aal.extract_tps(last_response, time.monotonic() - _t0_stream, _rc, _rt))
 
             # Stuck-Prevention: wenn kein Content, Nudge senden
             # Aber NICHT wenn send_image erfolgreich war (Bild IST die Antwort)
@@ -2824,7 +2868,8 @@ def chat_round_stream(
                 _done_content, _et = _strip_think_tags(_done_content)
                 if _et:
                     _done_thinking = (_done_thinking + "\n" + _et).strip() if _done_thinking else _et
-            yield {"type": "done", "thinking": _done_thinking, "content": _done_content, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info}
+            _done_tps = _aal.extract_tps(last_response, time.monotonic() - _stream_start, _done_content, _done_thinking)
+            yield {"type": "done", "thinking": _done_thinking, "content": _done_content, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info, "tps": _done_tps, "ctx": [_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs), _ctx_max]}
             return
 
         _tool_names = [n for n, _ in tool_calls]
@@ -2852,8 +2897,19 @@ def chat_round_stream(
                     if _et:
                         _final_thinking = (_final_thinking + "\n" + _et).strip() if _final_thinking else _et
                 yield {"type": "content", "delta": "\n\n*(Verarbeitung abgebrochen)*"}
-                yield {"type": "done", "thinking": _final_thinking, "content": _final_content, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info}
+                _cancel_tps = _aal.extract_tps(last_response, time.monotonic() - _stream_start, _final_content, _final_thinking)
+                yield {"type": "done", "thinking": _final_thinking, "content": _final_content, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info, "tps": _cancel_tps, "ctx": [_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs), _ctx_max]}
                 return
+        # Client-Tool-Routing: Tools die der Client lokal ausführen soll
+        _tool_hook = config.get("_tool_request_hook")
+        _client_tool_set: set[str] = set(config.get("_client_tools") or [])
+        if _tool_hook and _client_tool_set:
+            _client_calls = [(n, a) for n, a in tool_calls if n in _client_tool_set]
+            _server_calls = [(n, a) for n, a in tool_calls if n not in _client_tool_set]
+        else:
+            _client_calls = []
+            _server_calls = tool_calls
+
         _tool_names_all = [n for n, _ in tool_calls]
         _concurrent_count = sum(1 for n in _tool_names_all if n in _CONCURRENT_SAFE_TOOLS)
         if _concurrent_count > 1:
@@ -2861,12 +2917,28 @@ def chat_round_stream(
         else:
             for tn in _tool_names_all:
                 yield {"type": "status", "message": f"Tool: {tn}"}
-        tool_results = _run_tools_maybe_concurrent(tool_calls, config, project_dir)
-        for name, args, result in tool_results:
-            _aal.log_tool_call(config, name, args, result)
-            msgs.append({"role": "tool", "tool_name": name, "content": result})
-            if name == "send_image":
-                _sent_image = True
+
+        # Client-seitige Tool-Ausführung (Round-Trip): yield tool_request, warte auf Ergebnis
+        for _ct_name, _ct_args in _client_calls:
+            import uuid as _uuid
+            _req_id = str(_uuid.uuid4())
+            yield {"type": "tool_request", "id": _req_id, "tool": _ct_name, "args": _ct_args}
+            # Blockt bis Client antwortet (oder Timeout — dann Fallback serverseitig)
+            _ct_result = _tool_hook(_req_id, _ct_name, _ct_args)
+            if _ct_result is None:
+                # Timeout oder Fehler → serverseitig nachholen
+                _server_calls = list(_server_calls) + [(_ct_name, _ct_args)]
+                continue
+            _aal.log_tool_call(config, _ct_name, _ct_args, _ct_result)
+            msgs.append({"role": "tool", "tool_name": _ct_name, "content": _ct_result})
+
+        if _server_calls:
+            tool_results = _run_tools_maybe_concurrent(_server_calls, config, project_dir)
+            for name, args, result in tool_results:
+                _aal.log_tool_call(config, name, args, result)
+                msgs.append({"role": "tool", "tool_name": name, "content": result})
+                if name == "send_image":
+                    _sent_image = True
         rounds += 1
 
     # Max-Rounds-Exhaustion: Agent wollte noch weiterarbeiten aber hat keine Runden mehr
@@ -2915,7 +2987,7 @@ def chat_round_stream(
 
     # Response loggen wenn es noch nicht innerhalb der Schleife geloggt wurde
     if total_content.strip():
-        _aal.log_response(config, total_content.strip())
+        _aal.log_response(config, total_content.strip(), tps=_aal.extract_tps(last_response, time.monotonic() - _t0_stream, total_content.strip(), total_thinking))
 
     # send_image war erfolgreich → Content unterdrücken (Bild IST die Antwort)
     _final_content = "" if _sent_image else total_content.strip()
@@ -2924,7 +2996,8 @@ def chat_round_stream(
         _final_content, _et = _strip_think_tags(_final_content)
         if _et:
             _final_thinking = (_final_thinking + "\n" + _et).strip() if _final_thinking else _et
-    yield {"type": "done", "thinking": _final_thinking, "content": _final_content, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info}
+    _final_tps = _aal.extract_tps(last_response, time.monotonic() - _stream_start, _final_content, _final_thinking)
+    yield {"type": "done", "thinking": _final_thinking, "content": _final_content, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info, "tps": _final_tps, "ctx": [_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs), _ctx_max]}
 
 
 def is_chat_command(user_input: str) -> bool:
@@ -3111,16 +3184,19 @@ def handle_user_input(
             _log.info("Vision: %d Bild(er) empfangen, wechsle %s → %s", len(images), original_model, model)
 
     # Chat-Kontext (room_id/channel_id) in System-Prompt injizieren
+    # Werte sanitisieren: Newlines und Backticks entfernen (Prompt-Injection via Raumnamen)
     effective_system_prompt = session["system_prompt"]
     chat_ctx = session.get("chat_context")
     if chat_ctx:
+        def _sanitize_ctx(val: str, max_len: int = 200) -> str:
+            return val.replace("\n", "").replace("\r", "").replace("`", "").strip()[:max_len]
         ctx_lines = ["\n\n## Current Chat Context"]
         if chat_ctx.get("platform"):
-            ctx_lines.append(f"Platform: {chat_ctx['platform']}")
+            ctx_lines.append(f"Platform: {_sanitize_ctx(str(chat_ctx['platform']))}")
         if chat_ctx.get("room_id"):
-            ctx_lines.append(f"Matrix Room ID: `{chat_ctx['room_id']}`")
+            ctx_lines.append(f"Matrix Room ID: `{_sanitize_ctx(str(chat_ctx['room_id']))}`")
         if chat_ctx.get("channel_id"):
-            ctx_lines.append(f"Discord Channel ID: `{chat_ctx['channel_id']}`")
+            ctx_lines.append(f"Discord Channel ID: `{_sanitize_ctx(str(chat_ctx['channel_id']))}`")
         effective_system_prompt += "\n".join(ctx_lines)
 
     # Compacting-Check vor chat_round (für Notification bei non-streaming Clients)

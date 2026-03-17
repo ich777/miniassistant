@@ -156,8 +156,45 @@ Web-UI und API (Bind-Adresse, **Port**, Token). Port und Host sind einstellbar (
 | `log_agent_actions` | boolean | nein | `false` | Wenn `true`: Jeder Prompt, Thinking, Antwort und Tool-Call wird in `$config_dir/logs/agent_actions.log` protokolliert. Einträge werden durch `---` getrennt. Kann in der Web-UI unter **Logs** live eingesehen werden. |
 | `show_context` | boolean | nein | `false` | Wenn `true`: Vor jedem Ollama-Call wird der **vollständige Kontext** (System-Prompt, Messages, Token-Schätzung, verbleibende Tokens für Response/Thinking) in `$config_dir/logs/context.log` geschrieben. Format analog zu `agent_actions.log` mit Zeitstempel. Nützlich zum Debugging des Kontexts und Token-Budgets. |
 | `track_usage` | boolean | nein | `false` | Wenn `true`: Jeder LLM-Aufruf wird mit Zeitstempel, Modell, Typ und Dauer (Sekunden) in `$config_dir/usage/usage.csv` aufgezeichnet. Typen: `chat`, `vision`, `subagent`, `image` (Erfolg) sowie `chat_error`, `vision_error`, `subagent_error`, `image_error` (Timeout/Fehler – inkl. Retry-Zeit). Die Daten können in der Web-UI unter **Nutzung** (`/nutzung`) mit Zeitfiltern und Charts eingesehen werden. |
+| `rate_limit` | integer | nein | `100` | Maximale Anzahl Anfragen pro IP-Adresse **pro Minute** (Sliding-Window). Gilt für alle Endpunkte außer statischen Dateien. Bei Überschreitung: HTTP 429 mit `Retry-After: 60`. Auf `0` setzen zum Deaktivieren. |
 
 Wenn `token` nicht gesetzt ist, wird beim ersten Start von `miniassistant serve` eines generiert und in der Config gespeichert.
+
+### Reverse Proxy (Nginx)
+
+Um MiniAssistant über einen Reverse Proxy erreichbar zu machen, müssen folgende Endpunkte weitergeleitet werden:
+
+| Endpunkt | Methode | Zweck |
+|----------|---------|-------|
+| `/api/chat/stream` | POST | Chat mit Streaming (SSE) – Haupt-Endpunkt |
+| `/api/chat` | POST | Chat ohne Streaming |
+| `/api/chat/tool_result` | POST | Tool-Ergebnis zurückgeben |
+| `/api/token` | GET | Auth-Token abrufen |
+| `/v1/chat/completions` | POST | OpenAI-kompatibler Endpunkt |
+
+Minimale Nginx-Konfiguration:
+
+```nginx
+location /api/ {
+    proxy_pass http://127.0.0.1:8765;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+
+    # Pflicht für SSE (Streaming)
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_set_header Connection '';
+    proxy_http_version 1.1;
+    chunked_transfer_encoding on;
+}
+
+location /v1/ {
+    proxy_pass http://127.0.0.1:8765;
+    proxy_set_header Host $host;
+}
+```
+
+Der Token muss bei jedem Request im Header mitgeschickt werden: `Authorization: Bearer <token>`.
 
 ---
 
@@ -272,6 +309,67 @@ search_engines:
   vpn:
     url: https://search-vpn.example.org
 default_search_engine: main
+```
+
+---
+
+## 6d. read_url (Proxy-Konfiguration)
+
+Das Tool `read_url` unterstützt optionale Proxy-Konfiguration für serverseitige URL-Abrufe. Ohne Konfiguration wird immer direkt verbunden. Der Assistent kennt die konfigurierten Proxy-Namen und kann per `proxy`-Parameter gezielt einen auswählen.
+
+| Schlüssel | Typ | Beschreibung |
+|-----------|-----|--------------|
+| `read_url.proxies` | Objekt | Benannte Proxies: `name → URL`. Leerstring `""` = direkter Slot (kein Proxy). |
+| `read_url.default_proxy` | string | Welcher Proxy standardmäßig genutzt wird (Name aus `proxies`). Fehlt er: erster Eintrag. |
+| `read_url.proxy_strategy` | string | Auswahlstrategie wenn kein expliziter Name angegeben (default: `first`). |
+
+**Strategien (`proxy_strategy`):**
+
+| Wert | Verhalten |
+|------|-----------|
+| `first` | `default_proxy` nutzen, sonst ersten Eintrag (default) |
+| `random` | Zufällig aus allen Einträgen wählen |
+| `roundrobin` | Reihum rotieren (thread-safe) |
+| `none` | Immer direkt verbinden, auch wenn Proxies konfiguriert sind |
+
+**Wichtig:** `first` ohne konfigurierte Proxies = direkte Verbindung (= `none`). Ein Leerstring `""` als Proxy-URL ist ein expliziter Direkt-Slot — nützlich für Roundrobin mit gelegentlich direktem Zugriff.
+
+**Unterstützte Proxy-Formate:**
+```
+http://host:port
+https://host:port
+socks5://host:port              # socksio ist in den Base-Dependencies enthalten
+socks5://user:pass@host:port
+```
+
+**Standardbeispiel (VPN-Proxy, default direkt):**
+```yaml
+read_url:
+  proxies:
+    direct: ""                        # kein Proxy (direkter Slot)
+    vpn: "socks5://10.0.0.1:1080"
+  default_proxy: direct               # Standard: kein Proxy
+  proxy_strategy: first
+```
+Der Assistent kann dann explizit `proxy: "vpn"` in `read_url` angeben, wenn er über den Proxy gehen soll.
+
+**Roundrobin zwischen mehreren Proxies:**
+```yaml
+read_url:
+  proxies:
+    vpn1: "socks5://10.0.0.1:1080"
+    vpn2: "socks5://10.0.0.1:1081"
+    direct: ""
+  proxy_strategy: roundrobin
+```
+
+**Immer einen festen Proxy (kein manuelles Auswählen nötig):**
+```yaml
+read_url:
+  proxies:
+    vpn: "socks5://10.0.0.1:1080"
+  default_proxy: vpn
+  proxy_strategy: first
 ```
 
 ---
@@ -473,6 +571,7 @@ server:
   port: 8765
   token: "dein-geheimes-token"
   show_estimated_tokens: false
+  # rate_limit: 100       # req/min pro IP (default 100; 0 = deaktiviert)
 
 agent_dir: /opt/miniassistant/agent
 workspace: /home/user/projekte

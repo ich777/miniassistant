@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import logging
 import os
+import readline  # noqa: F401 – aktiviert Pfeiltasten/History in input()
+import time
 from pathlib import Path
 
 import click
@@ -308,7 +310,7 @@ def config_cmd(ctx: click.Context) -> None:
 @click.pass_context
 def chat(ctx: click.Context, model: str | None, show_thinking: bool) -> None:
     """Chat-Loop mit Ollama; /model MODELLNAME wechselt das Modell; exec und web_search als Tools."""
-    from miniassistant.chat_loop import create_session, handle_user_input
+    from miniassistant.chat_loop import create_session, handle_user_input, chat_round_stream
     from miniassistant.ollama_client import resolve_model
 
     project_dir = ctx.obj.get("project_dir")
@@ -328,7 +330,23 @@ def chat(ctx: click.Context, model: str | None, show_thinking: bool) -> None:
     if model:
         session["model"] = resolve_model(config, model) or model
     console.print("[bold]MiniAssistant[/bold] – Chat. /model = aktuelles Modell, /model NAME = Wechsel, /models = Modellliste, /new = neue Session, [cyan]exit[/cyan] = Beenden.\n")
-    console.print("Aktuelles Modell:", session.get("model") or "(keins)")
+    current_model = session.get("model")
+    console.print("Aktuelles Modell:", current_model or "(keins)")
+
+    # Frühe Modell-Validierung: Ollama erreichbar? Modell vorhanden?
+    if current_model:
+        try:
+            from miniassistant.chat_loop import _ollama_available_models
+            available, err_msg = _ollama_available_models(config)
+            if err_msg:
+                console.print(f"[yellow]⚠ Warnung: {err_msg}[/yellow]")
+            elif current_model not in available:
+                from miniassistant.ollama_client import get_provider_config
+                _, api_model = get_provider_config(config, current_model)
+                if (api_model or current_model) not in available:
+                    console.print(f"[yellow]⚠ Modell '{current_model}' nicht bei Ollama gefunden. Mit /model NAME wechseln oder Modell herunterladen.[/yellow]")
+        except Exception:
+            pass  # Validierungsfehler blockieren den Chat nicht
 
     while True:
         try:
@@ -339,18 +357,127 @@ def chat(ctx: click.Context, model: str | None, show_thinking: bool) -> None:
             continue
         if user_input.strip().lower() in ("exit", "quit", "q"):
             break
-        result = handle_user_input(session, user_input)
-        response, session = result[0], result[1]
-        if response:
-            if show_thinking and response.startswith("[Thinking]"):
-                parts = response.split("\n\n", 1)
-                if len(parts) >= 2:
-                    console.print(parts[0], style="dim")
-                    console.print(parts[1])
+        _t0 = time.monotonic()
+        _tps_raw = None
+        _ctx_raw = None
+
+        if user_input.strip().startswith("/"):
+            # Befehle (/model, /new, …): synchroner Pfad
+            with console.status("[dim]…[/dim]", spinner="dots"):
+                result = handle_user_input(session, user_input)
+            _elapsed = time.monotonic() - _t0
+            session = result[1]
+            _thinking = result[3] if len(result) > 3 else None
+            _content  = result[4] if len(result) > 4 else None
+            _reply = _content if _content is not None else result[0]
+            if show_thinking and _thinking:
+                console.print("[dim]▸ Denkvorgang[/dim]")
+                for line in (_thinking or "").splitlines():
+                    console.print(f"[dim]  {line}[/dim]")
+                console.print()
+        else:
+            # Normale Nachricht: Streaming mit Live-Denkvorgang
+            from rich.status import Status as _Status
+            _cfg      = session["config"]
+            _pdir     = session.get("project_dir")
+            _model    = session.get("model") or resolve_model(_cfg, None)
+            _system   = session.get("system_prompt", "")
+            _msgs     = list(session.get("messages", []))
+            _thinking = ""
+            _content  = ""
+            _had_thinking    = False
+            _content_started = False
+            _spinner_active  = False
+            _st = _Status("[dim]…[/dim]", spinner="dots", console=console)
+            _st._live.transient = True
+            _st.start()
+            _spinner_active = True
+            try:
+                for _ev in chat_round_stream(_cfg, _msgs, _system, _model, user_input, _pdir):
+                    _etype = _ev.get("type")
+                    if _etype == "thinking":
+                        if not _had_thinking:
+                            if _spinner_active:
+                                _st.stop()
+                                _spinner_active = False
+                            console.print("[dim]▸ Denkvorgang[/dim]")
+                            _had_thinking = True
+                        console.print(_ev.get("delta", ""), end="", markup=False, highlight=False)
+                    elif _etype == "content":
+                        if _had_thinking and not _content_started:
+                            _content_started = True
+                            console.print()  # Zeilenumbruch nach Denktext
+                    elif _etype == "status":
+                        if _spinner_active:
+                            _st.stop()
+                            _spinner_active = False
+                        console.print(f"[dim][{_ev.get('message', '')}][/dim]")
+                    elif _etype == "tool_call":
+                        if _spinner_active:
+                            _st.stop()
+                            _spinner_active = False
+                        console.print(f"[dim][Tool: {', '.join(_ev.get('tools', []))}][/dim]")
+                    elif _etype == "done":
+                        if _spinner_active:
+                            _st.stop()
+                            _spinner_active = False
+                        _content  = _ev.get("content", "")
+                        _thinking = _ev.get("thinking", _thinking)
+                        _new_msgs = _ev.get("new_messages")
+                        if _new_msgs:
+                            session["messages"] = _new_msgs
+                        _tps_raw = _ev.get("tps")
+                        _ctx_raw = _ev.get("ctx")
+                        break
+            finally:
+                if _spinner_active:
+                    _st.stop()
+            _elapsed = time.monotonic() - _t0
+            _reply = _content
+
+        # TPS-Label
+        _tps_label = ""
+        if _tps_raw and isinstance(_tps_raw, list) and len(_tps_raw) >= 1 and _tps_raw[0]:
+            _pfx = "" if (len(_tps_raw) > 1 and _tps_raw[1]) else "~"
+            _tps_label = f" [dim]({_pfx}{int(_tps_raw[0])} t/s)[/dim]"
+        elif _elapsed > 0 and (_thinking or _content):
+            _total_chars = len(_thinking or "") + len(_content or "")
+            _tps_label = f" [dim](~{int(_total_chars / 4 / _elapsed)} t/s)[/dim]"
+
+        if _reply:
+            console.print(f"[bold green]Assistant[/bold green]{_tps_label}[bold green]:[/bold green]")
+            console.print(_reply, markup=False, highlight=False)
+
+        # Kontext-Auslastung
+        if _content is not None:
+            try:
+                if _ctx_raw and isinstance(_ctx_raw, list) and len(_ctx_raw) >= 2 and _ctx_raw[1]:
+                    _ctx_used, _ctx_max = _ctx_raw[0], _ctx_raw[1]
                 else:
-                    console.print(response)
-            else:
-                console.print("[bold green]Assistant:[/bold green]", response)
+                    from miniassistant.ollama_client import get_num_ctx_for_model as _get_num_ctx
+                    _ctx_max   = _get_num_ctx(session.get("config", {}), session.get("model") or "")
+                    _ctx_system = session.get("system_prompt", "")
+                    _ctx_msgs  = session.get("messages", [])
+                    _ctx_used  = (
+                        len(_ctx_system) +
+                        sum(
+                            len(str(m.get("content") or "")) + len(str(m.get("thinking") or ""))
+                            for m in _ctx_msgs
+                        )
+                    ) // 3
+                _ctx_pct = min(int(_ctx_used * 100 / _ctx_max), 100) if _ctx_max > 0 else 0
+                _filled  = _ctx_pct * 10 // 100
+                _bar     = "█" * _filled + "░" * (10 - _filled)
+                if _ctx_pct >= 85:
+                    _ctx_style = "red"
+                elif _ctx_pct >= 70:
+                    _ctx_style = "yellow"
+                else:
+                    _ctx_style = "dim"
+                console.print(f"[{_ctx_style}]{_bar} {_ctx_pct}% ctx[/{_ctx_style}]", justify="right")
+            except Exception:
+                pass
+        console.print()
 
 
 @main.command("serve", help="Web-UI und API starten")
@@ -397,6 +524,10 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
 
     console.print(f"Server: http://{h}:{p}")
     console.print("Token (für API/Web):", token)
+    # Warnung wenn Server auf allen Interfaces lauscht aber kein Token gesetzt ist
+    if h in ("0.0.0.0", "::") and not (config.get("server") or {}).get("token"):
+        console.print("[bold red]⚠ Sicherheitswarnung:[/bold red] Server lauscht auf allen Interfaces (0.0.0.0) ohne Token – alle Netzwerkteilnehmer haben uneingeschränkten Zugriff.")
+        console.print("[dim]  server.token in config.yaml setzen oder 'miniassistant token --regenerate' ausführen.[/dim]")
     console.print("")
     console.print("[bold]Chat (klickbar):[/bold]")
     for dh in display_hosts:

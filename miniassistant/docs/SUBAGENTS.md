@@ -55,6 +55,14 @@ The message to the subagent must be self-contained — the subagent has no conve
 - Response language (e.g. "Antworte auf Deutsch")
 - If a plan file exists: "Arbeite gemäß Plan in [PFAD]. Markiere jeden Schritt als [x] wenn erledigt, [!] wenn fehlgeschlagen."
 
+**Transfer your knowledge.** If you already know the correct approach — the right API endpoint, the exec command that works, the tool to use — include it in the message. The subagent has no session context and will have to discover everything from scratch otherwise, likely getting it wrong.
+
+Example — wrong:
+> "Track my package on example-shop.com"
+
+Example — correct:
+> "Track my package on example-shop.com. Use exec with: `curl -s -X POST 'https://example-shop.com/api/track' -H 'Content-Type: application/json' -d '[\"TRACKINGNR\",\"PLZ\"]'`. Parse the JSON response and return status, last scan location, and delivered flag."
+
 Keep messages concise — subagents run small models with limited context.
 
 ## Debate tool

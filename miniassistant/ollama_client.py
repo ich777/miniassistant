@@ -3,9 +3,12 @@ Ollama-API: Modelle auflisten, Modell-Details/Caps, Chat mit num_ctx, think und 
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
+
+_log = logging.getLogger("miniassistant.ollama_client")
 
 
 def _auth_headers(api_key: str | None) -> dict[str, str]:
@@ -164,16 +167,20 @@ def get_provider_config(config: dict[str, Any], model: str | None = None) -> tup
     return providers.get(default_name) or {}, model
 
 
-def resolve_model(config: dict[str, Any], model: str | None) -> str | None:
+def resolve_model(config: dict[str, Any], model: str | None, _depth: int = 0) -> str | None:
     """Ersetzt Alias durch echten Modellnamen. Provider-Präfix wird durchgereicht (z.B. 'ollama2/big' → 'ollama2/llama3.3:70b').
-    Ohne Prefix: sucht Alias in ALLEN Providern. Bei Duplikat → Default-Provider gewinnt."""
+    Ohne Prefix: sucht Alias in ALLEN Providern. Bei Duplikat → Default-Provider gewinnt.
+    _depth: recursion guard against circular aliases (max 10)."""
+    if _depth > 10:
+        _log.warning("resolve_model: max recursion depth reached for model=%s (circular alias?)", model)
+        return model
     if not model:
         models_cfg = config.get("models") or {}
         default = models_cfg.get("default")
         if not default:
             return None
         # Default kann selbst ein Alias sein → auflösen
-        return resolve_model(config, default)
+        return resolve_model(config, default, _depth + 1)
     prefix, clean = _split_provider_prefix(model)
     providers = config.get("providers") or {}
     if prefix:
@@ -189,7 +196,11 @@ def resolve_model(config: dict[str, Any], model: str | None) -> str | None:
     default_prov = providers.get(default_name) or {}
     default_aliases = (default_prov.get("models") or {}).get("aliases") or {}
     if model in default_aliases:
-        return default_aliases[model]
+        resolved = default_aliases[model]
+        # Guard against circular aliases (alias points back to itself or to another alias chain)
+        if resolved != model:
+            return resolve_model(config, resolved, _depth + 1)
+        return resolved
     # Dann alle anderen Provider durchsuchen
     for prov_name, prov_cfg in providers.items():
         if prov_name == default_name:
@@ -327,7 +338,13 @@ def _tools_schema(
         else:  # first (default)
             desc = "Search the web via SearXNG. Available engines: " + ", ".join(engine_ids) + ". Default is '" + (default_id or "") + "'. Only specify engine if the user explicitly requests a different one."
         if any("vpn" in k.lower() for k in engine_ids):
-            desc += " Engine ids containing 'vpn': use only when user explicitly asks for VPN/secure search."
+            desc += (
+                " **Connection/routing preference:** When the user says to use a specific connection or VPN"
+                " (e.g. 'use vpn1', 'search via VPN', 'use this connection'), treat it as a session-wide preference:"
+                " apply the matching engine to ALL subsequent web_search calls AND the matching proxy to ALL read_url calls"
+                " until the user says otherwise. Engine and proxy names correspond (e.g. 'vpn'/'vpn1' engine↔proxy,"
+                " 'vpn2' engine↔proxy, 'main'/'direct' engine↔proxy)."
+            )
         schema.append({
             "type": "function",
             "function": {
@@ -361,11 +378,20 @@ def _tools_schema(
         "type": "function",
         "function": {
             "name": "read_url",
-            "description": "Read the content of a URL and return it as clean text. Use this to read web pages, documentation, product pages, wiki articles, or any URL the user provides. Also use during research to read the actual content of pages found via web_search. HTML is automatically converted to text.",
+            "description": (
+                "Read the content of a URL and return it as clean text. "
+                "Use for: web pages, docs, wikis, research. HTML is auto-converted to text. "
+                "CANNOT fill forms, click buttons, or navigate multi-step flows (tracking, login, search forms). "
+                "If this returns generic/homepage content instead of the specific data you need: "
+                "the site requires form interaction — escalate immediately to exec+Playwright, do NOT give up. "
+                "Never guess or construct URLs from memory — verify with web_search first."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "Full URL to read (e.g. https://en.wikipedia.org/wiki/Topic)"},
+                    "proxy": {"type": "string", "description": "Proxy name to use (from configured proxies). Omit to use the default proxy or direct connection."},
+                    "js": {"type": "boolean", "description": "Set true for JS-heavy pages (SPAs, React/Vue/Angular apps) that need browser rendering. Only use when plain fetch returns empty or minimal content. Requires Playwright to be installed."},
                 },
                 "required": ["url"],
             },
@@ -632,11 +658,16 @@ def get_subagent_tools_schema(config: dict[str, Any]) -> list[dict[str, Any]]:
         "type": "function",
         "function": {
             "name": "read_url",
-            "description": "Read the content of a URL and return it as clean text. Use to read web pages, docs, wikis. HTML is converted to text automatically.",
+            "description": (
+                "Read the content of a URL as clean text. "
+                "CANNOT fill forms or click buttons — use exec+Playwright for that. "
+                "Never guess or construct URLs from memory — verify with web_search first if unsure."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "Full URL to read"},
+                    "proxy": {"type": "string", "description": "Proxy name to use (from configured proxies). Omit for default/direct."},
                 },
                 "required": ["url"],
             },

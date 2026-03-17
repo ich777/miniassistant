@@ -43,6 +43,32 @@ curl -s http://localhost:8765/api/ollama/models \
   -H "Authorization: Bearer SECRET"
 ```
 
+## OpenAI-kompatible API
+
+MiniAssistant bietet unter `/v1/` eine OpenAI-kompatible Schnittstelle.
+Damit funktionieren Tools wie Open WebUI, Continue.dev, Cursor und das openai Python SDK direkt.
+
+```bash
+# Modelle auflisten (inkl. Aliases/Kurznamen)
+curl -s http://localhost:8765/v1/models \
+  -H "Authorization: Bearer SECRET"
+
+# Chat Completion (model kann ein Alias wie "fast" sein)
+curl -s http://localhost:8765/v1/chat/completions \
+  -H "Authorization: Bearer SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "fast", "messages": [{"role": "user", "content": "Hallo!"}]}'
+
+# Streaming
+curl -s -N http://localhost:8765/v1/chat/completions \
+  -H "Authorization: Bearer SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "fast", "stream": true, "messages": [{"role": "user", "content": "Hallo!"}]}'
+```
+
+Der Agent-Kontext (SOUL, IDENTITY, TOOLS, USER, Memory) wird automatisch als System-Prompt vorgeschaltet.
+Details: [OPENAI_API.md](../../OPENAI_API.md)
+
 ## Useful for schedules
 
 In a schedule prompt, the assistant runs with full tool access. To trigger from bash (e.g. after a backup script):

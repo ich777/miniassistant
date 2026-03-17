@@ -16,6 +16,12 @@ source venv/bin/activate
 
 **System-Pakete:** Das Install-Skript versucht zu Beginn automatisch, System-Pakete zu installieren (python3, python3-venv, python3-pip, libolm-dev für Matrix-E2EE). Dafür sind ggf. Rechte nötig (z. B. `sudo ./install.sh`). Schlägt die Installation fehl, die genannten Pakete manuell installieren und `./install.sh` erneut ausführen.
 
+**Systemweit verfügbar machen** (optional): Damit `miniassistant` ohne venv-Aktivierung aus jeder Shell aufrufbar ist:
+
+```bash
+sudo ln -s /pfad/zum/projekt/venv/bin/miniassistant /usr/local/bin/miniassistant
+```
+
 Optional: Init-Skript (sysvinit) oder systemd installieren:
 
 ```bash
@@ -71,6 +77,29 @@ ollama:
 - **Web-UI**: `miniassistant serve` – dann http://127.0.0.1:8765 (Host/Port in Config änderbar, z. B. `server.port: 8080` oder `--port 8080`)
 - **Token**: Beim ersten `serve` wird ein Token generiert (CLI-Ausgabe oder `miniassistant token`). **Im Browser:** Startseite öffnen, Token eingeben und „Zum Chat“ klicken – oder direkt z. B. `http://host:8765/chat?token=DEIN_TOKEN` aufrufen. API: `?token=...` in der URL oder Header `Authorization: Bearer <token>`.
 
+## OpenAI-kompatible API
+
+MiniAssistant stellt unter `/v1/` eine vollstaendig OpenAI-kompatible Schnittstelle bereit. Damit funktionieren externe Tools wie **Open WebUI**, **Continue.dev**, **Cursor** und das **openai Python SDK** direkt -- mit dem konfigurierten Agent-Kontext (SOUL, IDENTITY, TOOLS, USER, Memory).
+
+```bash
+# Modelle auflisten (inkl. Aliases wie "fast", "code", "sonnet")
+curl -s http://localhost:8765/v1/models -H "Authorization: Bearer TOKEN"
+
+# Chat Completion mit Kurzname
+curl -s http://localhost:8765/v1/chat/completions \
+  -H "Authorization: Bearer TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "fast", "messages": [{"role": "user", "content": "Hallo!"}]}'
+
+# Streaming (SSE)
+curl -s -N http://localhost:8765/v1/chat/completions \
+  -H "Authorization: Bearer TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "fast", "stream": true, "messages": [{"role": "user", "content": "Hallo!"}]}'
+```
+
+Details, Integrationsbeispiele und Einschraenkungen: **[OPENAI_API.md](OPENAI_API.md)**
+
 ## Binden auf alle Interfaces
 
 In der Config `server.host: "0.0.0.0"` setzen (miniassistant config oder YAML). **Wichtig**: Token setzen, damit nur Berechtigte zugreifen.
@@ -85,6 +114,8 @@ Die LLM erfährt automatisch, auf welchem System sie läuft (OS, Distribution, P
 - **Merken:** Das Modell weiß, dass es mit **exec** Dateien lesen/schreiben kann. Wenn `workspace` oder `agent_dir` gesetzt sind, werden diese Pfade im System-Prompt genannt – der Assistent kann dort Notizen anlegen, wenn du ihn darum bittest.
 - **Geplante Jobs (ohne System-Cron):** Optional `scheduler.enabled: true` in der Config und `pip install miniassistant[scheduler]`. Dann steht das Tool **schedule** zur Verfügung (Cron z. B. `0 9 * * *` oder „in 30 minutes“). Jobs werden beim `serve` ausgeführt.
 - **Nutzungs-Tracking:** Optional `server.track_usage: true` – zeichnet jeden LLM-Aufruf (Modell, Typ, Dauer in Sekunden) als CSV in `$config_dir/usage/usage.csv` auf. In der Web-UI unter `/nutzung` mit Zeitfiltern (Stunde, Tag, Woche, Monat, Jahr) und Charts einsehbar.
+- **Proxy für read_url:** Optionale Proxy-Konfiguration für serverseitige URL-Abrufe (`read_url.proxies` mit Namen). Unterstützt HTTP/HTTPS/SOCKS5 sowie Strategien `first`, `random`, `roundrobin`, `none`. Details: [CONFIGURATION.md](CONFIGURATION.md).
+- **JS-Rendering (optional):** `read_url` unterstützt `js: true` für JavaScript-lastige Seiten (SPAs, React/Vue/Angular). Erfordert Playwright: `pip install miniassistant[js] && playwright install chromium` (~300 MB). Ohne Installation: Warnung + Fallback auf normalen Fetch.
 
 ## Konfiguration (Doku)
 

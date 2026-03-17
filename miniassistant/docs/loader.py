@@ -34,6 +34,7 @@ DOC_FILES = [
     "VOICE.md",
     "EMAIL.md",
     "CHAT_HISTORY.md",
+    "WEB_FETCHING.md",
 ]
 
 
@@ -65,17 +66,18 @@ def ensure_docs(config: dict[str, Any]) -> Path | None:
     if not docs_dir:
         return None
 
-    # Fehlende Dateien aus Defaults kopieren
+    # Fehlende Dateien aus Defaults kopieren (nur wenn nicht vorhanden – user-editable)
     for fname in DOC_FILES:
         target = docs_dir / fname
+        source = _DEFAULTS_DIR / fname
+        if not source.exists():
+            continue
         if not target.exists():
-            source = _DEFAULTS_DIR / fname
-            if source.exists():
-                try:
-                    shutil.copy2(source, target)
-                    _log.info("docs/%s erstellt (Default kopiert)", fname)
-                except Exception as e:
-                    _log.warning("Konnte %s nicht kopieren: %s", fname, e)
+            try:
+                shutil.copy2(source, target)
+                _log.info("docs/%s erstellt (Default kopiert)", fname)
+            except Exception as e:
+                _log.warning("Konnte %s nicht kopieren: %s", fname, e)
 
     return docs_dir
 
