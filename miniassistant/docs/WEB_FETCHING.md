@@ -27,7 +27,8 @@ where `<python>` is the `Python:` path shown in the System section. After instal
 ## Form interaction (when read_url is not enough)
 
 **`read_url` (even with `js: true`) can only READ a page — it CANNOT fill forms, click buttons, or navigate multi-step flows.**
-For any interaction (tracking, login, forms, buttons): write a Playwright script via `exec`.
+For sites that REQUIRE filling a form or clicking buttons to get results (login, multi-step wizards): write a Playwright script via `exec`.
+**Note:** Many tracking/lookup sites have direct URLs (e.g. `site.com/tracking/NUMBER`) — use `read_url` for those, no Playwright needed.
 
 ### Mandatory before writing any script:
 

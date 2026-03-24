@@ -38,24 +38,126 @@ from miniassistant.memory import append_exchange
 import miniassistant.agent_actions_log as _aal
 import miniassistant.context_log as _ctx_log
 import re as _re
+from queue import Queue, Empty as _QueueEmpty
+from threading import Thread as _Thread
 
 # Tools die sicher parallel ausgeführt werden können (kein shared state, kein Filesystem-Konflikt)
 _CONCURRENT_SAFE_TOOLS = frozenset({"invoke_model", "read_url", "check_url", "read_email"})
 
-# Regex für <think>...</think> Tags die manche Modelle (phi4-reasoning, deepseek-r1)
-# inline im Content ausgeben wenn think nicht als API-Parameter gesendet wird.
-_THINK_TAG_RE = _re.compile(r"<think>(.*?)</think>", _re.DOTALL)
+# Keepalive-Intervall für Streaming (verhindert Socket-Timeout bei Modell-Laden)
+_KEEPALIVE_INTERVAL = 15.0  # Sekunden — unter den meisten Client-Timeouts (30-60s)
+_STREAM_DONE = object()      # Sentinel
+
+
+def _iter_with_keepalive(gen_fn, interval=_KEEPALIVE_INTERVAL):
+    """Generator in Thread ausführen, bei Stille >interval Sekunden None yielden.
+    Caller kann None als Keepalive-Signal behandeln."""
+    q: Queue = Queue()
+
+    def _run():
+        try:
+            for item in gen_fn():
+                q.put(item)
+        except Exception as e:
+            q.put(e)
+        q.put(_STREAM_DONE)
+
+    _Thread(target=_run, daemon=True).start()
+
+    while True:
+        try:
+            item = q.get(timeout=interval)
+        except _QueueEmpty:
+            yield None  # Keepalive-Signal
+            continue
+        if item is _STREAM_DONE:
+            return
+        if isinstance(item, BaseException):
+            raise item
+        yield item
+
+
+def _call_with_keepalive(fn, interval=_KEEPALIVE_INTERVAL):
+    """Blockierenden Aufruf in Thread ausführen, bei Stille None yielden.
+    Letztes yield ist das Ergebnis (nicht None). Für Tool-Execution etc."""
+    q: Queue = Queue()
+
+    def _run():
+        try:
+            q.put(("ok", fn()))
+        except BaseException as e:
+            q.put(("err", e))
+
+    _Thread(target=_run, daemon=True).start()
+
+    while True:
+        try:
+            kind, val = q.get(timeout=interval)
+            if kind == "ok":
+                yield val
+                return
+            raise val
+        except _QueueEmpty:
+            yield None
+
+# -- Regex für Reasoning/Thinking-Tags im Content --
+# <think>...</think> (phi4-reasoning, deepseek-r1, etc.)
+_THINK_RE = _re.compile(r"<think>(.*?)</think>", _re.DOTALL)
+# vLLM filtert das öffnende <think>-Token, </think> kommt trotzdem durch.
+_THINK_ORPHAN_RE = _re.compile(r"^(.*?)</think>\s*", _re.DOTALL)
+# <details type="reasoning"> (qwen3 etc.) — komplett oder ungeschlossen (Endlos-Loop)
+_DETAILS_RE = _re.compile(r'<details\s+type="reasoning"[^>]*>.*?(?:</details>\s*|$)', _re.DOTALL)
 
 
 def _strip_think_tags(content: str) -> tuple[str, str]:
-    """Extrahiert <think>...</think> Blöcke aus Content.
-    Returns: (bereinigter_content, thinking_text)"""
-    if "<think>" not in content:
+    """Strip <think> und <details type="reasoning"> Blöcke aus Content.
+    Returns: (bereinigter_content, extrahierter_thinking_text)"""
+    if not content:
         return content, ""
-    thinking_parts = _THINK_TAG_RE.findall(content)
-    cleaned = _THINK_TAG_RE.sub("", content).strip()
-    thinking = "\n".join(t.strip() for t in thinking_parts if t.strip())
-    return cleaned, thinking
+    thinking: list[str] = []
+    # <details type="reasoning"> Blöcke entfernen (qwen3 etc.)
+    if "<details" in content:
+        content = _DETAILS_RE.sub("", content)
+    # <think>...</think> Blöcke
+    if "<think>" in content:
+        thinking.extend(_THINK_RE.findall(content))
+        content = _THINK_RE.sub("", content)
+    # Verwaiste </think> (vLLM)
+    while "</think>" in content:
+        m = _THINK_ORPHAN_RE.match(content)
+        if not m:
+            break
+        thinking.append(m.group(1))
+        content = content[m.end():]
+    return content.strip(), "\n".join(t.strip() for t in thinking if t.strip())
+
+
+def _clean_response(content: str, thinking: str) -> tuple[str, str]:
+    """Strip Thinking-Tags und Tool-Call-XML aus Content und Thinking.
+    Einziger Aufruf nötig am Ende jedes Response-Pfads."""
+    content, extra = _strip_think_tags(content)
+    if extra:
+        thinking = (thinking + "\n" + extra).strip() if thinking else extra
+    content = _strip_tool_call_tags(content)
+    thinking = _strip_tool_call_tags(thinking)
+    return content, thinking
+
+
+def _strip_tool_call_tags(content: str) -> str:
+    """Entfernt verbliebene Tool-Call-XML-Blöcke aus Content (Safety-Net).
+    Wird als letzter Schritt aufgerufen bevor Content an Clients geliefert wird,
+    damit fehlerhaft geparste Tool-Call-XML nie durchleakt."""
+    if not any(tag in content for tag in ("<tool_call>", "<tools>", "<function=")):
+        return content
+    # Vollständige Blöcke entfernen
+    content = _re.sub(r'<tool_call>.*?</tool_call>', '', content, flags=_re.DOTALL)
+    content = _re.sub(r'<tools>.*?</tools>', '', content, flags=_re.DOTALL)
+    content = _re.sub(r'<function=\w+>.*?</function>(?:\s*</tool_call>)?', '', content, flags=_re.DOTALL)
+    # Verwaiste öffnende Tags ohne schließendes Tag (abgebrochene Generierung)
+    content = _re.sub(r'<tool_call>.*', '', content, flags=_re.DOTALL)
+    content = _re.sub(r'<tools>.*', '', content, flags=_re.DOTALL)
+    content = _re.sub(r'<function=\w+>.*', '', content, flags=_re.DOTALL)
+    return content.strip()
 
 
 try:
@@ -231,6 +333,9 @@ def _provider_supports_tools(config: dict[str, Any], model_name: str) -> bool:
         return google_tools_check(api_model or model_name)
     if provider_type in ("openai", "deepseek", "openai-compat"):
         if provider_type == "openai-compat":
+            prov, _ = get_provider_config(config, model_name)
+            if prov.get("no_api_tools"):
+                return False  # Tools über System-Prompt, nicht über API
             return True  # OpenAI-kompatible APIs: Tool-Support vom User verantwortet
         from miniassistant.openai_client import model_supports_tools as openai_tools_check
         _, api_model = get_provider_config(config, model_name)
@@ -243,6 +348,48 @@ def _provider_supports_tools(config: dict[str, Any], model_name: str) -> bool:
     base_url = get_base_url_for_model(config, model_name)
     _, api_model = get_provider_config(config, model_name)
     return model_supports_tools(base_url, api_model or model_name)
+
+
+def _provider_no_api_tools(config: dict[str, Any], model_name: str) -> bool:
+    """True wenn Provider 'no_api_tools: true' gesetzt hat.
+    Tools werden dann über System-Prompt + Client-seitigen XML-Parser genutzt,
+    nicht über die API (kein tools-Array im Request)."""
+    prov, _ = get_provider_config(config, model_name)
+    return bool(prov.get("no_api_tools"))
+
+
+def _build_no_api_tools_prompt(tools_schema: list[dict[str, Any]]) -> str:
+    """Erzeugt Tool-Schema + Format-Anweisung für den System-Prompt (no_api_tools-Modus).
+    Das Modell bekommt kein tools-Array via API — stattdessen steht das Schema hier."""
+    if not tools_schema:
+        return ""
+    lines = [
+        "## Tool Calling",
+        "To call tools, output one or more calls using this exact JSON format (one call per line, no extra text around it):",
+        '<tool_call>{"name": "TOOL_NAME", "arguments": {"PARAM": "VALUE", ...}}</tool_call>',
+        "Multiple parallel calls allowed (one per line). Wait for all results before continuing.\n",
+        "## Available Tools",
+    ]
+    for tool in tools_schema:
+        fn = tool.get("function") or tool
+        name = fn.get("name", "")
+        desc = fn.get("description", "").strip()
+        params = (fn.get("parameters") or {}).get("properties") or {}
+        required = (fn.get("parameters") or {}).get("required") or []
+        lines.append(f"\n### {name}")
+        if desc:
+            lines.append(desc)
+        if params:
+            lines.append("Parameters:")
+            for pname, pdef in params.items():
+                ptype = pdef.get("type", "string")
+                pdesc = pdef.get("description", "").strip()
+                req = "required" if pname in required else "optional"
+                line = f"- {pname} ({ptype}, {req})"
+                if pdesc:
+                    line += f": {pdesc}"
+                lines.append(line)
+    return "\n".join(lines)
 
 
 def _ollama_available_models(config: dict[str, Any], provider_name: str | None = None) -> tuple[list[str], str]:
@@ -1063,7 +1210,14 @@ def _run_tool(
                 others = [eid for eid, ecfg in (config.get("search_engines") or {}).items() if (ecfg.get("url") or "").strip() != url]
                 _random.shuffle(others)
                 if others:
-                    return f"Search engine returned no results. Other configured engines: {', '.join(others)}. Ask the user if they want to try one."
+                    # Auto-fallback zu anderer Engine statt User zu fragen
+                    next_engine = others[0]
+                    next_url = (config.get("search_engines") or {}).get(next_engine, {}).get("url", "")
+                    if next_url:
+                        alt_result = tool_web_search(next_url, query)
+                        if alt_result.get("results"):
+                            alt_lines = [f"- {r.get('title', '')} | {r.get('url', '')}\n  {r.get('snippet', '')}" for r in alt_result["results"]]
+                            return f"[No results from '{url}', results from '{next_engine}':]\n" + "\n".join(alt_lines)
             return "Search engine returned no results. This is a search engine failure — do NOT conclude that nothing exists. Tell the user the search returned no results and suggest rephrasing."
         return "\n".join(lines)
     if name == "check_url":
@@ -2333,13 +2487,54 @@ def _run_subagent_with_tools(
         try:
             nudge_r = ollama_chat(
                 base_url, msgs, model=api_model, system=system,
-                think=think, options=options or None, api_key=api_key,
+                think=think, tools=tools, options=options or None, api_key=api_key,
             )
             nudge_msg = nudge_r.get("message") or {}
             if nudge_msg.get("thinking"):
                 total_thinking += nudge_msg["thinking"]
-            if nudge_msg.get("content"):
-                total_content += nudge_msg["content"]
+            # Prüfen ob Nudge Tool-Calls enthält (1 Runde)
+            nudge_tc = _extract_tool_calls(nudge_msg)
+            if nudge_tc:
+                _log.info("Subagent %s nudge: %d Tool-Call(s) — führe aus", resolved_name, len(nudge_tc))
+                msgs.append(nudge_msg)
+                for tc_name, tc_args in nudge_tc:
+                    if tc_name in _ALLOWED_SUB_TOOLS:
+                        if tc_name == "exec":
+                            _ws = (config.get("workspace") or "").strip() or None
+                            _exec_r = run_exec(tc_args.get("command", ""), cwd=_ws, extra_env=_exec_env(config))
+                            tool_result = f"returncode: {_exec_r['returncode']}\nstdout:\n{_exec_r['stdout']}\nstderr:\n{_exec_r['stderr']}"
+                        elif tc_name == "web_search":
+                            from miniassistant.config import get_search_engine_url
+                            _ws_url = get_search_engine_url(config, tc_args.get("engine"))
+                            _ws_res = tool_web_search(_ws_url, tc_args.get("query", "")) if _ws_url else {"error": "not configured"}
+                            tool_result = "\n".join(f"- {_r.get('title','')} | {_r.get('url','')}\n  {_r.get('snippet','')}" for _r in (_ws_res.get("results") or [])) if not _ws_res.get("error") else f"Error: {_ws_res.get('error')}"
+                        elif tc_name == "read_url":
+                            _ru_r = tool_read_url(tc_args.get("url", ""), config=config, proxy=tc_args.get("proxy"), js=bool(tc_args.get("js", False)))
+                            tool_result = _ru_r.get("content", "") if _ru_r.get("ok") else f"Error: {_ru_r.get('error', 'unknown')}"
+                        elif tc_name == "check_url":
+                            _cu_r = tool_check_url(tc_args.get("url", ""))
+                            tool_result = f"reachable: {_cu_r.get('reachable', False)}, status: {_cu_r.get('status_code', '')}"
+                        else:
+                            tool_result = f"Unknown tool: {tc_name}"
+                    else:
+                        tool_result = f"Tool '{tc_name}' not available for subagents."
+                    _aal.log_tool_call(config, f"subagent:{tc_name}", tc_args, tool_result)
+                    msgs.append({"role": "tool", "content": str(tool_result)})
+                # Finale Antwort nach Nudge-Tools
+                try:
+                    final_r = ollama_chat(
+                        base_url, msgs, model=api_model, system=system,
+                        think=think, options=options or None, api_key=api_key,
+                    )
+                    final_msg = final_r.get("message") or {}
+                    if final_msg.get("thinking"):
+                        total_thinking += final_msg["thinking"]
+                    if final_msg.get("content"):
+                        total_content += _strip_tool_call_tags(final_msg["content"])
+                except Exception:
+                    pass
+            elif nudge_msg.get("content"):
+                total_content += _strip_tool_call_tags(nudge_msg["content"])
         except Exception as nudge_err:
             _log.warning("Subagent nudge failed (%s): %s", resolved_name, nudge_err)
     result = total_content.strip()
@@ -2352,9 +2547,23 @@ def _run_subagent_with_tools(
 
 def _extract_tool_calls(message: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     """Extrahiert (name, arguments) aus message.tool_calls.
-    Fallback: Parst <tool_call> XML-Tags aus message.content (manche Modelle wie qwen3 geben Tool-Calls als Text aus)."""
+    Fallback: Parst Tool-Call-Tags aus message.content.
+    Unterstützte Formate:
+      Format 1 (JSON):  <tool_call>{"name": "x", "arguments": {...}}</tool_call>
+      Format 2 (XML):   <tool_call><function=x><parameter=k>v</parameter>...</function></tool_call>
+      Format 2b:        wie Format 2, ohne schließende Tags (lenient)
+      Format 3:         <tools>{"name": "x", "arguments": {...}}</tools>
+      Format 4:         {"tool_calls": [{"name": "x", "arguments": {...}}, ...]}
+      Format 5:         <function=x><parameter=k>v</parameter></function>  (ohne <tool_call> Wrapper)
+      Format 6:         {"name": "x", "arguments": {...}}  (nacktes JSON-Objekt)
+    """
     out = []
-    for tc in message.get("tool_calls") or []:
+    _tc_api = message.get("tool_calls") or []
+    _tc_content = (message.get("content") or "")[:200]
+    _tc_thinking = (message.get("thinking") or "")[:200]
+    _log.debug("_extract_tool_calls: api_tc=%d, content=%.100s…, thinking=%.100s…",
+               len(_tc_api), _tc_content, _tc_thinking)
+    for tc in _tc_api:
         fn = tc.get("function") or {}
         name = fn.get("name", "")
         args = fn.get("arguments")
@@ -2365,12 +2574,21 @@ def _extract_tool_calls(message: dict[str, Any]) -> list[tuple[str, dict[str, An
                 args = {}
         if not isinstance(args, dict):
             args = {}
-        out.append((name, args))
-    # Fallback: <tool_call> XML im Content parsen (qwen3, deepseek, etc.)
+        if name:
+            out.append((name, args))
+    # Fallback: Tool-Call-Tags im Content parsen
     if not out:
         content = message.get("content") or ""
+        # Wenn Content keine Tool-Call-Marker hat, Thinking als Fallback nehmen
+        # (qwen3 etc. schreiben Tool-Calls manchmal ins reasoning_content statt content)
+        _tc_markers = ("<tool_call>", "<tools>", "<function=", '"tool_calls"', '"name"')
+        if not any(tag in content for tag in _tc_markers):
+            _think_fb = message.get("thinking") or ""
+            if _think_fb and any(tag in _think_fb for tag in _tc_markers):
+                _log.info("_extract_tool_calls: Tool-Call-Marker im thinking-Feld gefunden (Content leer/ohne Marker)")
+                content = _think_fb
         if "<tool_call>" in content:
-            import re as _re
+            # Format 1: JSON-Payload
             for m in _re.finditer(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', content, _re.DOTALL):
                 try:
                     obj = json.loads(m.group(1))
@@ -2383,9 +2601,126 @@ def _extract_tool_calls(message: dict[str, Any]) -> list[tuple[str, dict[str, An
                             args = {}
                     if name and isinstance(args, dict):
                         out.append((name, args))
-                        _log.info("Tool-Call aus <tool_call> XML extrahiert: %s", name)
+                        _log.info("Tool-Call (JSON) aus <tool_call> extrahiert: %s", name)
                 except json.JSONDecodeError:
                     pass
+            # Format 2: <function=name><parameter=key>value</parameter>...</function>
+            # (Qwen3/Nemotron/Hermes XML-Variante — vLLM gibt diese als Text durch)
+            if not out:
+                for m in _re.finditer(
+                    r'<tool_call>\s*<function=(\w+)>(.*?)</function>\s*</tool_call>',
+                    content, _re.DOTALL
+                ):
+                    name = m.group(1)
+                    body = m.group(2)
+                    args = {
+                        pm.group(1): pm.group(2).strip()
+                        for pm in _re.finditer(r'<parameter=(\w+)>(.*?)</parameter>', body, _re.DOTALL)
+                    }
+                    if name:
+                        out.append((name, args))
+                        _log.info("Tool-Call (XML) aus <tool_call> extrahiert: %s %s", name, args)
+            # Format 2b: Lenient — </function> und/oder </parameter> fehlen
+            # z.B. <tool_call> <function=web_search> <parameter=query> value </tool_call>
+            if not out:
+                for m in _re.finditer(
+                    r'<tool_call>\s*<function=(\w+)>(.*?)</tool_call>',
+                    content, _re.DOTALL
+                ):
+                    name = m.group(1)
+                    body = m.group(2)
+                    args = {}
+                    # Erst mit Closing-Tags versuchen
+                    for pm in _re.finditer(r'<parameter=(\w+)>(.*?)</parameter>', body, _re.DOTALL):
+                        args[pm.group(1)] = pm.group(2).strip()
+                    # Fallback: Parameter ohne Closing-Tags
+                    if not args:
+                        for pm in _re.finditer(r'<parameter=(\w+)>(.*?)(?=<parameter=|$)', body, _re.DOTALL):
+                            args[pm.group(1)] = pm.group(2).strip()
+                    if name:
+                        out.append((name, args))
+                        _log.info("Tool-Call (XML-lenient) aus <tool_call> extrahiert: %s %s", name, args)
+        # Format 5: Bare <function=name><parameter=key>value</parameter></function>
+        # (Kein <tool_call>-Wrapper — manche Modelle lassen ihn weg oder haben nur </tool_call>)
+        if not out and "<function=" in content:
+            for m in _re.finditer(
+                r'<function=(\w+)>(.*?)</function>', content, _re.DOTALL
+            ):
+                name = m.group(1)
+                body = m.group(2)
+                args = {}
+                for pm in _re.finditer(r'<parameter=(\w+)>(.*?)</parameter>', body, _re.DOTALL):
+                    args[pm.group(1)] = pm.group(2).strip()
+                if not args:
+                    for pm in _re.finditer(r'<parameter=(\w+)>(.*?)(?=<parameter=|$)', body, _re.DOTALL):
+                        args[pm.group(1)] = pm.group(2).strip()
+                if name:
+                    out.append((name, args))
+                    _log.info("Tool-Call (Format 5 bare <function>) extrahiert: %s %s", name, args)
+        # Format 3: <tools>{"name": "...", "arguments": {...}}</tools>
+        # (Manche Modelle, z.B. qwen3-next, nutzen dieses Format statt <tool_call>)
+        if not out and "<tools>" in content:
+            for m in _re.finditer(r'<tools>\s*(\{.*?\})\s*</tools>', content, _re.DOTALL):
+                try:
+                    obj = json.loads(m.group(1))
+                    name = obj.get("name", "")
+                    args = obj.get("arguments") or obj.get("parameters") or {}
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except json.JSONDecodeError:
+                            args = {}
+                    if name and isinstance(args, dict):
+                        out.append((name, args))
+                        _log.info("Tool-Call (Format 3 <tools>) extrahiert: %s", name)
+                except json.JSONDecodeError:
+                    pass
+        # Format 4: {"tool_calls": [{"name": "...", "arguments": {...}}, ...]}
+        # Ganzer Content ist ein JSON-Objekt mit tool_calls-Key
+        if not out and '"tool_calls"' in content:
+            stripped = content.strip()
+            if stripped.startswith("{"):
+                try:
+                    obj = json.loads(stripped)
+                    for tc in obj.get("tool_calls") or []:
+                        name = tc.get("name", "")
+                        args = tc.get("arguments") or tc.get("parameters") or {}
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except json.JSONDecodeError:
+                                args = {}
+                        if name and isinstance(args, dict):
+                            out.append((name, args))
+                            _log.info("Tool-Call (Format 4 raw JSON) extrahiert: %s", name)
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+        # Format 6: Nacktes JSON {"name": "...", "arguments": {...}} ohne Wrapper
+        # (Modell gibt nach Thinking manchmal nur das JSON-Objekt aus)
+        if not out and '"name"' in content and '"arguments"' in content:
+            stripped = content.strip()
+            if stripped.startswith("{"):
+                try:
+                    obj = json.loads(stripped)
+                    name = obj.get("name", "")
+                    args = obj.get("arguments") or obj.get("parameters") or {}
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except json.JSONDecodeError:
+                            args = {}
+                    if name and isinstance(args, dict):
+                        out.append((name, args))
+                        _log.info("Tool-Call (Format 6 bare JSON obj) extrahiert: %s", name)
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+    if out:
+        _log.info("_extract_tool_calls: %d Tool-Call(s) extrahiert: %s", len(out), [n for n, _ in out])
+    elif any(tag in (message.get("content") or "") + (message.get("thinking") or "")
+             for tag in ("<tool_call>", "<tools>", "<function=")):
+        _log.warning("_extract_tool_calls: Tool-Call-Marker vorhanden aber NICHTS extrahiert! "
+                     "content=%.300s thinking=%.300s",
+                     (message.get("content") or "")[:300], (message.get("thinking") or "")[:300])
     return out
 
 
@@ -2455,11 +2790,13 @@ def chat_round(
                 options = get_options_for_model(config, try_model)
                 tools = tools_schema if _provider_supports_tools(config, try_model) else []
                 system_effective = system_prompt
-                if not tools:
+                if not tools and not _provider_no_api_tools(config, try_model):
                     system_effective = (
                         system_prompt
                         + "\n\n[Wichtig: Diesem Modell stehen keine Tools (exec, schedule, web_search) zur Verfügung. Antworte nur mit Text; schlage keine Tool-Aufrufe oder konkreten schedule/exec-Beispiele vor.]"
                     )
+                elif not tools and _provider_no_api_tools(config, try_model) and tools_schema:
+                    system_effective = system_prompt + "\n\n" + _build_no_api_tools_prompt(tools_schema)
                 num_ctx = get_num_ctx_for_model(config, try_model)
                 msgs = _trim_messages_to_fit(system_effective, msgs, num_ctx, reserve_tokens=1024, tools=tools)
                 last_msgs_before_call = list(msgs)
@@ -2481,10 +2818,14 @@ def chat_round(
                                 timeout=_api_timeout,
                             )
                             break
-                        except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.RemoteProtocolError, RuntimeError) as e:
+                        except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.RemoteProtocolError, RuntimeError, OSError) as e:
+                            # Broken pipe (Errno 32) und andere Socket-Fehler retryen
                             if attempt < 2:
                                 code = getattr(getattr(e, "response", None), "status_code", None)
-                                if isinstance(e, (httpx.TimeoutException, httpx.RemoteProtocolError)) or code in (400, 500, 502, 503, 504):
+                                err_str = str(e).lower()
+                                if (isinstance(e, (httpx.TimeoutException, httpx.RemoteProtocolError, OSError)) or 
+                                    code in (400, 500, 502, 503, 504) or 
+                                    "broken pipe" in err_str or "errno 32" in err_str):
                                     _log.warning("API attempt %d/3 failed (%s), retrying in 3s …", attempt + 1, e)
                                     time.sleep(3)
                                     continue
@@ -2506,20 +2847,33 @@ def chat_round(
                 last_response = response
                 msg = response.get("message") or {}
                 total_thinking += (msg.get("thinking") or "")
-                total_content += (msg.get("content") or "")
+                _msg_content = msg.get("content") or ""
                 tool_calls = _extract_tool_calls(msg)
+                # Für Display (total_content): nur Content aus der finalen Runde (ohne Tool-Calls).
+                # Zwischen-Runden-Content (Kommentare wie "Lass mich das prüfen...") wird NICHT
+                # akkumuliert — er landet sonst in der Antwort an Matrix/Discord/Scheduler.
+                _display_content = _msg_content
+                if any(tag in _msg_content for tag in ("<tool_call>", "<tools>", "<function=")):
+                    _display_content = _strip_tool_call_tags(_msg_content)
 
                 if not tool_calls:
-                    msgs.append({"role": "assistant", "content": msg.get("content") or "", "thinking": msg.get("thinking") or ""})
+                    total_content += _display_content  # Nur finale Runde akkumulieren
+                    msgs.append({"role": "assistant", "content": _msg_content or "", "thinking": msg.get("thinking") or ""})
                     _aal.log_thinking(config, msg.get("thinking") or "")
                     if msg.get("content"):
                         _aal.log_response(config, msg["content"], tps=_aal.extract_tps(response, time.monotonic() - _t0, msg["content"], msg.get("thinking") or ""))
                         _response_logged = True
                     break
 
+                # Wenn Tool-Calls aus Thinking extrahiert wurden und Content leer ist,
+                # Thinking als Content verwenden (damit Modell in nächster Runde seinen
+                # eigenen Tool-Call sieht und die tool_response versteht)
+                _hist_content = msg.get("content") or ""
+                if not _hist_content.strip() and tool_calls and (msg.get("thinking") or ""):
+                    _hist_content = msg["thinking"]
                 msgs.append({
                     "role": "assistant",
-                    "content": msg.get("content") or "",
+                    "content": _hist_content,
                     "thinking": msg.get("thinking") or "",
                     "tool_calls": response.get("message", {}).get("tool_calls") or [],
                 })
@@ -2568,11 +2922,14 @@ def chat_round(
                         config, try_model, msgs,
                         system=system_effective, think=think,
                         options=options or None,
+                        timeout=_api_timeout,
                     )
                     wrapup_msg = wrapup_resp.get("message") or {}
                     total_thinking += (wrapup_msg.get("thinking") or "")
-                    # Ersetze bisherigen Content komplett durch Wrap-Up (der alte Content war irreführend)
-                    wrapup_content = (wrapup_msg.get("content") or "").strip()
+                    # Ersetze bisherigen Content — XML-Tool-Call-Tags entfernen (Modell darf hier keine Tools mehr aufrufen)
+                    wrapup_content, _ = _clean_response(
+                        (wrapup_msg.get("content") or "").strip(),
+                        (wrapup_msg.get("thinking") or "").strip())
                     if wrapup_content:
                         total_content = wrapup_content
                     msgs.append({"role": "assistant", "content": wrapup_content, "thinking": wrapup_msg.get("thinking") or ""})
@@ -2589,12 +2946,43 @@ def chat_round(
                     nudge_resp = _dispatch_chat(
                         config, try_model, msgs,
                         system=system_effective, think=think,
-                        options=options or None,
+                        tools=tools, options=options or None,
+                        timeout=_api_timeout,
                     )
                     nudge_msg = nudge_resp.get("message") or {}
                     total_thinking += (nudge_msg.get("thinking") or "")
-                    total_content += (nudge_msg.get("content") or "")
-                    msgs.append({"role": "assistant", "content": nudge_msg.get("content") or "", "thinking": nudge_msg.get("thinking") or ""})
+                    # Prüfen ob Nudge-Response Tool-Calls enthält (1 Runde)
+                    nudge_tool_calls = _extract_tool_calls(nudge_msg)
+                    if nudge_tool_calls:
+                        _log.info("Nudge response enthält %d Tool-Call(s) — führe aus", len(nudge_tool_calls))
+                        _nudge_hist = nudge_msg.get("content") or nudge_msg.get("thinking") or ""
+                        msgs.append({"role": "assistant", "content": _nudge_hist, "thinking": nudge_msg.get("thinking") or "", "tool_calls": nudge_resp.get("message", {}).get("tool_calls") or []})
+                        nudge_results = _run_tools_maybe_concurrent(nudge_tool_calls, config, project_dir)
+                        for n, a, r in nudge_results:
+                            _aal.log_tool_call(config, n, a, r)
+                            msgs.append({"role": "tool", "tool_name": n, "content": r})
+                        # Nochmal Model aufrufen für finale Antwort (ohne tools → nur Text)
+                        try:
+                            final_resp = _dispatch_chat(
+                                config, try_model, msgs,
+                                system=system_effective, think=think,
+                                options=options or None,
+                                timeout=_api_timeout,
+                            )
+                            final_msg = final_resp.get("message") or {}
+                            total_thinking += (final_msg.get("thinking") or "")
+                            _final_c = (final_msg.get("content") or "").strip()
+                            if _final_c:
+                                _final_c = _strip_tool_call_tags(_final_c)
+                            total_content += _final_c
+                            msgs.append({"role": "assistant", "content": _final_c, "thinking": final_msg.get("thinking") or ""})
+                            last_response = final_resp
+                        except Exception:
+                            pass
+                    else:
+                        _nudge_c, _ = _clean_response(nudge_msg.get("content") or "", nudge_msg.get("thinking") or "")
+                        total_content += _nudge_c
+                        msgs.append({"role": "assistant", "content": _nudge_c, "thinking": nudge_msg.get("thinking") or ""})
                     last_response = nudge_resp
                 except Exception as nudge_err:
                     _log.warning("Nudge call failed: %s", nudge_err)
@@ -2663,17 +3051,11 @@ def chat_round(
         except Exception:
             pass
     # Strip inline <think> tags from content (phi4-reasoning, deepseek-r1 ohne API-think)
-    _final_content = total_content.strip()
-    _final_thinking = total_thinking.strip()
-    if "<think>" in _final_content:
-        _cleaned, _extra_thinking = _strip_think_tags(_final_content)
-        _final_content = _cleaned
-        if _extra_thinking:
-            _final_thinking = (_final_thinking + "\n" + _extra_thinking).strip() if _final_thinking else _extra_thinking
-    # Auch in der Konversationshistorie <think> Tags bereinigen (spart Kontext-Tokens)
+    _final_content, _final_thinking = _clean_response(total_content.strip(), total_thinking.strip())
+    # Konversationshistorie bereinigen (spart Kontext-Tokens)
     if msgs_final:
         for _m in msgs_final:
-            if _m.get("role") == "assistant" and "<think>" in (_m.get("content") or ""):
+            if _m.get("role") == "assistant" and _m.get("content"):
                 _mc, _mt = _strip_think_tags(_m["content"])
                 _m["content"] = _mc
                 if _mt and not _m.get("thinking"):
@@ -2742,11 +3124,13 @@ def chat_round_stream(
         options = get_options_for_model(config, try_model)
         tools = tools_schema if _provider_supports_tools(config, try_model) else []
         system_effective = system_prompt
-        if not tools:
+        if not tools and not _provider_no_api_tools(config, try_model):
             system_effective = (
                 system_prompt
                 + "\n\n[Wichtig: Diesem Modell stehen keine Tools (exec, schedule, web_search) zur Verfügung. Antworte nur mit Text; schlage keine Tool-Aufrufe oder konkreten schedule/exec-Beispiele vor.]"
             )
+        elif not tools and _provider_no_api_tools(config, try_model) and tools_schema:
+            system_effective = system_prompt + "\n\n" + _build_no_api_tools_prompt(tools_schema)
         num_ctx = get_num_ctx_for_model(config, try_model)
         msgs = _trim_messages_to_fit(system_effective, msgs, num_ctx, reserve_tokens=1024, tools=tools)
         if rounds == 0:
@@ -2763,21 +3147,66 @@ def chat_round_stream(
                 round_thinking = ""
                 round_content = ""
                 round_tool_calls_raw = []
-                _stream_timeout = float(config.get("api_timeout") or 300)
+                _tc_stream_buf = ""      # Buffer für tool_call-Tag-Erkennung über Chunk-Grenzen
+                _raw_stream_content = "" # Unbereinigter Content für Tool-Call-Extraction
+                _stream_timeout = float(config.get("api_timeout") or 600)
                 try:
-                    for chunk in _dispatch_chat_stream(
+                    _stream_gen = lambda: _dispatch_chat_stream(
                         config, try_model, msgs,
                         system=system_effective, think=think,
                         tools=tools, options=options or None,
                         timeout=_stream_timeout,
-                    ):
+                    )
+                    for chunk in _iter_with_keepalive(_stream_gen):
+                        if chunk is None:
+                            # Keepalive: Modell wird noch geladen
+                            yield {"type": "status", "message": "⏳ Modell wird geladen…"}
+                            continue
                         msg = chunk.get("message") or {}
                         if msg.get("thinking"):
                             round_thinking += msg["thinking"]
-                            yield {"type": "thinking", "delta": msg["thinking"]}
+                            # Tool-Call-XML aus Thinking-Display entfernen (Modell schreibt manchmal
+                            # <tool_call>-Blöcke in seinen Denkprozess; im History-Content belassen,
+                            # aber dem Client nicht als rohe XML zeigen)
+                            _think_display = _strip_tool_call_tags(msg["thinking"]) if (
+                                any(tag in msg["thinking"] for tag in ("<tool_call>", "<tools>", "<function="))
+                            ) else msg["thinking"]
+                            if _think_display:
+                                yield {"type": "thinking", "delta": _think_display}
                         if msg.get("content"):
-                            round_content += msg["content"]
-                            yield {"type": "content", "delta": msg["content"]}
+                            # Tool-Call-XML buffered entfernen — Tags können über Chunk-Grenzen gehen
+                            _raw_stream_content += msg["content"]
+                            _tc_stream_buf += msg["content"]
+                            # Vollständige Tool-Call-Blöcke strippen
+                            _tc_stream_buf = _re.sub(r'<tool_call>.*?</tool_call>', '', _tc_stream_buf, flags=_re.DOTALL)
+                            _tc_stream_buf = _re.sub(r'<tools>.*?</tools>', '', _tc_stream_buf, flags=_re.DOTALL)
+                            _tc_stream_buf = _re.sub(r'<function=\w+>.*?</function>(?:\s*</tool_call>)?', '', _tc_stream_buf, flags=_re.DOTALL)
+                            # Sicheren Teil bestimmen (vor offenen/partiellen Tags)
+                            _tc_open1 = _tc_stream_buf.find("<tool_call>")
+                            _tc_open2 = _tc_stream_buf.find("<tools>")
+                            _tc_open3_m = _re.search(r'<function=', _tc_stream_buf)
+                            _tc_open3 = _tc_open3_m.start() if _tc_open3_m else -1
+                            _tc_opens = [i for i in (_tc_open1, _tc_open2, _tc_open3) if i != -1]
+                            _tc_open_idx = min(_tc_opens) if _tc_opens else -1
+                            if _tc_open_idx != -1:
+                                # Offener Tag — nur Content davor emittieren
+                                _emit = _tc_stream_buf[:_tc_open_idx]
+                                _tc_stream_buf = _tc_stream_buf[_tc_open_idx:]
+                            else:
+                                # Kein offener Tag — aber Puffer könnte mit partiellem Tag-Anfang enden
+                                _emit = _tc_stream_buf
+                                _tc_stream_buf = ""
+                                for _tc_tag in ("<tool_call>", "<tools>", "<function="):
+                                    for _tci in range(min(len(_tc_tag) - 1, len(_emit)), 0, -1):
+                                        if _emit.endswith(_tc_tag[:_tci]):
+                                            _tc_stream_buf = _emit[-_tci:]
+                                            _emit = _emit[:-_tci]
+                                            break
+                                    if _tc_stream_buf:
+                                        break
+                            if _emit:
+                                round_content += _emit
+                                yield {"type": "content", "delta": _emit}
                         # Tool-Calls aus JEDEM Chunk akkumulieren – Ollama streamt sie
                         # in Zwischen-Chunks, der Done-Chunk hat sie oft NICHT mehr.
                         for tc in msg.get("tool_calls") or []:
@@ -2785,6 +3214,13 @@ def chat_round_stream(
                         if chunk.get("done"):
                             last_response = chunk
                             break
+                    # Stream-Buffer flushen (unvollständige/falsche Tag-Anfänge)
+                    if _tc_stream_buf:
+                        _flush = _strip_tool_call_tags(_tc_stream_buf)
+                        if _flush:
+                            round_content += _flush
+                            yield {"type": "content", "delta": _flush}
+                        _tc_stream_buf = ""
                     break
                 except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.RemoteProtocolError) as e:
                     if attempt < 2:
@@ -2810,12 +3246,25 @@ def chat_round_stream(
             return
 
         total_thinking += round_thinking
-        total_content += round_content
 
-        # Tool-Calls: aus Zwischen-Chunks ODER Done-Chunk (Fallback)
+        # Tool-Calls: aus Zwischen-Chunks ODER Done-Chunk (Fallback) ODER Content-XML
         full_msg = last_response.get("message") or {}
         all_tool_calls_raw = round_tool_calls_raw or (full_msg.get("tool_calls") or [])
-        tool_calls = _extract_tool_calls({"tool_calls": all_tool_calls_raw})
+        # _raw_stream_content enthält den unbereinigten Content (mit XML) für Extraction;
+        # round_content ist bereits via Stream-Buffer bereinigt (ohne XML) für Display.
+        tool_calls = _extract_tool_calls({"tool_calls": all_tool_calls_raw, "content": _raw_stream_content, "thinking": round_thinking})
+        # History-Content: XML erhalten damit das Modell in Runde 2+ Kontext hat
+        # (wichtig bei no_api_tools wo kein tool_calls-Array existiert).
+        history_content = _raw_stream_content
+        # Safety-Net: Tool-Call-Tags immer aus Display-Content entfernen
+        if any(tag in round_content for tag in ("<tool_call>", "<tools>", "<function=")):
+            round_content = _strip_tool_call_tags(round_content)
+
+        # total_content: nur finale Runde akkumulieren (keine Tool-Call-Runden).
+        # Zwischen-Runden-Content ("Lass mich das prüfen...") soll nicht in DONE-Event.
+        # Die Inhalts-Deltas wurden bereits live an den Client gestreamt.
+        if not tool_calls:
+            total_content += round_content
 
         if not tool_calls:
             # Content/Thinking aus den gestreamten Deltas verwenden (Done-Chunk hat oft leere Werte)
@@ -2833,14 +3282,44 @@ def chat_round_stream(
                 try:
                     nudge_resp = _dispatch_chat(
                         config, try_model, msgs,
-                        system=system_effective, think=think, options=options or None,
+                        system=system_effective, think=think, tools=tools,
+                        options=options or None, timeout=_stream_timeout,
                     )
                     nudge_msg = nudge_resp.get("message") or {}
                     total_thinking += (nudge_msg.get("thinking") or "")
-                    total_content += (nudge_msg.get("content") or "")
-                    msgs.append({"role": "assistant", "content": nudge_msg.get("content") or "", "thinking": nudge_msg.get("thinking") or ""})
-                    if nudge_msg.get("content"):
-                        yield {"type": "content", "delta": nudge_msg["content"]}
+                    # Prüfen ob Nudge-Response Tool-Calls enthält (1 Runde)
+                    nudge_tool_calls = _extract_tool_calls(nudge_msg)
+                    if nudge_tool_calls:
+                        _log.info("Stream nudge enthält %d Tool-Call(s) — führe aus", len(nudge_tool_calls))
+                        yield {"type": "tool_call", "tools": [n for n, _ in nudge_tool_calls]}
+                        _nudge_hist = nudge_msg.get("content") or nudge_msg.get("thinking") or ""
+                        msgs.append({"role": "assistant", "content": _nudge_hist, "thinking": nudge_msg.get("thinking") or "", "tool_calls": nudge_resp.get("message", {}).get("tool_calls") or []})
+                        nudge_results = _run_tools_maybe_concurrent(nudge_tool_calls, config, project_dir)
+                        for n, a, r in nudge_results:
+                            _aal.log_tool_call(config, n, a, r)
+                            msgs.append({"role": "tool", "tool_name": n, "content": r})
+                        # Finale Antwort nach Tool-Execution
+                        try:
+                            final_resp = _dispatch_chat(
+                                config, try_model, msgs,
+                                system=system_effective, think=think,
+                                options=options or None, timeout=_stream_timeout,
+                            )
+                            final_msg = final_resp.get("message") or {}
+                            total_thinking += (final_msg.get("thinking") or "")
+                            _final_c = _strip_tool_call_tags((final_msg.get("content") or "").strip())
+                            total_content += _final_c
+                            msgs.append({"role": "assistant", "content": _final_c, "thinking": final_msg.get("thinking") or ""})
+                            if _final_c:
+                                yield {"type": "content", "delta": _final_c}
+                        except Exception:
+                            pass
+                    else:
+                        _nudge_c, _ = _clean_response(nudge_msg.get("content") or "", nudge_msg.get("thinking") or "")
+                        total_content += _nudge_c
+                        msgs.append({"role": "assistant", "content": _nudge_c, "thinking": nudge_msg.get("thinking") or ""})
+                        if _nudge_c:
+                            yield {"type": "content", "delta": _nudge_c}
                 except Exception as nudge_err:
                     _log.warning("Stream nudge failed: %s", nudge_err)
 
@@ -2862,22 +3341,24 @@ def chat_round_stream(
                     "message": full_msg,
                 }
             # send_image war erfolgreich → Content unterdrücken (Bild IST die Antwort)
-            _done_content = "" if _sent_image else total_content.strip()
-            _done_thinking = total_thinking.strip()
-            if "<think>" in _done_content:
-                _done_content, _et = _strip_think_tags(_done_content)
-                if _et:
-                    _done_thinking = (_done_thinking + "\n" + _et).strip() if _done_thinking else _et
-            _done_tps = _aal.extract_tps(last_response, time.monotonic() - _stream_start, _done_content, _done_thinking)
+            _done_content, _done_thinking = _clean_response(
+                "" if _sent_image else total_content.strip(), total_thinking.strip())
+            # TPS: letzte Runde (_t0_stream) verwenden — schließt Tool-Wartezeit aus
+            _done_tps = _aal.extract_tps(last_response, time.monotonic() - _t0_stream, _done_content, _done_thinking)
             yield {"type": "done", "thinking": _done_thinking, "content": _done_content, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info, "tps": _done_tps, "ctx": [_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs), _ctx_max]}
             return
 
         _tool_names = [n for n, _ in tool_calls]
         yield {"type": "tool_call", "tools": _tool_names}
+        # Wenn Tool-Calls aus Thinking extrahiert und Content leer: Thinking als Content
+        _hist_s_content = history_content or full_msg.get("content") or ""
+        _hist_s_thinking = round_thinking or full_msg.get("thinking") or ""
+        if not _hist_s_content.strip() and tool_calls and _hist_s_thinking:
+            _hist_s_content = _hist_s_thinking
         msgs.append({
             "role": "assistant",
-            "content": round_content or full_msg.get("content") or "",
-            "thinking": round_thinking or full_msg.get("thinking") or "",
+            "content": _hist_s_content,
+            "thinking": _hist_s_thinking,
             "tool_calls": all_tool_calls_raw,
         })
         # Cancellation check between tool rounds (stream)
@@ -2890,14 +3371,10 @@ def chat_round_stream(
                 _log.info("Stream cancellation (%s) für %s — breche nach Runde %d ab", _cancel_level, _cancel_user, rounds)
                 total_content += "\n\n*(Verarbeitung abgebrochen)*"
                 msgs.append({"role": "assistant", "content": total_content.strip()})
-                _final_content = "" if _sent_image else total_content.strip()
-                _final_thinking = total_thinking.strip()
-                if "<think>" in _final_content:
-                    _final_content, _et = _strip_think_tags(_final_content)
-                    if _et:
-                        _final_thinking = (_final_thinking + "\n" + _et).strip() if _final_thinking else _et
+                _final_content, _final_thinking = _clean_response(
+                    "" if _sent_image else total_content.strip(), total_thinking.strip())
                 yield {"type": "content", "delta": "\n\n*(Verarbeitung abgebrochen)*"}
-                _cancel_tps = _aal.extract_tps(last_response, time.monotonic() - _stream_start, _final_content, _final_thinking)
+                _cancel_tps = _aal.extract_tps(last_response, time.monotonic() - _t0_stream, _final_content, _final_thinking)
                 yield {"type": "done", "thinking": _final_thinking, "content": _final_content, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info, "tps": _cancel_tps, "ctx": [_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs), _ctx_max]}
                 return
         # Client-Tool-Routing: Tools die der Client lokal ausführen soll
@@ -2933,8 +3410,16 @@ def chat_round_stream(
             msgs.append({"role": "tool", "tool_name": _ct_name, "content": _ct_result})
 
         if _server_calls:
-            tool_results = _run_tools_maybe_concurrent(_server_calls, config, project_dir)
-            for name, args, result in tool_results:
+            # Tool-Execution mit Keepalive (Playwright etc. kann Minuten dauern)
+            tool_results = None
+            for _item in _call_with_keepalive(
+                lambda: _run_tools_maybe_concurrent(_server_calls, config, project_dir)
+            ):
+                if _item is None:
+                    yield {"type": "status", "message": "⏳ Tool wird ausgeführt…"}
+                else:
+                    tool_results = _item
+            for name, args, result in (tool_results or []):
                 _aal.log_tool_call(config, name, args, result)
                 msgs.append({"role": "tool", "tool_name": name, "content": result})
                 if name == "send_image":
@@ -2956,10 +3441,14 @@ def chat_round_stream(
             wrapup_resp = _dispatch_chat(
                 config, effective_model, msgs,
                 system=system_effective, think=think, options=options or None,
+                timeout=_stream_timeout,
             )
             wrapup_msg = wrapup_resp.get("message") or {}
             total_thinking += (wrapup_msg.get("thinking") or "")
-            wrapup_content = (wrapup_msg.get("content") or "").strip()
+            # XML-Tool-Call-Tags entfernen (Modell darf hier keine Tools mehr aufrufen)
+            wrapup_content, _ = _clean_response(
+                (wrapup_msg.get("content") or "").strip(),
+                (wrapup_msg.get("thinking") or "").strip())
             if wrapup_content:
                 total_content = wrapup_content
                 yield {"type": "content", "delta": wrapup_content}
@@ -2974,29 +3463,53 @@ def chat_round_stream(
         try:
             nudge_resp = _dispatch_chat(
                 config, effective_model, msgs,
-                system=system_effective, think=think, options=options or None,
+                system=system_effective, think=think, tools=tools,
+                options=options or None, timeout=_stream_timeout,
             )
             nudge_msg = nudge_resp.get("message") or {}
             total_thinking += (nudge_msg.get("thinking") or "")
-            total_content += (nudge_msg.get("content") or "")
-            msgs.append({"role": "assistant", "content": nudge_msg.get("content") or "", "thinking": nudge_msg.get("thinking") or ""})
-            if nudge_msg.get("content"):
-                yield {"type": "content", "delta": nudge_msg["content"]}
+            # Prüfen ob Nudge-Response Tool-Calls enthält
+            nudge_tool_calls = _extract_tool_calls(nudge_msg)
+            if nudge_tool_calls:
+                _log.info("Stream post-max nudge enthält %d Tool-Call(s) — führe aus", len(nudge_tool_calls))
+                _nudge_hist = nudge_msg.get("content") or nudge_msg.get("thinking") or ""
+                msgs.append({"role": "assistant", "content": _nudge_hist, "thinking": nudge_msg.get("thinking") or "", "tool_calls": nudge_resp.get("message", {}).get("tool_calls") or []})
+                nudge_results = _run_tools_maybe_concurrent(nudge_tool_calls, config, project_dir)
+                for n, a, r in nudge_results:
+                    _aal.log_tool_call(config, n, a, r)
+                    msgs.append({"role": "tool", "tool_name": n, "content": r})
+                try:
+                    final_resp = _dispatch_chat(
+                        config, effective_model, msgs,
+                        system=system_effective, think=think,
+                        options=options or None, timeout=_stream_timeout,
+                    )
+                    final_msg = final_resp.get("message") or {}
+                    _final_c = _strip_tool_call_tags((final_msg.get("content") or "").strip())
+                    total_content += _final_c
+                    msgs.append({"role": "assistant", "content": _final_c, "thinking": final_msg.get("thinking") or ""})
+                    if _final_c:
+                        yield {"type": "content", "delta": _final_c}
+                except Exception:
+                    pass
+            else:
+                _nudge_c, _ = _clean_response(nudge_msg.get("content") or "", nudge_msg.get("thinking") or "")
+                total_content += _nudge_c
+                msgs.append({"role": "assistant", "content": _nudge_c, "thinking": nudge_msg.get("thinking") or ""})
+                if _nudge_c:
+                    yield {"type": "content", "delta": _nudge_c}
         except Exception as nudge_err:
             _log.warning("Stream nudge (max rounds) failed: %s", nudge_err)
 
     # Response loggen wenn es noch nicht innerhalb der Schleife geloggt wurde
+    # TPS: letzte Runde (_t0_stream) — keine Tool-Wartezeit im Nenner
     if total_content.strip():
         _aal.log_response(config, total_content.strip(), tps=_aal.extract_tps(last_response, time.monotonic() - _t0_stream, total_content.strip(), total_thinking))
 
     # send_image war erfolgreich → Content unterdrücken (Bild IST die Antwort)
-    _final_content = "" if _sent_image else total_content.strip()
-    _final_thinking = total_thinking.strip()
-    if "<think>" in _final_content:
-        _final_content, _et = _strip_think_tags(_final_content)
-        if _et:
-            _final_thinking = (_final_thinking + "\n" + _et).strip() if _final_thinking else _et
-    _final_tps = _aal.extract_tps(last_response, time.monotonic() - _stream_start, _final_content, _final_thinking)
+    _final_content, _final_thinking = _clean_response(
+        "" if _sent_image else total_content.strip(), total_thinking.strip())
+    _final_tps = _aal.extract_tps(last_response, time.monotonic() - _t0_stream, _final_content, _final_thinking)
     yield {"type": "done", "thinking": _final_thinking, "content": _final_content, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info, "tps": _final_tps, "ctx": [_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs), _ctx_max]}
 
 
@@ -3091,6 +3604,7 @@ def handle_user_input(
                 resolved,
                 "Say hello briefly in one short sentence.",
                 project_dir,
+                images=None,
             )
             reply = (content or "Modell geladen.").strip()
             reply_with_model = f"{reply}\n\n*(Modell: {resolved})*"
@@ -3098,8 +3612,8 @@ def handle_user_input(
         except Exception as e:
             err = str(e).strip() or type(e).__name__
             if old_model and old_model != resolved:
-                return f"Modell gewechselt: `{old_model}` → `{resolved}`. Verlauf gelöscht.\n\n*(Warmup fehlgeschlagen: {err})*", session, None, None, None, None
-            return f"Modell: `{resolved}`. Verlauf gelöscht.\n\n*(Warmup fehlgeschlagen: {err})*", session, None, None, None, None
+                return f"Modell gewechselt: `{old_model}` → `{resolved}`. Verlauf gelöscht.\n*(Modell ist bereit, Warmup übersprungen)*", session, None, None, None, None
+            return f"Modell: `{resolved}`. Verlauf gelöscht.\n*(Modell ist bereit, Warmup übersprungen)*", session, None, None, None, None
 
     is_models, provider = parse_models_command(user_input)
     if is_models:
@@ -3307,7 +3821,7 @@ def _onboarding_system_prompt(detected_system: dict[str, str]) -> str:
 **Fixed questions (ask in this order, do not invent):**
 1. **IDENTITY:** What should the assistant be called? **Which language should the assistant use for its replies?** (e.g. Deutsch, English) (optional: emoji e.g. 🤖; optional: vibe in one sentence)
 2. **SOUL:** Use default limits? (Run harmless commands without asking; answer briefly and factually; never expose tokens/passwords/private data) – or add/change something?
-3. **USER:** What should I call you? (Name, nickname), pronouns (Du/Sie or you/they). Timezone: show the detected timezone and ask if it's correct (if not, note the correct one and tell the user how to change it on the system). **Country (optional):** Which country are you in? (e.g. Austria, Germany, Switzerland, USA). This helps the assistant search with local context (prices, shops, domains). If the user skips this, simply omit the country field from USER.md. Optional preferences? Also ask: Would you like to tell me something about yourself? (hobbies, interests, job – anything that helps the assistant understand you better). **Important: USER.md has a 500 character limit.** Keep it concise.
+3. **USER:** What should I call you? (Name, nickname), pronouns (Du/Sie or you/they). Timezone: show the detected timezone and ask if it's correct (if not, note the correct one and tell the user how to change it on the system). **Country (optional):** Which country are you in? (e.g. Austria, Germany, Switzerland, USA). This helps the assistant search with local context (prices, shops, domains). **Units preference (optional):** Should I use Celsius/Euro (EU default) or Fahrenheit/Dollar (US default)? If the user skips this, use EU default (Celsius, Euro) for EU countries, US default for USA. Optional preferences? Also ask: Would you like to tell me something about yourself? (hobbies, interests, job – anything that helps the assistant understand you better). **Important: USER.md has a 500 character limit.** Keep it concise.
 4. **AVATAR (optional):** Do you have a profile picture/avatar for the bot? (PNG file path or URL, e.g. `~/avatar.png` or `https://example.org/bot.png`). Best format: PNG, square (256x256 or 512x512). If provided as URL, validate with `check_url` first, then download to `agent_dir/avatar.png`. If a file path, copy to `agent_dir/avatar.png`. Save path in config via `save_config({{avatar: "<path>"}})`. If skipped, the default logo is used.
 
 Optional: Any special paths or hints for the environment (TOOLS)? Otherwise the detected system above is enough.
@@ -3333,7 +3847,7 @@ You only provide content; the user saves via button. Exact headings: "## SOUL.md
 [Environment: detected system above; optional paths/hints from user. **No meta text like 'Onboarding done' – only real environment info.**]
 
 ## USER.md
-[Name, nickname, pronouns, timezone, country; optional preferences (e.g. short/long answers)]
+[Name, nickname, pronouns, timezone, country, units (Celsius/Euro or Fahrenheit/Dollar); optional preferences (e.g. short/long answers)]
 
 **Important:** The four blocks must contain ONLY the actual file content. Do NOT add commentary, status messages, or text like "Onboarding complete" inside any block.
 """

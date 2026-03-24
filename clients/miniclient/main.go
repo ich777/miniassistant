@@ -833,6 +833,7 @@ func runChat(cfg Config, preload *Session) {
 	fmt.Printf("\n%sBefehle:%s\n", dim, reset)
 	fmt.Printf("%s  /model          Aktuelles Modell anzeigen%s\n", dim, reset)
 	fmt.Printf("%s  /model NAME     Modell wechseln%s\n", dim, reset)
+	fmt.Printf("%s  /models         Alle Modelle auflisten%s\n", dim, reset)
 	fmt.Printf("%s  /new            Neue Session starten%s\n", dim, reset)
 	fmt.Printf("%s  exit            Beenden%s\n\n", dim, reset)
 
@@ -869,6 +870,77 @@ func runChat(cfg Config, preload *Session) {
 			break
 		}
 
+		// Slash-Commands verarbeiten
+		modellWechsel := ""
+		if strings.HasPrefix(input, "/model ") {
+			modellWechsel = strings.TrimSpace(strings.TrimPrefix(input, "/model "))
+		}
+
+		// Modellwechsel: Config setzen und kurze Begrüßungsnachricht senden
+		if modellWechsel != "" {
+			cfg.Model = modellWechsel
+			saveConfig(cfg)
+			// Keine Bestätigung anzeigen - User weiß was er getan hat
+		}
+
+		if input == "/model" {
+			if cfg.Model != "" {
+				fmt.Printf("%sAktuelles Modell: %s%s\n", cyan, cfg.Model, reset)
+			} else {
+				fmt.Printf("%sAktuelles Modell: (Serverstandard)%s\n", dim, reset)
+			}
+			continue
+		}
+
+		if input == "/models" {
+			fmt.Printf("%sVerfügbare Modelle:%s\n", bold, reset)
+			req, err := newRequest("GET", cfg.Server+"/v1/models", cfg.Token, nil)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%sFehler: %v%s\n", yellow, err, reset)
+				continue
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%sFehler: %v%s\n", yellow, err, reset)
+				continue
+			}
+			if resp.StatusCode != 200 {
+				resp.Body.Close()
+				fmt.Fprintf(os.Stderr, "%sFehler: HTTP %d%s\n", yellow, resp.StatusCode, reset)
+				continue
+			}
+			var result struct {
+				Data []struct {
+					ID string `json:"id"`
+				} `json:"data"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+				resp.Body.Close()
+				fmt.Fprintf(os.Stderr, "%sFehler beim Parsen: %v%s\n", yellow, err, reset)
+				continue
+			}
+			resp.Body.Close()
+			if len(result.Data) == 0 {
+				fmt.Printf("%sKeine Modelle gefunden.%s\n", dim, reset)
+			} else {
+				for _, m := range result.Data {
+					mark := ""
+					if cfg.Model == m.ID {
+						mark = fmt.Sprintf(" %s← aktuell%s", cyan, reset)
+					}
+					fmt.Printf("  • %s%s\n", m.ID, mark)
+				}
+			}
+			continue
+		}
+
+		if input == "/new" {
+			sessionID = ""
+			sessionMessages = nil
+			fmt.Printf("%s✓ Neue Session gestartet.%s\n", green, reset)
+			continue
+		}
+
 		// Titel parallel generieren — nur einmal, für die allererste Nachricht einer neuen Session
 		if sessionID == "" && len(sessionMessages) == 0 && titleCh == nil {
 			titleCh = make(chan string, 1)
@@ -880,8 +952,13 @@ func runChat(cfg Config, preload *Session) {
 		}
 
 		// Request aufbauen
+		msgContent := input
+		if modellWechsel != "" {
+			msgContent = fmt.Sprintf("Stelle dich bitte kurz vor. Neues Modell: %s", modellWechsel)
+		}
+
 		payload := map[string]any{
-			"message": input,
+			"message": msgContent,
 		}
 		if sessionID != "" {
 			payload["session_id"] = sessionID

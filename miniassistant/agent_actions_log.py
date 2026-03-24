@@ -64,7 +64,8 @@ def log_thinking(config: dict[str, Any], thinking: str) -> None:
 def extract_tps(response: dict[str, Any], elapsed_s: float, content: str = "", thinking: str = "") -> tuple[float, bool] | None:
     """Berechnet Tokens/Sekunde aus der API-Antwort.
     Gibt (tps, exact) zurück:
-      exact=True  → Ollama lokal: eval_count / (eval_duration / 1e9)
+      exact=True  → Ollama: eval_count / (eval_duration / 1e9)
+                  → llama.cpp: timings.predicted_per_second oder predicted_n / predicted_ms
       exact=False → Näherung: token_count / elapsed_s  oder  chars/4 / elapsed_s
 
     thinking: optionaler Thinking-Text — wird in die Schätzung einbezogen, da
@@ -77,6 +78,12 @@ def extract_tps(response: dict[str, Any], elapsed_s: float, content: str = "", t
     eval_duration = response.get("eval_duration")
     if eval_count and eval_duration and eval_duration > 0:
         return (eval_count / (eval_duration / 1e9), True)
+    # llama.cpp-Server: timings.predicted_per_second (exakt, kein elapsed_s nötig)
+    timings = response.get("timings") or {}
+    if timings.get("predicted_per_second") and timings["predicted_per_second"] > 0:
+        return (timings["predicted_per_second"], True)
+    if timings.get("predicted_n") and timings.get("predicted_ms") and timings["predicted_ms"] > 0:
+        return (timings["predicted_n"] / (timings["predicted_ms"] / 1000.0), True)
     # Andere Provider: token count aus usage + Wall-Clock-Zeit — Näherung
     if elapsed_s and elapsed_s > 0:
         usage = response.get("usage") or {}

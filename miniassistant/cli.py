@@ -571,9 +571,34 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
 
 @main.command("token", help="Token anzeigen oder neu generieren")
 @click.option("--regenerate", is_flag=True, help="Neuen Token generieren und speichern")
+@click.option("--raw-proxy", is_flag=True, help="Raw-Proxy Token anzeigen/generieren")
 @click.pass_context
-def token_cmd(ctx: click.Context, regenerate: bool) -> None:
+def token_cmd(ctx: click.Context, regenerate: bool, raw_proxy: bool) -> None:
     config = load_config(ctx.obj.get("project_dir"))
+    
+    if raw_proxy:
+        # Raw-Proxy Token
+        raw_cfg = config.get("raw_proxy") or {}
+        if not raw_cfg.get("enabled"):
+            console.print("[yellow]Raw-Proxy ist nicht aktiviert[/yellow]")
+            console.print("  Füge 'raw_proxy: {enabled: true}' zur Config hinzu")
+            return
+        if regenerate:
+            import secrets
+            token = secrets.token_urlsafe(32)
+            config.setdefault("raw_proxy", {})["token"] = token
+            save_config(config, ctx.obj.get("project_dir"))
+            console.print("Neuer Raw-Proxy Token generiert und gespeichert.")
+        else:
+            token = raw_cfg.get("token")
+            if not token:
+                import secrets
+                token = secrets.token_urlsafe(32)
+                config.setdefault("raw_proxy", {})["token"] = token
+                save_config(config, ctx.obj.get("project_dir"))
+        console.print("Raw-Proxy Token:", token)
+        return
+    
     if regenerate:
         import secrets
         config.setdefault("server", {})["token"] = secrets.token_urlsafe(32)

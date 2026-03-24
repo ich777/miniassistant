@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re as _re
 import time
 import uuid
 from typing import Any
@@ -23,13 +24,20 @@ from miniassistant.config import load_config
 from miniassistant.agent_loader import build_system_prompt
 from miniassistant.ollama_client import resolve_model, get_provider_config, get_provider_type
 from miniassistant.chat_loop import (
-    _dispatch_chat,
-    _dispatch_chat_stream,
-    _provider_supports_tools,
-    create_session,
+    chat_round,
+    chat_round_stream,
 )
+from miniassistant.memory import append_exchange
 
 _log = logging.getLogger("miniassistant.openai_compat")
+
+
+def _strip_tool_call_xml(content: str) -> str:
+    """Entfernt Tool-Call-Tags aus Content für saubere Anzeige."""
+    content = _re.sub(r'<tool_call>.*?</tool_call>', '', content, flags=_re.DOTALL)
+    content = _re.sub(r'<tools>.*?</tools>', '', content, flags=_re.DOTALL)
+    content = _re.sub(r'<function=\w+>.*?</function>(?:\s*</tool_call>)?', '', content, flags=_re.DOTALL)
+    return content.strip()
 
 router = APIRouter(prefix="/v1", tags=["OpenAI-compatible"])
 
@@ -310,7 +318,7 @@ async def chat_completions(request: Request):
     # --- Streaming ---
     if stream:
         return StreamingResponse(
-            _stream_generator(config, resolved, internal_messages, system_prompt, completion_id, model_display),
+            _stream_generator(config, resolved, internal_messages, system_prompt, completion_id, model_display, project_dir),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -319,23 +327,29 @@ async def chat_completions(request: Request):
         )
 
     # --- Non-Streaming ---
+    # Letzten User-Prompt aus Messages extrahieren; Rest ist History
+    user_content = ""
+    history_messages = list(internal_messages)
+    if history_messages and history_messages[-1].get("role") == "user":
+        user_content = history_messages.pop().get("content", "")
+
     try:
-        resp = _dispatch_chat(
-            config, resolved, internal_messages,
-            system=system_prompt,
-            think=None,  # Provider-Config entscheidet
-            tools=None,  # Keine Tool-Calls ueber OpenAI-API (Sicherheit)
-            timeout=300.0,
+        # chat_round loggt intern (PROMPT, TOOL, RESPONSE) — kein extra Logging hier
+        content, thinking, new_messages, _debug, _switch = chat_round(
+            config, history_messages, system_prompt, resolved,
+            user_content, project_dir,
         )
     except Exception as e:
         _log.error("Chat completion error: %s", e)
         raise HTTPException(status_code=502, detail=f"Backend error: {e}")
 
-    msg = resp.get("message") or {}
-    content = msg.get("content", "")
-    thinking = msg.get("thinking") or None
+    # Tool-Call-XML aus Content entfernen (Safety-Net)
+    content = _strip_tool_call_xml(content)
 
-    return JSONResponse(_make_response(completion_id, model_display, content, thinking))
+    # Memory speichern
+    append_exchange(user_content, content)
+
+    return JSONResponse(_make_response(completion_id, model_display, content, thinking or None))
 
 
 def _stream_generator(
@@ -345,8 +359,10 @@ def _stream_generator(
     system_prompt: str,
     completion_id: str,
     model_display: str,
+    project_dir: str | None = None,
 ):
-    """SSE-Stream-Generator im OpenAI-Format (data: {...}\\n\\n)."""
+    """SSE-Stream-Generator im OpenAI-Format (data: {...}\\n\\n).
+    Nutzt chat_round_stream für vollständige Tool-Execution."""
     # Erster Chunk: role
     first_chunk = {
         "id": completion_id,
@@ -357,20 +373,34 @@ def _stream_generator(
     }
     yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n"
 
+    # Letzten User-Prompt aus Messages extrahieren; Rest ist History
+    user_content = ""
+    history_messages = list(messages)
+    if history_messages and history_messages[-1].get("role") == "user":
+        user_content = history_messages.pop().get("content", "")
+
+    total_content = ""
+    total_thinking = ""
+
     try:
-        for chunk in _dispatch_chat_stream(
-            config, model, messages,
-            system=system_prompt,
-            think=None,
-            tools=None,
-            timeout=300.0,
+        for ev in chat_round_stream(
+            config, history_messages, system_prompt, model,
+            user_content, project_dir,
         ):
-            msg = chunk.get("message") or {}
-            if msg.get("thinking"):
-                yield _make_stream_chunk(completion_id, model_display, thinking=msg["thinking"])
-            if msg.get("content"):
-                yield _make_stream_chunk(completion_id, model_display, content=msg["content"])
-            if chunk.get("done"):
+            ev_type = ev.get("type")
+            if ev_type == "thinking" and ev.get("delta"):
+                total_thinking += ev["delta"]
+                yield _make_stream_chunk(completion_id, model_display, thinking=ev["delta"])
+            elif ev_type == "content" and ev.get("delta"):
+                total_content += ev["delta"]
+                yield _make_stream_chunk(completion_id, model_display, content=ev["delta"])
+            elif ev_type == "status":
+                # Keepalive: leerer Delta-Chunk hält den Socket offen
+                yield _make_stream_chunk(completion_id, model_display)
+            elif ev_type == "done":
+                # done-Event: finale Inhalte (bereinigt) übernehmen
+                total_content = ev.get("content") or total_content
+                total_thinking = ev.get("thinking") or total_thinking
                 break
     except Exception as e:
         _log.error("Stream error: %s", e)
@@ -378,6 +408,11 @@ def _stream_generator(
             "error": {"message": str(e), "type": "server_error"},
         }
         yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+
+    # chat_round_stream loggt intern (PROMPT, TOOL, RESPONSE) — kein extra Logging hier
+
+    # Memory speichern
+    append_exchange(user_content, total_content)
 
     # Finish-Chunk
     yield _make_stream_chunk(completion_id, model_display, finish_reason="stop")

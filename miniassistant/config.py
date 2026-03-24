@@ -412,6 +412,7 @@ def _parse_provider(raw: dict[str, Any]) -> dict[str, Any]:
         "api_key": raw.get("api_key") or None,
         "num_ctx": raw.get("num_ctx"),
         "think": raw.get("think"),
+        "no_api_tools": bool(raw.get("no_api_tools", False)),
         "options": options,
         "model_options": model_options,
         "models": models,
@@ -514,6 +515,11 @@ def _merge_with_defaults(data: dict[str, Any]) -> dict[str, Any]:
         "email": _normalize_email(data),
         "voice": data.get("voice") or None,
         "read_url": data.get("read_url") or {},
+        "raw_proxy": {
+            "enabled": bool((data.get("raw_proxy") or {}).get("enabled", False)),
+            "token": (data.get("raw_proxy") or {}).get("token"),
+            "rate_limit": int((data.get("raw_proxy") or {}).get("rate_limit", 100) or 100),
+        },
     }
 
 
@@ -543,6 +549,8 @@ def save_config(config: dict[str, Any], project_dir: str | None = None) -> Path:
             out_prov["num_ctx"] = prov_cfg["num_ctx"]
         if prov_cfg.get("think") is not None:
             out_prov["think"] = prov_cfg["think"]
+        if prov_cfg.get("no_api_tools"):
+            out_prov["no_api_tools"] = prov_cfg["no_api_tools"]
         if prov_cfg.get("options"):
             out_prov["options"] = prov_cfg["options"]
         if prov_cfg.get("model_options"):
@@ -589,6 +597,7 @@ def save_config(config: dict[str, Any], project_dir: str | None = None) -> Path:
         },
         "subagents": list(config.get("subagents") or []),
         "fallbacks": list(config.get("fallbacks") or []),
+        "raw_proxy": config.get("raw_proxy") or {},
     }
     # vision / image_generation nur schreiben wenn gesetzt (als Liste)
     if config.get("vision"):

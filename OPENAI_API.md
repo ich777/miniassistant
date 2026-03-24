@@ -240,11 +240,61 @@ for chunk in stream:
         print(delta.content, end="", flush=True)
 ```
 
+## Tool-Calling
+
+Die internen Tools (exec, web_search, read_url, etc.) werden automatisch ueber die
+OpenAI-kompatible Schnittstelle ausgefuehrt. Der Agent arbeitet wie ueber die Web-UI:
+er kann mehrere Tool-Runden durchlaufen, bevor er die finale Antwort liefert.
+
+Waehrend der Tool-Ausfuehrung pausiert der Stream kurz — die App zeigt ggf. einen
+Lade-Indikator. Der Default-Timeout betraegt 600 Sekunden (konfigurierbar via `api_timeout`).
+
+## Mobile Apps
+
+Jede App die einen Custom OpenAI Endpoint unterstuetzt funktioniert mit MiniAssistant:
+
+| App | Plattform | Open Source |
+|-----|-----------|-------------|
+| **Chatbox** | Android, iOS, Windows, Mac, Linux | [GitHub](https://github.com/chatboxai/chatbox) |
+| **GPT Mobile** | Android | [GitHub](https://github.com/Taewan-P/gpt_mobile) |
+| **Cumbersome** | iOS | Nein |
+| **OpenCat** | iOS, Mac | Nein |
+| **Open WebUI** | Alle (Browser) | [GitHub](https://github.com/open-webui/open-webui) |
+
+Einrichtung in der App:
+```
+API Base URL:  https://dein-server.example.com/v1
+API Key:       DEIN_TOKEN  (= server.token aus der Config)
+Model:         fast  (oder ein anderer Alias/Modellname)
+```
+
+## Reverse-Proxy (Nginx)
+
+Fuer externen Zugriff (z.B. mobile Apps) genuegt es, `/v1/` freizugeben:
+
+```nginx
+location /v1/ {
+    proxy_pass http://127.0.0.1:8765/v1/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_buffering off;            # wichtig fuer SSE-Streaming
+    proxy_read_timeout 600s;        # Tool-Calls koennen dauern
+}
+```
+
+Benoetigte Endpunkte:
+
+| Methode | Pfad | Pflicht | Zweck |
+|---------|------|---------|-------|
+| GET | `/v1/models` | Optional | App laedt Modell-Liste |
+| POST | `/v1/chat/completions` | Ja | Chat (Streaming + Non-Streaming) |
+
+Auth laeuft ueber `Authorization: Bearer <TOKEN>` — das entspricht dem "API Key" Feld in der App.
+Brute-Force-Schutz: nach 20 fehlgeschlagenen Auth-Versuchen wird die IP fuer 1 Stunde gesperrt.
+
 ## Einschraenkungen
 
-- **Kein Tool-Calling ueber die OpenAI-API**: Die internen Tools (exec, web_search, etc.)
-  werden nicht ueber die OpenAI-kompatible Schnittstelle exponiert. Das ist beabsichtigt --
-  Tools laufen nur ueber die native MiniAssistant-API (`/api/chat`).
 - **Kein Multi-Turn State**: Jede Anfrage ist stateless. Fuer Multi-Turn-Konversationen
   muessen alle bisherigen Messages mitgeschickt werden (wie bei der echten OpenAI-API).
 - **Keine Embeddings/Images/Audio**: Nur `/v1/chat/completions` und `/v1/models` sind implementiert.

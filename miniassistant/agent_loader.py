@@ -139,8 +139,19 @@ def _system_and_runtime_section(is_root: bool) -> str:
 
 
 def _safety_section() -> str:
+    """Liest basic_rules/safety.md und injiziert den Inhalt."""
     rule = _get_rule("safety.md")
     return (rule + "\n\n") if rule else ""
+
+
+def _units_section_from_prefs(config: dict[str, Any]) -> str:
+    """Units-Regel: LLM leitet Einheiten aus dem Land des Users (USER.md) ab."""
+    return (
+        "## Units and Currency\n"
+        "Use the measurement system, temperature unit, and currency that are standard "
+        "in the user's country (see USER section above). Show only one unit system — "
+        "never show both or convert between them.\n"
+    )
 
 
 def _prefs_section(config: dict[str, Any]) -> str:
@@ -255,7 +266,7 @@ def _planning_section(config: dict[str, Any]) -> str:
         f"For complex tasks (>3 steps or multiple components): create `{ws}/TOPIC-plan.md` with a Markdown checklist (`- [ ]`/`- [x]`).",
         f"Read and update the plan via `exec` (cat/write) between steps. Mark steps done as you go.",
         "With subagents: include relevant plan context in invoke_model message.",
-        "Delete the plan file when all tasks are done.",
+        "Keep the plan file as reference — only delete when the user explicitly asks.",
         f"When the user says **'schau dir den Plan an'**, **'mach weiter'**, or **references a plan by name**: "
         f"read the plan file from `{ws}/`, summarize the status, and continue with the next open step.",
     ]
@@ -344,6 +355,10 @@ def _language_section(config: dict[str, Any], identity_md_content: str = "") -> 
     rule = _get_rule("language.md")
     if rule:
         # Sprache aus IDENTITY.md in die Regeldatei injizieren (ersetzt 'Deutsch' Platzhalter)
+        # Wenn IDENTITY.md keine Sprache hat → Deutsch bleibt Default
+        if not _language_from_identity_md(identity_md_content):
+            # Keine Sprache in IDENTITY.md → Deutsch als Default
+            return rule.replace("**Deutsch**", "**Deutsch**") + "\n\n"
         return rule.replace("**Deutsch**", f"**{lang}**") + "\n\n"
     return (
         f"## Language\nAlways respond in **{lang}** unless the user explicitly asks for another language.\n\n"
@@ -359,6 +374,8 @@ def _knowledge_verification_section() -> str:
     tz_name = now.strftime("%Z") or now.strftime("%z")
     rule = _get_rule("knowledge_verification.md")
     if rule:
+        # Inject current date into the rule (replaces {{current_date}} placeholder)
+        rule = rule.replace("{{current_date}}", today)
         return f"Today is **{today}**, current local time is **{current_time} {tz_name}**. Your training data (= everything you \"know\") has a cutoff date — anything after that is outdated.\n{rule}\n\n"
     return ""
 
@@ -657,6 +674,7 @@ def _voice_section(config: dict[str, Any]) -> str:
             "no markdown, no tables, no code blocks. Be concise (1-3 sentences). "
             "Tables and code are sent as separate text automatically."
         )
+    lines.append("**No emojis.** Never use emojis, emoticons, or kaomoji — TTS cannot pronounce them and they disrupt the listening experience.")
     lines.append("")
     return "\n".join(lines)
 
@@ -685,6 +703,7 @@ def build_system_prompt(
     parts = [
         "# Role and context",
         "You are the assistant of **MiniAssistant**. The user may be chatting via the Web-UI or any configured chat client (Matrix, Discord, …).",
+        "**ABSOLUTE RULE: NEVER respond without using tools first. NEVER tell the user what THEY can do — YOU do it. If you need information, search for it. If something fails, try alternatives. The user hired you to WORK, not to give advice.**\n\n"
         "**Core rules:** "
         "(1) **Just do it.** Use your tools immediately — don't explain what you *would* do, just do it. The user wants results, not your thought process. (Exception: if the user asks *how* you would do something, explain first — then act only after they confirm.) "
         "(2) **Inform first, then act.** Before doing anything that touches an external system, file, page, or API: gather current state first with your tools — never assume, never use training-data memory. "
@@ -724,6 +743,7 @@ def build_system_prompt(
         _prefs_section(config),
         _language_section(config, files.get("IDENTITY.md") or ""),
         _knowledge_verification_section(),
+        _units_section_from_prefs(config),
         _system_and_runtime_section(is_root),
         _safety_section(),
         _exec_behavior_section(),

@@ -45,8 +45,9 @@ curl -s http://localhost:8765/api/ollama/models \
 
 ## OpenAI-kompatible API
 
-MiniAssistant bietet unter `/v1/` eine OpenAI-kompatible Schnittstelle.
-Damit funktionieren Tools wie Open WebUI, Continue.dev, Cursor und das openai Python SDK direkt.
+MiniAssistant bietet unter `/v1/` eine OpenAI-kompatible Schnittstelle mit vollem Tool-Support
+(exec, web_search, read_url, etc.). Damit funktionieren Tools wie Open WebUI, Continue.dev,
+Cursor, Chatbox (Android/iOS), Cumbersome (iOS) und das openai Python SDK direkt.
 
 ```bash
 # Modelle auflisten (inkl. Aliases/Kurznamen)

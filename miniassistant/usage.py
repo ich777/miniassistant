@@ -41,12 +41,17 @@ def record(config: dict, model: str, call_type: str, duration_s: float) -> None:
         _log.debug("usage record failed", exc_info=True)
 
 
-def load(after: datetime | None = None) -> list[dict]:
-    """Liest alle Usage-Einträge, optional gefiltert ab *after*."""
+def load(after: datetime | None = None, before: datetime | None = None) -> list[dict]:
+    """Liest Usage-Einträge, optional gefiltert auf Zeitraum *after* .. *before*.
+
+    Da die CSV chronologisch geschrieben wird, bricht die Funktion
+    frühzeitig ab sobald Einträge *nach* ``before`` erscheinen.
+    """
     path = _usage_path()
     if not os.path.exists(path):
         return []
     rows: list[dict] = []
+    _past_end = 0
     try:
         with open(path, newline="") as f:
             for row in csv.DictReader(f):
@@ -56,6 +61,12 @@ def load(after: datetime | None = None) -> list[dict]:
                     continue
                 if after and ts < after:
                     continue
+                if before and ts > before:
+                    _past_end += 1
+                    if _past_end >= 5:
+                        break
+                    continue
+                _past_end = 0
                 rows.append({
                     "ts": ts,
                     "model": row.get("model", ""),
@@ -147,7 +158,7 @@ def aggregate(entries: list[dict], group_by: str = "day") -> dict:
 def get_usage_for_period(period: str = "day") -> dict:
     """Lädt und aggregiert Usage für einen Zeitraum.
 
-    period: "hour" | "day" | "week" | "month" | "year" | "all"
+    period: "hour" | "day" | "3days" | "week" | "month" | "year" | "all"
     """
     now = datetime.now()
     if period == "hour":
@@ -155,6 +166,9 @@ def get_usage_for_period(period: str = "day") -> dict:
         group = "hour"
     elif period == "day":
         after = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        group = "hour"
+    elif period == "3days":
+        after = now - timedelta(days=3)
         group = "hour"
     elif period == "week":
         after = now - timedelta(days=7)
@@ -170,4 +184,17 @@ def get_usage_for_period(period: str = "day") -> dict:
         group = "month"
 
     entries = load(after=after)
+    return aggregate(entries, group_by=group)
+
+
+def get_usage_for_range(from_dt: datetime, to_dt: datetime) -> dict:
+    """Lädt und aggregiert Usage für einen benutzerdefinierten Zeitraum."""
+    delta = to_dt - from_dt
+    if delta.days <= 1:
+        group = "hour"
+    elif delta.days <= 14:
+        group = "day"
+    else:
+        group = "month"
+    entries = load(after=from_dt, before=to_dt)
     return aggregate(entries, group_by=group)

@@ -537,6 +537,12 @@ server:
   host: 127.0.0.1
   port: 8765
 
+# Raw OpenAI Proxy (optional, deaktiviert wenn nicht gesetzt)
+raw_proxy:
+  enabled: true
+  token: "dein-geheimes-token"   # Optional: wird automatisch generiert wenn fehlt
+  rate_limit: 100                # req/min (default 100; 0 = deaktiviert)
+
 agent_dir: ~/.config/miniassistant/agent
 ```
 
@@ -571,7 +577,13 @@ server:
   port: 8765
   token: "dein-geheimes-token"
   show_estimated_tokens: false
-  # rate_limit: 100       # req/min pro IP (default 100; 0 = deaktiviert)
+  rate_limit: 100       # req/min pro IP (default 100; 0 = deaktiviert)
+
+# Raw OpenAI Proxy (optional)
+raw_proxy:
+  enabled: true
+  token: "raw-proxy-token"   # Optional: separates Token fuer /raw/v1/
+  rate_limit: 200            # req/min (default 100; 0 = deaktiviert)
 
 agent_dir: /opt/miniassistant/agent
 workspace: /home/user/projekte
@@ -627,8 +639,56 @@ email:
 - **agent_dir** fehlt: Default-Pfad unter `~/.config/miniassistant/agent`.
 - **chat_clients** fehlt: Kein Matrix/Discord, nur CLI und Web-UI.
 - **email** fehlt: Keine E-Mail-Funktion. Konto hinzufügen mit `save_config` — der Assistent führt dich durch die Einrichtung.
+- **raw_proxy** fehlt: Raw Proxy ist deaktiviert (`/raw/v1/` nicht erreichbar).
 
 Alles ist optional; eine leere oder minimale Config ist ausreichend.
+
+---
+
+## 10b. Raw OpenAI Proxy
+
+Der `raw_proxy` Endpunkt (`/raw/v1/`) leitet Requests **direkt** an die konfigurierten Provider weiter (OpenAI, DeepSeek, llama-swap, etc.) **ohne** Agent-Context, Memory oder System-Prompt.
+
+### Konfiguration
+
+```yaml
+raw_proxy:
+  enabled: true        # Proxy aktivieren (default: false)
+  token: "xyz"         # Optional: Token fuer Auth (wie server.token)
+  rate_limit: 100      # Requests pro Minute (default: 100; 0 = deaktiviert)
+```
+
+### Endpunkte
+
+| Methode | Pfad | Beschreibung |
+|---------|------|-------------|
+| GET | `/raw/v1/models` | Alle Modelle von OpenAI-kompatiblen Providern auflisten |
+| POST | `/raw/v1/chat/completions` | Chat-Completion (direkter Proxy) |
+| POST | `/raw/v1/completions` | Text-Completion (direkter Proxy) |
+
+### Unterschiede zu `/v1/`
+
+| Feature | `/v1/` (OpenAI-kompatibel) | `/raw/v1/` (Raw Proxy) |
+|---------|---------------------------|-----------------------|
+| Agent-Context | Ja (SOUL, IDENTITY, Memory) | Nein |
+| System-Prompt | Ja | Nein |
+| Provider-Auswahl | Automatisch (Default-Provider) | Explizit (`provider/model`) |
+| Auth | `server.token` (auto-generated) | `raw_proxy.token` (auto-generated wenn enabled) |
+| Rate Limit | `server.rate_limit` | `raw_proxy.rate_limit` |
+
+### Beispiel
+
+```bash
+# Modelle auflisten
+curl http://localhost:8765/raw/v1/models \
+  -H "Authorization: Bearer raw_proxy.token"
+
+# Chat-Completion (Modell muss provider/model Format haben)
+curl http://localhost:8765/raw/v1/chat/completions \
+  -H "Authorization: Bearer raw_proxy.token" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "llama-swap/qwen3.5-122b-a10b", "messages": [{"role": "user", "content": "Hallo"}]}'
+```
 
 ---
 
@@ -1047,6 +1107,34 @@ providers:
     models:
       default: meta-llama/Llama-3.3-70B-Instruct-Turbo
 ```
+
+### vLLM / lokale OpenAI-kompatible APIs
+
+Für lokale Setups mit **vLLM**, **llama.cpp**, **llama-swap** u.ä. empfiehlt sich `type: openai-compat` statt `type: openai` — damit wird die Modell-Verfügbarkeitsprüfung übersprungen.
+
+#### `no_api_tools` — Tool-Calling ohne API-Tools-Mechanismus
+
+Manche Modelle (z. B. Qwen3, Nemotron) geben Tool-Calls im XML-Format aus (`<function=name>...</function>`), nicht im JSON-Format das vLLMs `--tool-call-parser hermes` erwartet. Der hermes-Parser schlägt beim Streaming fehl (`JSONDecodeError`) und verwirft die Tool-Calls.
+
+Mit `no_api_tools: true` schickt MiniAssistant **kein `tools`-Array** an die API. Das Modell erfährt die verfügbaren Tools über den System-Prompt und gibt sie als XML im Content aus — MiniAssistant parst das clientseitig. Tool-Calling funktioniert damit zuverlässig in allen Pfaden (Streaming, Matrix, Go-Client etc.).
+
+```yaml
+providers:
+  vllm:
+    type: openai-compat
+    base_url: http://10.0.0.175:8080
+    no_api_tools: true        # kein tools-Array an API — XML-Parsing clientseitig
+    think: true
+    num_ctx: 256000
+    models:
+      default: qwen3-32b
+      list:
+        - qwen3-32b
+        - nemotron-super
+        - qwen3.5-fast
+```
+
+> **Hinweis:** `--enable-auto-tool-choice --tool-call-parser hermes` kann aus der vLLM-/llama-swap-Config entfernt werden wenn `no_api_tools: true` gesetzt ist — die Flags werden nicht mehr ausgelöst.
 
 ### Unterschied zu anderen Providern
 

@@ -80,7 +80,16 @@ providers:
 
 ## OpenAI-kompatible API
 
-MiniAssistant stellt unter `/v1/` eine vollstaendig OpenAI-kompatible Schnittstelle bereit. Damit funktionieren externe Tools wie **Open WebUI**, **Continue.dev**, **Cursor** und das **openai Python SDK** direkt -- mit dem konfigurierten Agent-Kontext (SOUL, IDENTITY, TOOLS, USER, Memory).
+MiniAssistant stellt zwei OpenAI-kompatible Schnittstellen bereit:
+
+### `/v1/` - MiniAssistant API (mit Agent-Context)
+
+Vollstaendig OpenAI-kompatibel **mit** dem konfigurierten Agent-Kontext (SOUL, IDENTITY, TOOLS, USER, Memory). Ideal fuer **Open WebUI**, **Continue.dev**, **Cursor** und Tools die den vollen MiniAssistant-Funktionsumfang nutzen sollen.
+
+**Endpunkte:**
+- `GET /v1/models` - Alle Modelle auflisten (inkl. Aliases)
+- `POST /v1/chat/completions` - Chat mit Agent-Context
+- `POST /v1/completions` - Text Completion (optional)
 
 ```bash
 # Modelle auflisten (inkl. Aliases wie "fast", "code", "sonnet")
@@ -100,6 +109,98 @@ curl -s -N http://localhost:8765/v1/chat/completions \
 ```
 
 Details, Integrationsbeispiele und Einschraenkungen: **[OPENAI_API.md](OPENAI_API.md)**
+
+## Raw OpenAI Proxy (Optional)
+
+Aktiviere in der Config `raw_proxy.enabled: true` fuer einen direkten Proxy (`/raw/v1/`) ohne Agent-Context. Ideal fuer externe Tools die **keinen** System-Prompt wollen.
+
+```yaml
+# config.yaml
+raw_proxy:
+  enabled: true
+  token: "dein-token"   # Optional: wenn leer, keine Auth erforderlich
+  rate_limit: 100       # Requests pro Minute (default 100; 0 = deaktiviert)
+```
+
+**Wichtig:**
+- `raw_proxy.token`: Wird **automatisch generiert** wenn `enabled: true` aber kein Token vorhanden (wie `server.token`).
+- Token anzeigen: `miniassistant token --raw-proxy`
+- Token neu generieren: `miniassistant token --raw-proxy --regenerate`
+- Separate Rate Limits: `server.rate_limit` fuer `/v1/`, `raw_proxy.rate_limit` fuer `/raw/v1/`.
+
+```bash
+# Modelle von allen OpenAI-kompatiblen Providern
+curl -s http://localhost:8765/raw/v1/models -H "Authorization: Bearer TOKEN"
+
+# Chat-Completion (Modellname ohne provider-prefix)
+curl -s http://localhost:8765/raw/v1/chat/completions \
+  -H "Authorization: Bearer TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "qwen3.5-122b-a10b", "messages": [{"role": "user", "content": "Hallo!"}]}'
+```
+
+**Reverse-Proxy Beispiel (Nginx) - Nur Raw-Proxy freigeben:**
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name ai.deinedomain.de;
+
+    ssl_certificate /path/to/cert.pem;
+    ssl_certificate_key /path/to/key.pem;
+
+    # Nur Raw-Proxy Endpunkte freigeben (kein Agent-Context)
+    location /raw/v1 {
+        proxy_pass http://127.0.0.1:8765/raw/v1;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Authorization $http_authorization;
+        
+        # Streaming unterstuetzen
+        proxy_buffering off;
+        chunked_transfer_encoding off;
+    }
+
+    # Alles andere verweigern
+    location / {
+        return 404;
+    }
+}
+```
+
+**Client-Usage (OpenAI SDK):**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://ai.deinedomain.de/raw/v1",
+    api_key="dein-raw-proxy-token"
+)
+
+response = client.chat.completions.create(
+    model="qwen3.5-122b-a10b",
+    messages=[{"role": "user", "content": "Hallo!"}]
+)
+```
+
+---
+
+### Alle Endpunkte im Ueberblick
+
+| Pfad | Beschreibung | Auth | Agent-Context |
+|------|--------------|------|---------------|
+| `/chat` | Web-UI | `server.token` | Ja |
+| `/v1/*` | MiniAssistant API | `server.token` | Ja |
+| `/raw/v1/*` | Raw Proxy | `raw_proxy.token` | Nein |
+| `/api/*` | Interne APIs | `server.token` | Ja |
+| `/nutzung` | Usage Tracking | `server.token` | Ja |
+| `/config` | Config-Editor | `server.token` | Ja |
+
+**Nur Raw-Proxy freigeben?** Siehe Reverse-Proxy Beispiel oben - dann sind `/v1/`, `/chat`, `/api/*` usw. **nicht** von aussen erreichbar.
+
+Unterschiede: `/v1/` = mit Agent-Context (MiniAssistant), `/raw/v1/` = direkter Proxy (OpenAI-kompatibel). Details: **[CONFIGURATION.md](CONFIGURATION.md)** (#10b)
 
 ## Binden auf alle Interfaces
 

@@ -130,16 +130,27 @@ def _convert_messages(
             continue
 
         if role == "tool":
-            # Tool-Ergebnis → braucht tool_call_id
-            tool_call_id = msg.get("tool_call_id", "")
-            if not tool_call_id:
-                _tool_call_counter += 1
-                tool_call_id = f"call_{_tool_call_counter}"
-            api_msgs.append({
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": msg.get("content", ""),
-            })
+            # Prüfen ob die vorherige assistant-Nachricht tool_calls hat.
+            # Bei no_api_tools (XML-Tool-Calls) hat sie keines → tool-Result als user senden,
+            # da vLLM ohne passendes tool_calls-Array im assistant die role:tool-Message ablehnt.
+            prev_assistant = next((m for m in reversed(api_msgs) if m.get("role") == "assistant"), None)
+            if not (prev_assistant and prev_assistant.get("tool_calls")):
+                tool_name = msg.get("tool_name", "tool")
+                api_msgs.append({
+                    "role": "user",
+                    "content": f"<tool_response>\n<tool_name>{tool_name}</tool_name>\n<content>{msg.get('content', '')}</content>\n</tool_response>",
+                })
+            else:
+                # Standard OpenAI tool_call_id matching
+                tool_call_id = msg.get("tool_call_id", "")
+                if not tool_call_id:
+                    _tool_call_counter += 1
+                    tool_call_id = f"call_{_tool_call_counter}"
+                api_msgs.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": msg.get("content", ""),
+                })
             continue
 
         if role == "assistant":
@@ -296,6 +307,7 @@ def _parse_response(resp: dict[str, Any]) -> dict[str, Any]:
         "done": True,
         "provider": "openai",
         "usage": resp.get("usage"),
+        "timings": resp.get("timings"),
         "finish_reason": choice.get("finish_reason"),
     }
 
@@ -440,6 +452,7 @@ def api_chat_stream(
         "model": model,
         "messages": api_msgs,
         "stream": True,
+        "stream_options": {"include_usage": True},
     }
     if _use_mct:
         body["max_completion_tokens"] = max_tokens
@@ -466,6 +479,9 @@ def api_chat_stream(
 
     # Akkumulierte Tool-Calls für Streaming (OpenAI streamt sie in Teilen)
     _tool_calls_acc: dict[int, dict[str, Any]] = {}
+    # Usage/Timings aus Stream-Chunks sammeln (llama.cpp, OpenAI, vLLM)
+    _usage: dict[str, Any] | None = None
+    _timings: dict[str, Any] | None = None
 
     with httpx.stream("POST", url, headers=headers, json=body, timeout=timeout) as resp:
         resp.raise_for_status()
@@ -492,12 +508,24 @@ def api_chat_stream(
                             },
                         })
                     yield {"message": {"tool_calls": tcs}, "done": False}
-                yield {"done": True}
+                _done: dict[str, Any] = {"done": True}
+                if _usage:
+                    _done["usage"] = _usage
+                if _timings:
+                    _done["timings"] = _timings
+                yield _done
                 break
             try:
                 event = json.loads(data_str)
             except json.JSONDecodeError:
                 continue
+
+            # Usage/Timings aus jedem Chunk sammeln — OpenAI/vLLM senden usage
+            # im finalen Chunk (choices=[]), llama.cpp sendet zusätzlich timings
+            if event.get("usage"):
+                _usage = event["usage"]
+            if event.get("timings"):
+                _timings = event["timings"]
 
             choices = event.get("choices") or []
             if not choices:
@@ -525,9 +553,10 @@ def api_chat_stream(
                 if fn.get("arguments"):
                     _tool_calls_acc[idx]["arguments"] += fn["arguments"]
 
-            finish = choices[0].get("finish_reason")
-            if finish and finish == "stop":
-                yield {"done": True}
+            # Kein frühes done bei finish_reason — immer auf [DONE] warten.
+            # Grund: Tool-Calls werden in _tool_calls_acc akkumuliert und erst
+            # beim [DONE]-Sentinel geliefert. Ein früher Ausstieg bei finish_reason
+            # würde sie verlieren (race condition bei vLLM mit tool-call-parser).
 
 
 # ═══════════════════════════════════════════════════════════════════════════

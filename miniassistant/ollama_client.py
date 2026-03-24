@@ -39,22 +39,32 @@ def show_model(base_url: str, name: str, api_key: str | None = None) -> dict[str
 
 def model_supports_thinking(base_url: str, name: str) -> bool:
     """True wenn das Modell Reasoning/Thinking unterstützt (für Anzeige in der Modellliste)."""
+    n = (name or "").lower()
+    
+    # OpenAI Reasoning-Modelle automatisch erkennen
+    if "o1-" in n or n.startswith("o1"):
+        return True
+    if "o3-" in n or n.startswith("o3"):
+        return True
+    if "o4-" in n or n.startswith("o4"):
+        return True
+    
+    # Heuristik: bekannte Reasoning-Modelle (funktioniert für Ollama, vLLM, llama.cpp, etc.)
+    if "r1" in n or "reasoning" in n or "deepseek-r1" in n:
+        return True
+    if "qwen3" in n and ("80k" in n or "14b" in n):
+        return True
+    if "phi4-reasoning" in n:
+        return True
+    
+    # Nur für Ollama: /api/show aufrufen
     try:
         info = show_model(base_url, name)
         caps = info.get("capabilities") or []
         if isinstance(caps, list) and ("thinking" in caps or "reasoning" in caps):
             return True
-        params = info.get("parameters") or {}
-        if isinstance(params, dict) and (params.get("thinking") or params.get("num_ctx")):
-            # Manche Modelle exponieren think über Parameter
-            pass
-        # Heuristik: bekannte Reasoning-Modelle
-        n = (name or "").lower()
-        if "r1" in n or "reasoning" in n or "deepseek-r1" in n:
-            return True
-        if "qwen3" in n and ("80k" in n or "14b" in n):
-            return True
     except Exception:
+        # show_model schlägt fehl (z.B. bei vLLM, OpenAI API) → Heuristik verwenden
         pass
     return False
 
@@ -380,11 +390,13 @@ def _tools_schema(
             "name": "read_url",
             "description": (
                 "Read the content of a URL and return it as clean text. "
-                "Use for: web pages, docs, wikis, research. HTML is auto-converted to text. "
-                "CANNOT fill forms, click buttons, or navigate multi-step flows (tracking, login, search forms). "
-                "If this returns generic/homepage content instead of the specific data you need: "
-                "the site requires form interaction — escalate immediately to exec+Playwright, do NOT give up. "
-                "Never guess or construct URLs from memory — verify with web_search first."
+                "Use for: web pages, docs, wikis, research, tracking results, any URL. HTML is auto-converted to text. "
+                "Set js=true if the page returns empty/minimal content (SPA/React) — try without js first. "
+                "Many tracking/lookup sites have direct URLs (e.g. site.com/tracking/NUMBER) — "
+                "always try read_url with the FULL URL including the query/number FIRST. "
+                "CANNOT fill forms or click buttons. Only if the site truly REQUIRES filling a form: "
+                "escalate to exec+Playwright (read docs/WEB_FETCHING.md). "
+                "Never guess URLs from memory — verify with web_search first."
             ),
             "parameters": {
                 "type": "object",
@@ -745,7 +757,8 @@ def chat(
     import json as _json
     url = f"{base_url.rstrip('/')}/api/chat"
     body = _chat_body(model=model, messages=messages, system=system, num_ctx=num_ctx, think=think, tools=tools, options=options, stream=False)
-    _timeout = httpx.Timeout(connect=30.0, read=timeout, write=60.0, pool=30.0)
+    # pool=600: langsame Modell-Pulls bei Ollama dürfen bis 10min warten
+    _timeout = httpx.Timeout(connect=30.0, read=timeout, write=60.0, pool=600.0)
     with httpx.Client(timeout=_timeout, headers=_auth_headers(api_key)) as client:
         r = client.post(url, json=body)
         r.raise_for_status()
@@ -769,8 +782,8 @@ def chat_stream(
     import json as _json
     url = f"{base_url.rstrip('/')}/api/chat"
     body = _chat_body(model=model, messages=messages, system=system, num_ctx=num_ctx, think=think, tools=tools, options=options, stream=True)
-    # connect: Verbindung zu Ollama; read: max. Pause zwischen Tokens (Inaktivitätserkennung)
-    _timeout = httpx.Timeout(connect=30.0, read=timeout, write=60.0, pool=30.0)
+    # connect: Verbindung zu Ollama; read: max. Pause zwischen Tokens; pool=600: Modell-Pulls bis 10min
+    _timeout = httpx.Timeout(connect=30.0, read=timeout, write=60.0, pool=600.0)
     with httpx.Client(timeout=_timeout, headers=_auth_headers(api_key)) as client:
         with client.stream("POST", url, json=body) as response:
             response.raise_for_status()

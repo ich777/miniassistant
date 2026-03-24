@@ -131,6 +131,9 @@ def _run_prompt(prompt: str, model: str | None = None, scheduled_prompt: str | N
     from miniassistant.ollama_client import resolve_model
     if scheduled_prompt is not None:
         config["_scheduled_task_prompt"] = scheduled_prompt
+    # Scheduled Tasks: höherer Timeout — Tool-Chains können lange dauern,
+    # kein User wartet interaktiv. Default 3600s (1h), überschreibbar via schedule_timeout.
+    config["api_timeout"] = float(config.get("schedule_timeout") or config.get("api_timeout") or 3600)
     session = create_session(config, None)
     if model:
         resolved = resolve_model(config, model)
@@ -166,7 +169,7 @@ def _run_prompt(prompt: str, model: str | None = None, scheduled_prompt: str | N
         else:
             logger.warning("Schedule: Nudge lieferte auch keinen Content — behalte Original")
 
-    if not content:
+    if not content or not content.strip():
         logger.warning("Schedule: Modell hat keinen Content produziert (nur Thinking oder leer)")
     return (content or "").strip()
 
@@ -174,6 +177,7 @@ def _run_prompt(prompt: str, model: str | None = None, scheduled_prompt: str | N
 def _send_to_client(message: str, client: str | None, room_id: str | None = None, channel_id: str | None = None) -> None:
     """Sendet eine Nachricht an Chat-Client(s) via notify. Optional direkt in Raum/Channel."""
     if not message:
+        logger.warning("_send_to_client: Leere Nachricht — überspringe (kein Content produziert)")
         return
     try:
         from miniassistant.notify import send_notification

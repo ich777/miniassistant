@@ -14,9 +14,15 @@ import shutil
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 _log = logging.getLogger("uvicorn.error")
+
+# Dedizierter Threadpool für Chat-Requests (verhindert Blockieren bei Modell-Pulls)
+# Standard Executor hat nur ~5 Threads, wir brauchen mehr für parallele Requests
+_chat_executor: ThreadPoolExecutor | None = None
+_CHAT_EXECUTOR_MAX_WORKERS = 20
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse
@@ -84,29 +90,56 @@ def _get_session_lock(session_id: str) -> threading.Lock:
 # ---------------------------------------------------------------------------
 _rate_buckets: dict[str, list[float]] = {}   # ip -> liste von Request-Timestamps
 _rate_lock = threading.Lock()
-_rate_config_cache: tuple[float, int] = (0.0, 100)  # (cached_at, limit)
+_rate_config_cache: tuple[float, int, int] = (0.0, 100, 100)  # (cached_at, server_limit, raw_proxy_limit)
 _RATE_WINDOW = 60.0  # Sekunden
 
+# Auth Brute-Force Protection: separate Buckets für fehlgeschlagene Auth-Versuche (401)
+_auth_fail_buckets: dict[str, list[float]] = {}
+_AUTH_FAIL_WINDOW = 3600.0  # 1 Stunde
+_AUTH_FAIL_MAX = 20          # max fehlgeschlagene Versuche → danach 1h Ban
 
-def _get_rate_limit() -> int:
-    """Liest server.rate_limit aus der Config; cached 30 Sekunden."""
+
+def _check_auth_rate_limit(ip: str) -> bool:
+    """True = erlaubt, False = zu viele fehlgeschlagene Auth-Versuche."""
+    now = time.time()
+    with _rate_lock:
+        attempts = _auth_fail_buckets.get(ip, [])
+        attempts = [t for t in attempts if now - t < _AUTH_FAIL_WINDOW]
+        _auth_fail_buckets[ip] = attempts
+        return len(attempts) < _AUTH_FAIL_MAX
+
+
+def _record_auth_failure(ip: str) -> None:
+    """Fehlgeschlagenen Auth-Versuch aufzeichnen."""
+    now = time.time()
+    with _rate_lock:
+        attempts = _auth_fail_buckets.get(ip, [])
+        attempts = [t for t in attempts if now - t < _AUTH_FAIL_WINDOW]
+        attempts.append(now)
+        _auth_fail_buckets[ip] = attempts
+
+
+def _get_rate_limit(path: str = "/") -> int:
+    """Liest rate_limit aus der Config; cached 30 Sekunden. Unterscheidet zwischen /v1/ und /raw/v1/."""
     global _rate_config_cache
     now = time.monotonic()
-    cached_at, cached_limit = _rate_config_cache
+    cached_at, server_limit, raw_limit = _rate_config_cache
     if now - cached_at < 30.0:
-        return cached_limit
+        return raw_limit if path.startswith("/raw/v1") else server_limit
     try:
         cfg = load_config()
-        limit = int((cfg.get("server") or {}).get("rate_limit", 100) or 100)
+        server_limit = int((cfg.get("server") or {}).get("rate_limit", 100) or 100)
+        raw_limit = int((cfg.get("raw_proxy") or {}).get("rate_limit", 100) or 100)
     except Exception:
-        limit = 100
-    _rate_config_cache = (now, limit)
-    return limit
+        server_limit = 100
+        raw_limit = 100
+    _rate_config_cache = (now, server_limit, raw_limit)
+    return raw_limit if path.startswith("/raw/v1") else server_limit
 
 
-def _check_rate_limit(ip: str) -> bool:
+def _check_rate_limit(ip: str, path: str = "/") -> bool:
     """True = Anfrage erlaubt, False = Rate-Limit überschritten."""
-    limit = _get_rate_limit()
+    limit = _get_rate_limit(path)
     if limit <= 0:
         return True  # 0 = deaktiviert
     now = time.time()
@@ -128,6 +161,10 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 from miniassistant.web.openai_compat import router as _openai_router
 app.include_router(_openai_router)
 
+# Raw OpenAI Proxy (/raw/v1/models, /raw/v1/chat/completions)
+from miniassistant.web.raw_proxy import router as _raw_proxy_router
+app.include_router(_raw_proxy_router)
+
 
 @app.get("/favicon.ico", include_in_schema=False)
 async def _favicon():
@@ -144,8 +181,9 @@ _discord_bot_task: asyncio.Task | None = None
 @app.on_event("startup")
 async def _startup() -> None:
     """Bei server.debug: Startup in debug/serve.log schreiben. Chat-Bots starten falls konfiguriert."""
-    global _matrix_bot_task, _discord_bot_task, _session_cleanup_task
+    global _matrix_bot_task, _discord_bot_task, _session_cleanup_task, _chat_executor
     _session_cleanup_task = asyncio.create_task(_cleanup_expired_sessions())
+    _chat_executor = ThreadPoolExecutor(max_workers=_CHAT_EXECUTOR_MAX_WORKERS, thread_name_prefix="chat")
     try:
         project_dir = getattr(app.state, "project_dir", None)
         config = load_config(project_dir)
@@ -204,8 +242,11 @@ async def _cleanup_expired_sessions() -> None:
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    """Bot-Tasks und Cleanup abbrechen."""
-    global _matrix_bot_task, _discord_bot_task, _session_cleanup_task
+    """Chat-Executor cleanup und Bot-Tasks abbrechen."""
+    global _chat_executor, _matrix_bot_task, _discord_bot_task, _session_cleanup_task
+    if _chat_executor:
+        _chat_executor.shutdown(wait=False)
+        _chat_executor = None
     if _session_cleanup_task and not _session_cleanup_task.done():
         _session_cleanup_task.cancel()
     for task in (_matrix_bot_task, _discord_bot_task):
@@ -221,19 +262,30 @@ async def _shutdown() -> None:
 
 @app.middleware("http")
 async def _rate_limit_middleware(request: Request, call_next):
-    """Sliding-Window Rate-Limiter pro IP. Limit: server.rate_limit req/min (default 100). 0 = deaktiviert."""
+    """Sliding-Window Rate-Limiter pro IP + Auth-Brute-Force-Schutz (401-Tracking)."""
     # Statische Dateien und Favicon ausnehmen
     path = request.url.path
     if path.startswith("/static/") or path == "/favicon.ico":
         return await call_next(request)
     ip = (request.client.host if request.client else None) or "unknown"
-    if not _check_rate_limit(ip):
+    if not _check_rate_limit(ip, path):
         return JSONResponse(
             status_code=429,
             content={"detail": "Rate limit exceeded – too many requests. Please slow down."},
             headers={"Retry-After": "60"},
         )
-    return await call_next(request)
+    # Auth-Brute-Force: zu viele fehlgeschlagene Versuche → 1h Ban
+    if not _check_auth_rate_limit(ip):
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Too many failed authentication attempts. Banned for 1 hour."},
+            headers={"Retry-After": "3600"},
+        )
+    response = await call_next(request)
+    # 401-Responses tracken für Brute-Force-Schutz
+    if response.status_code == 401:
+        _record_auth_failure(ip)
+    return response
 
 
 @app.middleware("http")
@@ -1067,9 +1119,17 @@ async def chat_page(request: Request):
       const contentEl = document.getElementById("stream-content");
       const wrap = container.querySelector(".content");
       if (!wrap) return;
-      var thinkingText = thinkingEl ? thinkingEl.textContent.trim() : "";
-      var contentText  = contentEl  ? contentEl.textContent.trim()  : "";
-      if (!contentText && doneData && doneData.content) contentText = doneData.content.trim();
+      // doneData.content ist bereinigt (thinking/tool_call-XML entfernt) → bevorzugen
+      // doneData.thinking enthält extrahierten Denktext (vLLM: aus Content, Ollama: native)
+      var contentText  = (doneData && doneData.content)  ? doneData.content.trim()  : (contentEl  ? contentEl.textContent.trim()  : "");
+      var thinkingText = (doneData && doneData.thinking) ? doneData.thinking.trim() : (thinkingEl ? thinkingEl.textContent.trim() : "");
+      // Fallback: falls </think> noch im contentText steckt (vLLM hat <think> gefiltert aber
+      // server-seitig nicht gesplittet), hier client-seitig splitten.
+      if (!thinkingText && contentText.includes('</think>')) {{
+        const thinkEnd = contentText.indexOf('</think>');
+        thinkingText = contentText.slice(0, thinkEnd).trim();
+        contentText  = contentText.slice(thinkEnd + 8).trim();
+      }}
       if (thinkingEl) thinkingEl.remove();
       if (contentEl)  contentEl.remove();
       if (thinkingText && contentText) {{
@@ -1302,6 +1362,20 @@ async def api_config_save(request: Request):
                     orig_dc = ((orig_data.get("chat_clients") or {}).get("discord") or {}).get("bot_token")
                     if orig_dc:
                         content = content.replace(str(new_dc), orig_dc)
+                # github_token (top-level)
+                new_gh = (new_data.get("github_token") or "")
+                if new_gh and "****" in str(new_gh):
+                    orig_gh = orig_data.get("github_token")
+                    if orig_gh:
+                        content = content.replace(str(new_gh), orig_gh)
+                # email.password in accounts
+                new_emails = (new_data.get("email") or {}).get("accounts") or {}
+                orig_emails = (orig_data.get("email") or {}).get("accounts") or {}
+                for acc_name, acc_cfg in new_emails.items():
+                    if isinstance(acc_cfg, dict) and acc_cfg.get("password") and "****" in str(acc_cfg.get("password", "")):
+                        orig_pass = (orig_emails.get(acc_name) or {}).get("password")
+                        if orig_pass:
+                            content = content.replace(str(acc_cfg["password"]), orig_pass)
             except Exception:
                 pass
         ok, err = validate_config_raw(content)
@@ -1347,8 +1421,10 @@ async def api_generate_title(request: Request):
         prompt = (f"Create a short title (max 5 words, same language as the message, "
                   f"no quotes, no punctuation at end) for a conversation starting with:\n{message}\n"
                   f"Reply with ONLY the title, nothing else.")
-        resp = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: _oc(base_url, [{"role": "user", "content": prompt}],
+        loop = asyncio.get_event_loop()
+        executor = _chat_executor
+        resp = await loop.run_in_executor(
+            executor, lambda: _oc(base_url, [{"role": "user", "content": prompt}],
                                model=model, api_key=api_key, timeout=20.0, num_ctx=512))
         title = (resp.get("message", {}).get("content") or "").strip().strip('"').strip("'")
         if len(title) > 50:
@@ -1581,6 +1657,12 @@ async def api_chat_stream(request: Request):
         if body.get("track"):
             session["_track_chat"] = True
         _sessions[session_id] = session
+    
+    # Modell aus Body lesen und in Session setzen
+    requested_model = body.get("model")
+    if requested_model:
+        session["model"] = requested_model
+    
     _session_last_access[session_id] = time.time()
 
     # Cancellation-User-ID setzen (damit chat_round_stream bei Disconnect abbrechen kann)
@@ -1595,10 +1677,13 @@ async def api_chat_stream(request: Request):
         session["config"].pop("_client_tools", None)
         session["config"].pop("_tool_request_hook", None)
 
-    if is_chat_command(message):
+    if is_chat_command(message) or body.get("model"):
         is_new = message.strip().lower() == "/new"
-        is_model_switch = message.strip().lower().startswith("/model ")
-        result = handle_user_input(session, message)
+        is_model_switch = message.strip().lower().startswith("/model ") or body.get("model")
+        # Run in threadpool to avoid blocking event loop during model pulls
+        loop = asyncio.get_event_loop()
+        executor = _chat_executor
+        result = await loop.run_in_executor(executor, lambda: handle_user_input(session, message))
         session = result[1]
         _sessions[session_id] = session
         thinking = result[3] if len(result) > 3 else None
@@ -1639,10 +1724,11 @@ async def api_chat_stream(request: Request):
 
         watcher = asyncio.create_task(_disconnect_watcher())
         try:
-            # Sync generator in Threadpool ausfuehren
+            # Sync generator in dedicated Threadpool ausfuehren (vermeidet Blockieren bei Modell-Pulls)
+            executor = _chat_executor
             while True:
                 try:
-                    chunk = await loop.run_in_executor(None, next, gen)
+                    chunk = await loop.run_in_executor(executor, next, gen)
                     yield chunk
                 except StopIteration:
                     break
@@ -1700,7 +1786,10 @@ async def api_chat(request: Request):
         session = create_session(None, project_dir)
         _sessions[session_id] = session
     _session_last_access[session_id] = time.time()
-    result = handle_user_input(session, message)
+    # Run in threadpool to avoid blocking the event loop during Ollama model pulls
+    loop = asyncio.get_event_loop()
+    executor = _chat_executor
+    result = await loop.run_in_executor(executor, lambda: handle_user_input(session, message))
     response_text = result[0]
     session = result[1]
     debug_info = result[2] if len(result) > 2 else None
@@ -2381,11 +2470,26 @@ async def api_restart(request: Request):
 
 @app.get("/api/usage")
 async def api_usage(request: Request):
-    """GET /api/usage?period=hour|day|week|month|year|all -> aggregierte Nutzungsdaten."""
+    """GET /api/usage?period=hour|day|3days|week|month|year|all -> aggregierte Nutzungsdaten.
+
+    Alternativ: ?from=YYYY-MM-DD&to=YYYY-MM-DD für benutzerdefinierten Zeitraum.
+    """
     _require_token(request)
-    period = request.query_params.get("period", "day")
-    from miniassistant.usage import get_usage_for_period
-    data = get_usage_for_period(period)
+    from_str = request.query_params.get("from")
+    to_str = request.query_params.get("to")
+    if from_str and to_str:
+        from datetime import datetime
+        from miniassistant.usage import get_usage_for_range
+        try:
+            from_dt = datetime.strptime(from_str, "%Y-%m-%d")
+            to_dt = datetime.strptime(to_str, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Datumsformat muss YYYY-MM-DD sein")
+        data = get_usage_for_range(from_dt, to_dt)
+    else:
+        from miniassistant.usage import get_usage_for_period
+        period = request.query_params.get("period", "day")
+        data = get_usage_for_period(period)
     return JSONResponse(data)
 
 
@@ -2409,11 +2513,15 @@ async def nutzung_page(request: Request):
     .usage-header img {{ width: 32px; height: 32px; border-radius: 6px; }}
     .usage-header h1 {{ margin: 0; font-size: 1.2em; }}
     .usage-nav {{ margin-left: auto; }}
-    .filter-bar {{ display: flex; gap: 0.4em; flex-wrap: wrap; margin-bottom: 1em; }}
+    .filter-bar {{ display: flex; gap: 0.4em; flex-wrap: wrap; margin-bottom: 1em; align-items: center; }}
     .filter-bar button {{ padding: 0.4em 0.9em; border: 1.5px solid var(--border); border-radius: var(--radius);
                           background: var(--card); color: var(--text); cursor: pointer; font-size: 0.85em; transition: all 0.15s; }}
     .filter-bar button:hover {{ border-color: var(--primary); }}
     .filter-bar button.active {{ background: var(--primary); color: #fff; border-color: var(--primary); }}
+    .range-sep {{ color: var(--muted); font-size: 0.85em; margin: 0 0.1em; }}
+    .filter-bar input[type="date"] {{ padding: 0.35em 0.5em; border: 1.5px solid var(--border); border-radius: var(--radius);
+                                      background: var(--card); color: var(--text); font-size: 0.82em; }}
+    .filter-bar .range-btn {{ padding: 0.4em 0.7em; font-size: 0.82em; }}
     .summary-cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.8em; margin-bottom: 1.2em; }}
     .summary-card {{ background: var(--card); border: 1.5px solid var(--border); border-radius: var(--radius); padding: 1em; text-align: center; }}
     .summary-card .label {{ font-size: 0.8em; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }}
@@ -2442,10 +2550,16 @@ async def nutzung_page(request: Request):
       <div class="filter-bar">
         <button data-period="hour">Letzte Stunde</button>
         <button data-period="day" class="active">Heute</button>
+        <button data-period="3days">3 Tage</button>
         <button data-period="week">7 Tage</button>
         <button data-period="month">30 Tage</button>
         <button data-period="year">Jahr</button>
         <button data-period="all">Gesamt</button>
+        <span class="range-sep">&nbsp;|&nbsp;</span>
+        <input type="date" id="range-from" title="Von">
+        <span class="range-sep">&ndash;</span>
+        <input type="date" id="range-to" title="Bis">
+        <button class="range-btn" id="range-go">Anzeigen</button>
       </div>
       <div class="summary-cards">
         <div class="summary-card"><div class="label">Gesamtzeit</div><div class="value" id="sum-time">—</div></div>
@@ -2498,8 +2612,11 @@ async def nutzung_page(request: Request):
         return h;
       }}
 
-      function loadData(period) {{
-        fetch("/api/usage?period=" + period, {{credentials: "same-origin"}})
+      function loadData(period, fromDate, toDate) {{
+        var url = fromDate && toDate
+          ? "/api/usage?from=" + fromDate + "&to=" + toDate
+          : "/api/usage?period=" + period;
+        fetch(url, {{credentials: "same-origin"}})
           .then(function(r) {{ return r.json(); }})
           .then(function(data) {{
             // Summary
@@ -2599,8 +2716,18 @@ async def nutzung_page(request: Request):
         btn.addEventListener("click", function() {{
           btns.forEach(function(b) {{ b.classList.remove("active"); }});
           btn.classList.add("active");
+          document.getElementById("range-from").value = "";
+          document.getElementById("range-to").value = "";
           loadData(btn.getAttribute("data-period"));
         }});
+      }});
+
+      document.getElementById("range-go").addEventListener("click", function() {{
+        var f = document.getElementById("range-from").value;
+        var t = document.getElementById("range-to").value;
+        if (!f || !t) return;
+        btns.forEach(function(b) {{ b.classList.remove("active"); }});
+        loadData(null, f, t);
       }});
 
       loadData("day");
