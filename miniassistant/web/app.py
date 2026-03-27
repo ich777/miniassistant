@@ -728,7 +728,7 @@ async def schedules_page(request: Request):
             ) if (j.get("prompt") or trigger == "cron") and not j.get("watch") else ""
             rows += (
                 f'<tr><td><code>{_escape(when)}</code>{once_tag}{watch_badge}</td><td>{task}</td><td>{client}</td><td>{model}</td><td>{added}</td>'
-                f'<td><code>{jid}</code> {edit_btn}<button class="btn-del" data-id="{full_id}" title="Loeschen">&#10005;</button></td></tr>'
+                f'<td><code>{jid}</code> <button class="btn-run" data-id="{full_id}" title="Jetzt ausführen">&#9654;</button>{edit_btn}<button class="btn-del" data-id="{full_id}" title="Loeschen">&#10005;</button></td></tr>'
             )
     html = f"""
     <!DOCTYPE html><html><head><meta charset="utf-8"><title>Schedules – MiniAssistant</title>
@@ -755,6 +755,10 @@ async def schedules_page(request: Request):
     .btn-edit {{ background: none; border: 1.5px solid #888; color: #555; border-radius: 4px;
       cursor: pointer; padding: 0.15em 0.4em; font-size: 0.85em; line-height: 1; margin-right: 0.3em; transition: background 0.15s; }}
     .btn-edit:hover {{ background: #eee; }}
+    .btn-run {{ background: none; border: 1.5px solid #2d8a4e; color: #2d8a4e; border-radius: 4px;
+      cursor: pointer; padding: 0.15em 0.4em; font-size: 0.85em; line-height: 1; margin-right: 0.3em; transition: background 0.15s; }}
+    .btn-run:hover {{ background: #2d8a4e; color: #fff; }}
+    .btn-run:disabled {{ opacity: 0.5; cursor: default; }}
     .modal-overlay {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,0.45); z-index:1000; align-items:center; justify-content:center; }}
     .modal-overlay.open {{ display:flex; }}
     .modal-box {{ background:#fff; border-radius:8px; padding:1.5em; max-width:540px; width:90%; box-shadow:0 4px 24px rgba(0,0,0,0.18); }}
@@ -803,11 +807,12 @@ async def schedules_page(request: Request):
     var token = new URLSearchParams(window.location.search).get("token") || "";
     // Modelle laden
     (function() {{
-      var url = "/api/ollama/models" + (token ? "?token=" + encodeURIComponent(token) : "");
+      var url = "/v1/models" + (token ? "?token=" + encodeURIComponent(token) : "");
       fetch(url).then(function(r) {{ return r.json(); }}).then(function(d) {{
         var sel = document.getElementById("editModelSelect");
-        (d.models || []).forEach(function(m) {{
-          var opt = document.createElement("option"); opt.value = m; opt.textContent = m; sel.appendChild(opt);
+        (d.data || d.models || []).forEach(function(m) {{
+          var id = m.id || m;
+          var opt = document.createElement("option"); opt.value = id; opt.textContent = id; sel.appendChild(opt);
         }});
       }}).catch(function() {{}});
     }})();
@@ -856,6 +861,19 @@ async def schedules_page(request: Request):
     }});
     document.getElementById("editModal").addEventListener("click", function(e) {{
       if (e.target === this) this.classList.remove("open");
+    }});
+    document.querySelectorAll(".btn-run").forEach(function(btn) {{
+      btn.addEventListener("click", function() {{
+        var id = this.getAttribute("data-id");
+        var b = this;
+        b.disabled = true; b.textContent = "…";
+        fetch("/api/schedule/" + encodeURIComponent(id) + "/run" + (token ? "?token=" + encodeURIComponent(token) : ""), {{
+          method: "POST"
+        }}).then(function(r) {{
+          if (r.ok) {{ b.textContent = "✓"; setTimeout(function() {{ b.disabled = false; b.innerHTML = "&#9654;"; }}, 2000); }}
+          else r.json().then(function(d) {{ alert(d.detail || d.error || "Fehler"); b.disabled = false; b.innerHTML = "&#9654;"; }});
+        }}).catch(function() {{ b.disabled = false; b.innerHTML = "&#9654;"; }});
+      }});
     }});
     document.querySelectorAll(".btn-del").forEach(function(btn) {{
       btn.addEventListener("click", function() {{
@@ -1498,6 +1516,33 @@ async def api_schedule_delete(request: Request, job_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/schedule/{job_id}/run")
+async def api_schedule_run(request: Request, job_id: str):
+    """Führt einen Schedule-Job sofort aus (fire-and-forget). Token erforderlich."""
+    _require_token(request)
+    try:
+        import json as _json
+        from miniassistant.scheduler import list_scheduled_jobs, _run_scheduled_job
+        jobs = list_scheduled_jobs()
+        job = next((j for j in jobs if j.get("id") == job_id), None)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job nicht gefunden")
+        job_data: dict = {}
+        for key in ("command", "prompt", "client", "model", "room_id", "channel_id"):
+            if job.get(key):
+                job_data[key] = job[key]
+        if job.get("once"):
+            job_data["once"] = True
+        job_data_json = _json.dumps(job_data, ensure_ascii=False)
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, _run_scheduled_job, job_id, job_data_json)
+        return JSONResponse({"ok": True, "message": f"Job {job_id[:8]} gestartet"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/api/notify")
 async def api_notify(request: Request):
     """Benachrichtigung an Chat-Clients senden. Body: { message, client? }. Token erforderlich."""
@@ -1728,7 +1773,10 @@ async def api_chat_stream(request: Request):
             executor = _chat_executor
             while True:
                 try:
-                    chunk = await loop.run_in_executor(executor, next, gen)
+                    _sentinel = object()
+                    chunk = await loop.run_in_executor(executor, lambda: next(gen, _sentinel))
+                    if chunk is _sentinel:
+                        break
                     yield chunk
                 except StopIteration:
                     break
