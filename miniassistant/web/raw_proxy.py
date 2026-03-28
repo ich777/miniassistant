@@ -56,6 +56,23 @@ def _require_token(request: Request) -> None:
     raise HTTPException(status_code=401, detail="Invalid or missing token")
 
 
+def _is_model_allowed(raw_cfg: dict[str, Any], model_id: str) -> bool:
+    """Prüft ob ein Modell über den Raw-Proxy erlaubt ist.
+    allowed_models: Liste — wenn leer/nicht gesetzt, sind ALLE Modelle erlaubt.
+    Matching: 'qwen3-35b-a3b' trifft 'llama-swap/qwen3-35b-a3b' (Suffix-Match)."""
+    allowed = raw_cfg.get("allowed_models") or []
+    if not allowed:
+        return True
+    model_lower = model_id.lower()
+    model_suffix = model_id.split("/", 1)[-1].lower() if "/" in model_id else model_lower
+    for entry in allowed:
+        e = str(entry).lower()
+        e_suffix = e.split("/", 1)[-1] if "/" in e else e
+        if e == model_lower or e_suffix == model_suffix:
+            return True
+    return False
+
+
 def _get_provider_for_model(config: dict[str, Any], model_id: str) -> tuple[str | None, dict[str, Any] | None]:
     """Findet den Provider für ein Modell. Gibt (provider_name, provider_config) zurück."""
     providers = config.get("providers") or {}
@@ -149,9 +166,10 @@ async def list_models(request: Request):
             
             for m in data.get("data") or []:
                 model_id = m.get("id", "")
-                if model_id:
+                full_id = f"{prov_name}/{model_id}"
+                if model_id and _is_model_allowed(raw_cfg, full_id):
                     all_models.append({
-                        "id": f"{prov_name}/{model_id}",
+                        "id": full_id,
                         "object": "model",
                         "created": m.get("created", 0),
                         "owned_by": prov_name,
@@ -183,12 +201,15 @@ async def chat_completions(request: Request):
     
     if not model:
         raise HTTPException(status_code=400, detail="model parameter required")
-    
+
+    if not _is_model_allowed(raw_cfg, model):
+        raise HTTPException(status_code=403, detail=f"Model not allowed via raw proxy: {model}")
+
     # Provider für Modell finden
     prov_name, prov_cfg = _get_provider_for_model(config, model)
     if not prov_cfg:
         raise HTTPException(status_code=400, detail=f"No provider found for model: {model}")
-    
+
     # Modell-Name auflösen (Alias → echter Modellname)
     prov_models = prov_cfg.get("models") or {}
     aliases = prov_models.get("aliases") or {}

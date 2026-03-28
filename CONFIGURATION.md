@@ -656,7 +656,15 @@ raw_proxy:
   enabled: true        # Proxy aktivieren (default: false)
   token: "xyz"         # Optional: Token fuer Auth (wie server.token)
   rate_limit: 100      # Requests pro Minute (default: 100; 0 = deaktiviert)
+  allowed_models:      # Optional: Whitelist erlaubter Modelle (leer = alle)
+    - qwen3-35b-a3b    # Suffix-Match: trifft auch "llama-swap/qwen3-35b-a3b"
+    - openai/gpt-4o    # Exakter Match mit Provider-Prefix moeglich
 ```
+
+Wenn `allowed_models` leer oder nicht gesetzt ist, sind alle Modelle erlaubt. Mit Eintraegen gilt:
+- `GET /raw/v1/models` gibt nur erlaubte Modelle zurueck
+- `POST /raw/v1/chat/completions` gibt 403 fuer nicht erlaubte Modelle
+- Matching per Suffix: `qwen3-35b-a3b` trifft `llama-swap/qwen3-35b-a3b`
 
 ### Endpunkte
 
