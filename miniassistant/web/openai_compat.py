@@ -38,6 +38,9 @@ def _strip_tool_call_xml(content: str) -> str:
     content = _re.sub(r'<tool_call>.*?</tool_call>', '', content, flags=_re.DOTALL)
     content = _re.sub(r'<tools>.*?</tools>', '', content, flags=_re.DOTALL)
     content = _re.sub(r'<function=\w+>.*?</function>(?:\s*</tool_call>)?', '', content, flags=_re.DOTALL)
+    for _st in ("exec", "web_search", "read_url", "check_url"):
+        content = _re.sub(rf'<{_st}[^>]*>.*?</{_st}>', '', content, flags=_re.DOTALL)
+        content = _re.sub(rf'<{_st}[^>]*>.*', '', content, flags=_re.DOTALL)
     return content.strip()
 
 router = APIRouter(prefix="/v1", tags=["OpenAI-compatible"])

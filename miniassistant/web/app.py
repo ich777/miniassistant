@@ -718,12 +718,13 @@ async def schedules_page(request: Request):
             once_tag = ' <span style="color:var(--muted);font-size:0.8em;">einmalig</span>' if j.get("once") else ""
             watch_badge = ' <span class="badge-watch" title="Watch-Job">👁 Watch</span>' if j.get("watch") else ""
             full_id = _escape(j.get("id", ""))
-            prompt_js = _js_escape(j.get("prompt") or "")
+            import html as _html
             raw_when = when if trigger == "cron" else ""
-            model_js = _js_escape(j.get("model") or "")
             edit_btn = (
-                f'<button class="btn-edit" data-id="{full_id}" data-prompt={prompt_js}'
-                f' data-when={_js_escape(raw_when)} data-model={model_js}'
+                f'<button class="btn-edit" data-id="{full_id}"'
+                f' data-prompt="{_html.escape(j.get("prompt") or "", quote=True)}"'
+                f' data-when="{_html.escape(raw_when, quote=True)}"'
+                f' data-model="{_html.escape(j.get("model") or "", quote=True)}"'
                 f' title="Bearbeiten">&#9998;</button>'
             ) if (j.get("prompt") or trigger == "cron") and not j.get("watch") else ""
             rows += (

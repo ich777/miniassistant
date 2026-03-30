@@ -147,8 +147,12 @@ def _strip_tool_call_tags(content: str) -> str:
     """Entfernt verbliebene Tool-Call-XML-Blöcke aus Content (Safety-Net).
     Wird als letzter Schritt aufgerufen bevor Content an Clients geliefert wird,
     damit fehlerhaft geparste Tool-Call-XML nie durchleakt."""
-    if not any(tag in content for tag in ("<tool_call>", "<tools>", "<function=")):
+    _SIMPLE_TAGS = ("exec", "web_search", "read_url", "check_url")
+    if not any(tag in content for tag in ("<tool_call>", "<tools>", "<function=") + tuple(f"<{t}>" for t in _SIMPLE_TAGS)):
         return content
+    for t in _SIMPLE_TAGS:
+        content = _re.sub(rf'<{t}[^>]*>.*?</{t}>', '', content, flags=_re.DOTALL)
+        content = _re.sub(rf'<{t}[^>]*>.*', '', content, flags=_re.DOTALL)
     # Vollständige Blöcke entfernen
     content = _re.sub(r'<tool_call>.*?</tool_call>', '', content, flags=_re.DOTALL)
     content = _re.sub(r'<tools>.*?</tools>', '', content, flags=_re.DOTALL)
@@ -2595,6 +2599,30 @@ def _run_subagent_with_tools(
     return result
 
 
+def _nudge_message(msgs: list[dict[str, Any]]) -> str:
+    """Wählt den passenden Nudge-Text abhängig vom Kontext.
+
+    Wenn die letzte Nachricht ein Tool-Ergebnis ist, war das Modell noch mitten
+    in der Arbeit (Tool-Runde) → Aufforderung zum Weitermachen statt Abschluss.
+    """
+    last = msgs[-1] if msgs else {}
+    if last.get("role") == "tool":
+        # Tool just ran — model was mid-task, not done yet
+        tool_result = last.get("content") or ""
+        if "returncode:" in tool_result and "returncode: 0" not in tool_result:
+            # Tool failed with non-zero exit code
+            return (
+                "The tool returned an error. According to your instructions, you must "
+                "try a different approach. Do NOT give up — use another command or "
+                "method to complete the task."
+            )
+        return (
+            "The tool returned a result. Please continue working — analyze the result "
+            "and proceed with the next step to complete the task."
+        )
+    return "You have not provided a text response yet. Please give your final answer to the user now."
+
+
 def _extract_tool_calls(message: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     """Extrahiert (name, arguments) aus message.tool_calls.
     Fallback: Parst Tool-Call-Tags aus message.content.
@@ -2764,6 +2792,32 @@ def _extract_tool_calls(message: dict[str, Any]) -> list[tuple[str, dict[str, An
                         _log.info("Tool-Call (Format 6 bare JSON obj) extrahiert: %s", name)
                 except (json.JSONDecodeError, AttributeError):
                     pass
+    # Format 7: <toolname>content</toolname> — Modell erfindet eigene XML-Tags für bekannte Tools
+    # z.B. <exec>curl ...</exec> oder <web_search>query</web_search>
+    # Prüft zuerst content, dann thinking als Fallback (qwen3 schreibt Format-7-Calls manchmal
+    # ins reasoning_content statt in den sichtbaren Content).
+    if not out:
+        _SIMPLE_TOOL_ARGS = {
+            "exec": "command",
+            "web_search": "query",
+            "read_url": "url",
+            "check_url": "url",
+        }
+        for _f7_src in (message.get("content") or "", message.get("thinking") or ""):
+            if out:
+                break
+            for tool_name, arg_name in _SIMPLE_TOOL_ARGS.items():
+                for m in _re.finditer(
+                    rf'<{tool_name}[^>]*>(.*?)</{tool_name}>',
+                    _f7_src, _re.DOTALL
+                ):
+                    body = m.group(1).strip()
+                    # command="..." oder command='...' Attributsyntax normalisieren
+                    attr_m = _re.match(rf'{arg_name}=["\']?(.*?)["\']?\s*$', body, _re.DOTALL)
+                    value = attr_m.group(1).strip() if attr_m else body
+                    if value:
+                        out.append((tool_name, {arg_name: value}))
+                        _log.info("Tool-Call (Format 7 <%s>-Tag) extrahiert: %s", tool_name, tool_name)
     if out:
         _log.info("_extract_tool_calls: %d Tool-Call(s) extrahiert: %s", len(out), [n for n, _ in out])
     elif any(tag in (message.get("content") or "") + (message.get("thinking") or "")
@@ -2991,7 +3045,7 @@ def chat_round(
             # Aber NICHT wenn send_image erfolgreich war (Bild IST die Antwort)
             elif not total_content.strip() and not _sent_image:
                 _log.info("Empty response after %d rounds — sending nudge", rounds)
-                msgs.append({"role": "user", "content": "You have not provided a text response yet. Please give your final answer to the user now."})
+                msgs.append({"role": "user", "content": _nudge_message(msgs)})
                 try:
                     nudge_resp = _dispatch_chat(
                         config, try_model, msgs,
@@ -3219,24 +3273,34 @@ def chat_round_stream(
                             # <tool_call>-Blöcke in seinen Denkprozess; im History-Content belassen,
                             # aber dem Client nicht als rohe XML zeigen)
                             _think_display = _strip_tool_call_tags(msg["thinking"]) if (
-                                any(tag in msg["thinking"] for tag in ("<tool_call>", "<tools>", "<function="))
+                                any(tag in msg["thinking"] for tag in ("<tool_call>", "<tools>", "<function=", "<exec>", "<web_search>", "<read_url>", "<check_url>"))
                             ) else msg["thinking"]
                             if _think_display:
                                 yield {"type": "thinking", "delta": _think_display}
                         if msg.get("content"):
                             # Tool-Call-XML buffered entfernen — Tags können über Chunk-Grenzen gehen
                             _raw_stream_content += msg["content"]
-                            _tc_stream_buf += msg["content"]
+                            # <details type="reasoning"> aus Display-Buffer entfernen:
+                            # llama-swap dupliziert thinking als <details>-Blöcke im content-Feld
+                            # (zusätzlich zu reasoning_content). Für Display und History nicht nötig.
+                            _chunk_display = _re.sub(r'<details[^>]*>.*?</details>', '', msg["content"], flags=_re.DOTALL)
+                            _tc_stream_buf += _chunk_display
                             # Vollständige Tool-Call-Blöcke strippen
                             _tc_stream_buf = _re.sub(r'<tool_call>.*?</tool_call>', '', _tc_stream_buf, flags=_re.DOTALL)
                             _tc_stream_buf = _re.sub(r'<tools>.*?</tools>', '', _tc_stream_buf, flags=_re.DOTALL)
                             _tc_stream_buf = _re.sub(r'<function=\w+>.*?</function>(?:\s*</tool_call>)?', '', _tc_stream_buf, flags=_re.DOTALL)
+                            for _st in ("exec", "web_search", "read_url", "check_url"):
+                                _tc_stream_buf = _re.sub(rf'<{_st}[^>]*>.*?</{_st}>', '', _tc_stream_buf, flags=_re.DOTALL)
                             # Sicheren Teil bestimmen (vor offenen/partiellen Tags)
                             _tc_open1 = _tc_stream_buf.find("<tool_call>")
                             _tc_open2 = _tc_stream_buf.find("<tools>")
                             _tc_open3_m = _re.search(r'<function=', _tc_stream_buf)
                             _tc_open3 = _tc_open3_m.start() if _tc_open3_m else -1
                             _tc_opens = [i for i in (_tc_open1, _tc_open2, _tc_open3) if i != -1]
+                            for _st in ("exec", "web_search", "read_url", "check_url"):
+                                _m4 = _re.search(rf'<{_st}[\s>/]|<{_st}$', _tc_stream_buf)
+                                if _m4:
+                                    _tc_opens.append(_m4.start())
                             _tc_open_idx = min(_tc_opens) if _tc_opens else -1
                             if _tc_open_idx != -1:
                                 # Offener Tag — nur Content davor emittieren
@@ -3246,7 +3310,7 @@ def chat_round_stream(
                                 # Kein offener Tag — aber Puffer könnte mit partiellem Tag-Anfang enden
                                 _emit = _tc_stream_buf
                                 _tc_stream_buf = ""
-                                for _tc_tag in ("<tool_call>", "<tools>", "<function="):
+                                for _tc_tag in ("<tool_call>", "<tools>", "<function=", "<exec>", "<web_search>", "<read_url>", "<check_url>"):
                                     for _tci in range(min(len(_tc_tag) - 1, len(_emit)), 0, -1):
                                         if _emit.endswith(_tc_tag[:_tci]):
                                             _tc_stream_buf = _emit[-_tci:]
@@ -3292,6 +3356,11 @@ def chat_round_stream(
                 _usage_record(config, try_model, _stream_usage_type + "_error", time.monotonic() - _t0_stream)
             except Exception:
                 pass
+            _log.error("Stream-Runde %d gescheitert: %s", rounds, e)
+            if not total_content:
+                _err_delta = f"⚠️ Verbindungsfehler (Runde {rounds + 1}): {str(e)[:120]}"
+                yield {"type": "content", "delta": _err_delta}
+                total_content = _err_delta
             yield {"type": "done", "error": str(e), "thinking": total_thinking, "content": total_content, "new_messages": msgs, "debug_info": None, "switch_info": switch_info, "ctx": [_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs), _ctx_max]}
             return
 
@@ -3305,7 +3374,9 @@ def chat_round_stream(
         tool_calls = _extract_tool_calls({"tool_calls": all_tool_calls_raw, "content": _raw_stream_content, "thinking": round_thinking})
         # History-Content: XML erhalten damit das Modell in Runde 2+ Kontext hat
         # (wichtig bei no_api_tools wo kein tool_calls-Array existiert).
-        history_content = _raw_stream_content
+        # <details type="reasoning"> entfernen — llama-swap bettet Thinking als HTML in content ein;
+        # das Modell soll im nächsten Round keine halluzinierten Patterns daraus lernen.
+        history_content = _re.sub(r'<details[^>]*>.*?</details>', '', _raw_stream_content, flags=_re.DOTALL).strip()
         # Safety-Net: Tool-Call-Tags immer aus Display-Content entfernen
         if any(tag in round_content for tag in ("<tool_call>", "<tools>", "<function=")):
             round_content = _strip_tool_call_tags(round_content)
@@ -3328,7 +3399,7 @@ def chat_round_stream(
             # Aber NICHT wenn send_image erfolgreich war (Bild IST die Antwort)
             if not total_content.strip() and not _sent_image:
                 _log.info("Empty stream response after %d rounds — sending nudge", rounds)
-                msgs.append({"role": "user", "content": "You have not provided a text response yet. Please give your final answer to the user now."})
+                msgs.append({"role": "user", "content": _nudge_message(msgs)})
                 try:
                     nudge_resp = _dispatch_chat(
                         config, try_model, msgs,
@@ -3372,6 +3443,15 @@ def chat_round_stream(
                             yield {"type": "content", "delta": _nudge_c}
                 except Exception as nudge_err:
                     _log.warning("Stream nudge failed: %s", nudge_err)
+
+            # Fallback: wenn Content nach Nudge noch immer leer, User informieren
+            # (sollte mit dem kontextsensitiven Nudge nie feuern — wenn doch, ist das ein Bug)
+            if not total_content.strip() and not _sent_image:
+                _log.error("Empty response after nudge — model produced nothing (rounds=%d, last_role=%s)",
+                           rounds, (msgs[-1].get("role") if msgs else "?"))
+                _fallback_msg = "⚠️ Keine Antwort vom Modell erhalten. Bitte erneut versuchen."
+                total_content = _fallback_msg
+                yield {"type": "content", "delta": _fallback_msg}
 
             if debug and last_response:
                 opts_debug = get_options_for_model(config, try_model)
@@ -3509,7 +3589,7 @@ def chat_round_stream(
     # Aber NICHT wenn send_image erfolgreich war (Bild IST die Antwort)
     elif not total_content.strip() and not _sent_image:
         _log.info("Empty stream response after max rounds — sending nudge")
-        msgs.append({"role": "user", "content": "You have not provided a text response yet. Please give your final answer to the user now."})
+        msgs.append({"role": "user", "content": _nudge_message(msgs)})
         try:
             nudge_resp = _dispatch_chat(
                 config, effective_model, msgs,
