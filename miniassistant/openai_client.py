@@ -583,32 +583,56 @@ def api_generate_image(
     size: str = "1024x1024",
     quality: str = "standard",
     base_url: str = OPENAI_API_URL,
-    timeout: int = 60,
+    timeout: int = 600,
+    steps: int | None = None,
+    cfg_scale: float | None = None,
 ) -> dict[str, Any]:
     """
     OpenAI Image Generation – POST /v1/images/generations.
     Returns: {url: str, revised_prompt: str} oder {b64_json: str, revised_prompt: str}.
+    Für lokale Backends (LocalAI, Flux): DALL-E-spezifische Parameter werden weggelassen
+    wenn der Endpoint sie nicht kennt (erster Versuch mit, zweiter ohne).
+    Optionale Parameter (steps, cfg_scale) werden nur für lokale Backends gesendet.
+    Default: size=1024x1024, steps=20.
     """
-    # api_key ist optional für OpenAI-kompatible APIs (z.B. vLLM, llama.cpp)
+    # api_key ist optional für OpenAI-kompatible APIs (z.B. LocalAI, llama.cpp)
     url = _api_url(base_url, "/images/generations")
-    body: dict[str, Any] = {
-        "model": model,
-        "prompt": prompt,
-        "n": 1,
-        "size": size,
-        "quality": quality,
-        "response_format": "b64_json",
-    }
-    try:
-        r = httpx.post(url, headers=_api_headers(api_key), json=body, timeout=timeout)
-        r.raise_for_status()
-        resp = r.json()
+    is_openai = OPENAI_API_URL in base_url
+    body: dict[str, Any] = {"model": model, "prompt": prompt, "n": 1}
+    if is_openai:
+        # DALL-E braucht size/quality/response_format
+        body["size"] = size
+        body["quality"] = quality
+        body["response_format"] = "b64_json"
+    else:
+        # Lokale Backends (LocalAI/Flux): size + steps + optionale Parameter
+        body["response_format"] = "b64_json"
+        body["size"] = size
+        body["steps"] = steps if steps is not None else 20
+        if cfg_scale is not None:
+            body["cfg_scale"] = cfg_scale
+
+    def _parse(resp: dict) -> dict:
         data = (resp.get("data") or [{}])[0]
+        b64 = data.get("b64_json", "")
+        if not b64 and data.get("url", "").startswith("data:"):
+            # Some backends return data-URI instead of b64_json field
+            b64 = data["url"].split(",", 1)[-1]
         return {
-            "b64_json": data.get("b64_json", ""),
+            "b64_json": b64,
+            "url": data.get("url", ""),
             "revised_prompt": data.get("revised_prompt", ""),
             "mime_type": "image/png",
         }
+
+    try:
+        r = httpx.post(url, headers=_api_headers(api_key), json=body, timeout=timeout)
+        if r.status_code == 422 and not is_openai:
+            # Backend rejected response_format — retry without it
+            body.pop("response_format", None)
+            r = httpx.post(url, headers=_api_headers(api_key), json=body, timeout=timeout)
+        r.raise_for_status()
+        return _parse(r.json())
     except httpx.HTTPStatusError as e:
         detail = ""
         try:

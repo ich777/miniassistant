@@ -2,19 +2,75 @@
 
 Portabler Terminal-Client für MiniAssistant. Einzelnes Binary, keine Abhängigkeiten.
 
-## Build
+## Installation
+
+### macOS (Apple Silicon / M-Series)
 
 ```bash
-go mod tidy   # lädt Abhängigkeit (readline)
-go build -o miniclient .
+# Binary herunterladen oder vom Server kopieren:
+scp user@server:/root/miniassistant/clients/miniclient/miniclient-darwin-arm64 ~/Downloads/miniclient
+
+# Systemweit installieren:
+sudo mv ~/Downloads/miniclient /usr/local/bin/miniclient
+sudo chmod +x /usr/local/bin/miniclient
+
+# Gatekeeper-Sperre aufheben (macOS blockiert unbekannte Binaries):
+xattr -d com.apple.quarantine /usr/local/bin/miniclient
+
+# Einrichten:
+miniclient config
 ```
 
-Cross-Compile (Beispiele):
+> Falls macOS "Kann nicht geöffnet werden" meldet: Systemeinstellungen → Datenschutz & Sicherheit → "Trotzdem öffnen" klicken, dann erneut versuchen.
+
+### Linux (x86_64)
+
 ```bash
-GOOS=linux  GOARCH=amd64   go build -o miniclient-linux-amd64 .
-GOOS=linux  GOARCH=arm64   go build -o miniclient-linux-arm64 .
-GOOS=darwin GOARCH=arm64   go build -o miniclient-macos-arm64 .
-GOOS=windows GOARCH=amd64  go build -o miniclient.exe .
+# Binary herunterladen oder vom Server kopieren:
+scp user@server:/root/miniassistant/clients/miniclient/miniclient-linux-amd64 ~/miniclient
+
+# Ausführbar machen und systemweit installieren:
+chmod +x ~/miniclient
+sudo mv ~/miniclient /usr/local/bin/miniclient
+
+# Einrichten:
+miniclient config
+```
+
+### Linux (ARM64 / Raspberry Pi)
+
+```bash
+scp user@server:/root/miniassistant/clients/miniclient/miniclient-linux-arm64 ~/miniclient
+chmod +x ~/miniclient
+sudo mv ~/miniclient /usr/local/bin/miniclient
+miniclient config
+```
+
+### Build aus Source (alle Plattformen)
+
+```bash
+# Go 1.21+ erforderlich
+cd clients/miniclient
+go mod tidy   # lädt Abhängigkeit (readline)
+go build -ldflags="-s -w" -o miniclient .
+```
+
+Cross-Compile vom Server:
+```bash
+GOOS=darwin  GOARCH=arm64  go build -ldflags="-s -w" -o miniclient-darwin-arm64 .
+GOOS=linux   GOARCH=amd64  go build -ldflags="-s -w" -o miniclient-linux-amd64 .
+GOOS=linux   GOARCH=arm64  go build -ldflags="-s -w" -o miniclient-linux-arm64 .
+GOOS=windows GOARCH=amd64  go build -ldflags="-s -w" -o miniclient.exe .
+```
+
+## Quickstart
+
+```bash
+# Ersteinrichtung (Server-URL, Token, Modell, Tool-Ausführung)
+miniclient config
+
+# Chat starten
+miniclient
 ```
 
 ## Einzel-Frage (Scripting)
@@ -31,17 +87,6 @@ git diff | miniclient -q "Schreib eine Commit-Message für diesen Diff"
 ```
 
 Die Antwort geht auf **stdout**, Fehler auf stderr — gut für Shell-Pipelines.
-Kein Session-Speicher, kein interaktiver Modus, kein Spinner.
-
-## Quickstart
-
-```bash
-# Ersteinrichtung (Server-URL, Token, Modell, Tool-Ausführung)
-./miniclient config
-
-# Chat starten
-./miniclient
-```
 
 ## Befehle
 
@@ -82,7 +127,6 @@ socks5://user:pass@host:port
 ```
 
 Konfigurierbar über `miniclient config` (Schritt 5) oder manuell in der JSON-Datei.
-Leer lassen oder weglassen = kein Proxy.
 
 Umgebungsvariablen (überschreiben Config-Datei):
 
@@ -96,7 +140,6 @@ MINIASSISTANT_MODEL=qwen3:8b
 
 Sessions werden unter `~/.config/miniassistant/sessions/<id>.json` gespeichert.
 Beim nächsten Start wird die letzte Session angezeigt und angeboten fortzusetzen.
-Der Client generiert automatisch einen kurzen Titel (via LLM) für jede neue Session.
 
 ```bash
 # Alle Sessions anzeigen
@@ -109,9 +152,6 @@ miniclient --continue abc12345
 
 Funktioniert auch nach einem Server-Neustart: die gespeicherten Messages werden beim
 ersten Request an den Server gesendet, sodass der Kontext vollständig wiederhergestellt wird.
-
-Kompaktierungen (automatische Zusammenfassungen langer Verläufe) werden transparent
-übernommen — die kompaktierte Version wird lokal gespeichert.
 
 ## Lokale Tool-Ausführung
 
@@ -130,8 +170,6 @@ Nur aktivieren, wenn du dem MiniAssistant-Server vertraust.
 
 ## Tastaturkürzel
 
-Die readline-Bibliothek (`ergochat/readline`) bietet volle Terminal-Navigation:
-
 | Kürzel | Funktion |
 |--------|---------|
 | `↑` / `↓` | Verlauf durchblättern |
@@ -148,7 +186,6 @@ Code-Blöcke, Überschriften, fetter Text, Listen und mehr — ohne externe Abh�
 
 ## Anforderungen
 
-- Go 1.21 oder neuer (nur für den Build)
 - Fertige Binaries laufen ohne Go-Installation
-- `curl` und `jq` werden **nicht** benötigt (anders als `macli.sh`)
-- Einzige Abhängigkeit: `github.com/ergochat/readline` (wird von `go mod tidy` geladen)
+- Go 1.21+ nur für den Build aus Source nötig
+- `curl` und `jq` werden **nicht** benötigt

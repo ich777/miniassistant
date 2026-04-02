@@ -103,7 +103,9 @@ def get_memory_for_prompt(
         return None
     now = datetime.now(timezone.utc)
     all_lines: list[str] = []
-    for i in range(days):
+    # Älteste Tage zuerst einlesen (i=days-1 … i=0) → all_lines = [älteste…neueste]
+    # Damit ist all_lines[-max_lines:] korrekt die neuesten Zeilen.
+    for i in range(days - 1, -1, -1):
         day = (now - timedelta(days=i)).strftime("%Y-%m-%d")
         path = d / f"{day}.md"
         if not path.exists():
@@ -118,8 +120,6 @@ def get_memory_for_prompt(
             continue
     if not all_lines:
         return None
-    # Chronologisch (älteste zuerst): i=0 heute, i=1 gestern → nach reverse: [gestern…, heute…]
-    all_lines.reverse()
     # Nur die neuesten max_lines Zeilen behalten (Ende der Liste = neueste)
     trimmed = all_lines[-max_lines:] if len(all_lines) > max_lines else all_lines
     # Token-Budget: von hinten (neueste) aufbauen, stoppen wenn Budget erschöpft

@@ -463,6 +463,10 @@ def _tools_section(config: dict[str, Any]) -> str:
             f"Read `{docs_prefix}SCHEDULES.md` for edge cases (once, simple messages, editing, now+schedule, prompt engineering for API/exec schedules). "
             f"For complex schedule prompts (API calls, exec, self-deletion): also read `{docs_prefix}PROMPT_ENGINEERING.md`."
         )
+        lines.append(
+            "- **Waiting:** need result in this session ≤10 min → `wait`. "
+            "Background task, notify when done → `watch`. Future or recurring → `schedule`."
+        )
     lines.append(
         "- `save_config`: **only for system config** (see Persistence section). Pass only keys to change (deep-merged). After saving, tell the user to restart **miniassistant**.\n"
         "  Per-model options → `providers.<name>.model_options.\"model:tag\"`. Quote `:` in YAML keys.\n"

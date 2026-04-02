@@ -1169,6 +1169,24 @@ def _run_tool(
             arguments = {}
     if not isinstance(arguments, dict):
         arguments = {}
+    if name == "wait":
+        _wait_secs = max(1, min(int(arguments.get("seconds") or 30), 600))
+        _wait_reason = (arguments.get("reason") or "").strip()
+        _wait_cb = config.get("_tool_status_callback")
+        _waited = 0
+        _chunk = 5  # Status alle 5 Sekunden aktualisieren
+        while _waited < _wait_secs:
+            _sleep = min(_chunk, _wait_secs - _waited)
+            time.sleep(_sleep)
+            _waited += _sleep
+            _remaining = _wait_secs - _waited
+            if _wait_cb and _remaining > 0:
+                _label = f" ({_wait_reason})" if _wait_reason else ""
+                _wait_cb(f"⏳ Warte{_label}… noch {int(_remaining)}s")
+        _done = f"Wartezeit abgelaufen ({_wait_secs}s)."
+        if _wait_reason:
+            _done += f" Anlass: {_wait_reason}."
+        return _done + " Fahre jetzt fort."
     if name == "save_config":
         import yaml as _yaml
         from miniassistant.config import validate_config_raw, write_config_raw, load_config_raw
@@ -1429,9 +1447,27 @@ def _run_tool(
             f"      Do NOT call any tool. Return ONLY the exact text: [WATCH:PENDING]\n"
         )
 
+        # Room/Channel und Client aus chat_context — nur bei Matrix/Discord-Kontext.
+        # Ohne echten Raum-Kontext → client="none" (keine Benachrichtigung).
+        chat_ctx = config.get("_chat_context") or {}
+        chat_platform = chat_ctx.get("platform")
+        if chat_platform == "matrix" and chat_ctx.get("room_id"):
+            watch_room_id = chat_ctx["room_id"]
+            watch_channel_id = None
+            watch_client = "matrix"
+        elif chat_platform == "discord" and chat_ctx.get("channel_id"):
+            watch_room_id = None
+            watch_channel_id = chat_ctx["channel_id"]
+            watch_client = "discord"
+        else:
+            watch_room_id = None
+            watch_channel_id = None
+            watch_client = "none"
+
         ok, info = _add_job(
             cron_when,
             prompt=scheduled_prompt,
+            client=watch_client,
             once=False,
             watch=True,
             job_id=job_id,
@@ -1439,6 +1475,8 @@ def _run_tool(
             watch_message=message,
             watch_timeout=timeout_dt_str,
             watch_recurring=recurring,
+            room_id=watch_room_id,
+            channel_id=watch_channel_id,
         )
         if not ok:
             return f"watch: failed to create job — {info}"
@@ -1459,6 +1497,42 @@ def _run_tool(
         platform = chat_ctx.get("platform")
         room_id = chat_ctx.get("room_id")
         channel_id = chat_ctx.get("channel_id")
+        # Web/API: Bild in _pending_images speichern (NICHT in Tool-Response!).
+        # Tool-Response geht ins LLM-Context → base64 würde Context sprengen (500er).
+        # Die Bilder werden am Ende in den finalen Content injiziert.
+        if platform in ("web", "api") or (not platform and not room_id and not channel_id):
+            _img_p = _Path(image_path).resolve()
+            if platform == "web":
+                _workspace = _Path(config.get("workspace") or "").expanduser().resolve()
+                if str(_img_p).startswith(str(_workspace)):
+                    _rel = str(_img_p.relative_to(_workspace))
+                    from urllib.parse import quote as _url_quote
+                    _img_url = f"/api/workspace/raw?path={_url_quote(_rel)}"
+                else:
+                    _img_url = f"/api/workspace/raw?path={_url_quote(str(_img_p))}"
+            else:
+                # API: UUID-URL (kein Token in URL, kein Chunk-Limit), base64 nur als Fallback
+                _api_base = (config.get("_chat_context") or {}).get("_api_base_url", "")
+                if _api_base:
+                    # Stabiler URL aus Dateiname — kein Token, kein Verfall
+                    _img_url = f"{_api_base}/api/img/{_img_p.stem}"
+                else:
+                    import base64 as _b64_img
+                    _suffix = _img_p.suffix.lower()
+                    _mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                                 ".gif": "image/gif", ".webp": "image/webp"}
+                    _mime = _mime_map.get(_suffix, "image/png")
+                    _data = _b64_img.b64encode(_img_p.read_bytes()).decode("ascii")
+                    _img_url = f"data:{_mime};base64,{_data}"
+            # Deduplizieren: gleichen Pfad nicht zweimal senden
+            # (passiert wenn Agent erst invoke_model, dann send_image für dasselbe Bild aufruft)
+            _already = any(img.get("url") == _img_url for img in config.get("_pending_images", []))
+            if not _already:
+                config.setdefault("_pending_images", []).append({
+                    "url": _img_url,
+                    "caption": caption or "Bild",
+                })
+            return f"Image delivered to user: {image_path} (displayed inline)"
         try:
             from miniassistant.notify import send_image as _send_img
             results = _send_img(
@@ -1563,11 +1637,25 @@ def _run_tool(
         sched_model = arguments.get("model", "").strip() or None
         if not cmd and not prompt:
             return "schedule requires 'command' and/or 'prompt'"
-        # Room/Channel aus chat_context automatisch uebernehmen
+        # Room/Channel aus chat_context automatisch uebernehmen.
+        # WICHTIG: Nur Benachrichtigung wenn aus Matrix-Raum oder Discord-Channel erstellt.
+        # Kein Kontext (CLI, Web, API, autonomer Schedule) → client="none" erzwingen,
+        # damit der Agent nicht "alle" oder einen Raum aus einer vorigen Konversation nutzt.
         chat_ctx = config.get("_chat_context") or {}
-        sched_room_id = chat_ctx.get("room_id") if chat_ctx.get("platform") == "matrix" else None
-        sched_channel_id = chat_ctx.get("channel_id") if chat_ctx.get("platform") == "discord" else None
-        ok, msg = add_scheduled_job(when, command=cmd, prompt=prompt, client=client or chat_ctx.get("platform"), once=bool(once), model=sched_model, room_id=sched_room_id, channel_id=sched_channel_id)
+        chat_platform = chat_ctx.get("platform")
+        if chat_platform == "matrix" and chat_ctx.get("room_id"):
+            sched_room_id = chat_ctx["room_id"]
+            sched_channel_id = None
+            sched_client = client or "matrix"
+        elif chat_platform == "discord" and chat_ctx.get("channel_id"):
+            sched_room_id = None
+            sched_channel_id = chat_ctx["channel_id"]
+            sched_client = client or "discord"
+        else:
+            sched_room_id = None
+            sched_channel_id = None
+            sched_client = "none"
+        ok, msg = add_scheduled_job(when, command=cmd, prompt=prompt, client=sched_client, once=bool(once), model=sched_model, room_id=sched_room_id, channel_id=sched_channel_id)
         return f"Scheduled: {msg}" if ok else f"Schedule failed: {msg}"
     if name == "debate":
         topic = arguments.get("topic", "").strip()
@@ -1649,7 +1737,8 @@ def _run_tool(
         elif provider_type in ("openai", "openai-compat"):
             try:
                 from miniassistant.openai_client import model_supports_image_generation as _o_img
-                if _o_img(api_model_sub):
+                from miniassistant.ollama_client import get_image_generation_models as _get_img_models
+                if _o_img(api_model_sub) or api_model_sub in _get_img_models(config) or resolved in _get_img_models(config):
                     _sub_usage_type = "image"
             except Exception:
                 pass
@@ -2274,8 +2363,8 @@ def _run_subagent_google(
         for i, img in enumerate(msg["images"]):
             mime = img.get("mime_type", "image/png")
             ext = "png" if "png" in mime else "jpg" if "jpeg" in mime or "jpg" in mime else "webp" if "webp" in mime else "png"
-            ts = int(_time.time())
-            fname = f"{ts}-generated-{i}.{ext}"
+            import uuid as _uuid_img
+            fname = f"{_uuid_img.uuid4().hex}-{i}.{ext}"
             fpath = img_dir / fname
             try:
                 fpath.write_bytes(_b64.b64decode(img.get("data", "")))
@@ -2303,7 +2392,7 @@ def _run_subagent_openai(
     Mit Tool-Support (exec, web_search, check_url). Max 15 Tool-Runden.
     Unterstützt DALL-E Image Generation."""
     from miniassistant.openai_client import api_chat as openai_chat, OPENAI_API_URL, model_supports_image_generation as _oai_img_gen
-    from miniassistant.ollama_client import get_subagent_tools_schema
+    from miniassistant.ollama_client import get_subagent_tools_schema, get_image_generation_models
     api_key = get_api_key_for_model(config, resolved_name)
     base_url = get_base_url_for_model(config, resolved_name)
     think = get_think_for_model(config, resolved_name)
@@ -2313,31 +2402,77 @@ def _run_subagent_openai(
         _aal.log_subagent_result(config, resolved_name, err, "")
         return err
 
-    # DALL-E: eigener Endpoint für Bildgenerierung
-    if _oai_img_gen(api_model):
+    # Image Generation: DALL-E (Name-Check) ODER explizit in image_generation:-Config (z.B. LocalAI Flux)
+    _img_gen_models = get_image_generation_models(config)
+    _is_img_gen = _oai_img_gen(api_model) or api_model in _img_gen_models or resolved_name in _img_gen_models
+    if _is_img_gen:
         try:
             from miniassistant.openai_client import api_generate_image
             import base64 as _b64
             from pathlib import Path as _Path
             import time as _time
+            import re as _img_re
+            # Parameter aus User-Prompt extrahieren (Size, Steps, Quality, CFG)
+            _img_kwargs: dict[str, Any] = {}
+            _size_m = _img_re.search(r'(\d{3,4})\s*[xX×]\s*(\d{3,4})', user_msg)
+            if _size_m:
+                _img_kwargs["size"] = f"{_size_m.group(1)}x{_size_m.group(2)}"
+            _steps_m = _img_re.search(r'(\d+)\s*(?:steps?|schritte?)\b', user_msg, _img_re.IGNORECASE)
+            if _steps_m:
+                _img_kwargs["steps"] = int(_steps_m.group(1))
+            _cfg_m = _img_re.search(r'(?:cfg[_ ]?(?:scale)?|guidance)\s*[:=]?\s*(\d+(?:\.\d+)?)', user_msg, _img_re.IGNORECASE)
+            if _cfg_m:
+                _img_kwargs["cfg_scale"] = float(_cfg_m.group(1))
+            _quality_m = _img_re.search(r'\b(hd|high|hq|standard|low)\b', user_msg, _img_re.IGNORECASE)
+            if _quality_m:
+                _q = _quality_m.group(1).lower()
+                _img_kwargs["quality"] = "hd" if _q in ("hd", "high", "hq") else "standard"
             r = api_generate_image(
                 user_msg, api_key=api_key, model=api_model,
                 base_url=base_url or OPENAI_API_URL,
+                **_img_kwargs,
             )
             workspace = (config.get("workspace") or "").strip()
             img_dir = _Path(workspace) / "images" if workspace else _Path("images")
             img_dir.mkdir(parents=True, exist_ok=True)
-            ts = int(_time.time())
-            fpath = img_dir / f"{ts}-generated-0.png"
+            import uuid as _uuid_img
+            fpath = img_dir / f"{_uuid_img.uuid4().hex}.png"
             b64_data = r.get("b64_json", "")
+            _server_url = r.get("url", "")
+            # Wenn Backend HTTP-URL statt base64 zurückgibt: Bild herunterladen
+            if not b64_data and _server_url and _server_url.startswith(("http://", "https://")):
+                try:
+                    import httpx as _httpx_img
+                    _dl = _httpx_img.get(_server_url, timeout=60, follow_redirects=True)
+                    _dl.raise_for_status()
+                    b64_data = _b64.b64encode(_dl.content).decode()
+                    _log.info("Image download from server URL %s OK (%d bytes)", _server_url, len(_dl.content))
+                except Exception as _dl_err:
+                    _log.warning("Image download from server URL %s failed: %s", _server_url, _dl_err)
             if b64_data:
                 fpath.write_bytes(_b64.b64decode(b64_data))
                 _log.info("DALL-E image generation: saved %s", fpath)
-                result = f"Bild generiert und gespeichert: `{fpath}`"
+                # Bild in _pending_images speichern (NICHT in Tool-Response!).
+                # base64 in der Tool-Response würde den LLM-Context sprengen → 500er.
+                _img_ctx = config.get("_chat_context") or {}
+                _img_platform = _img_ctx.get("platform")
+                _api_base = _img_ctx.get("_api_base_url", "")
+                if _img_platform == "web":
+                    _img_url = f"/api/workspace/raw?path=images/{fpath.name}"
+                elif _api_base:
+                    # API (OpenWebUI): stabiler URL aus Dateiname — kein Token, kein Verfall
+                    _img_url = f"{_api_base}/api/img/{fpath.stem}"
+                else:
+                    _img_url = f"data:image/png;base64,{b64_data}"
+                config.setdefault("_pending_images", []).append({
+                    "url": _img_url,
+                    "caption": "Generiertes Bild",
+                })
+                result = f"Bild generiert und gespeichert: `{fpath}` (wird dem User inline angezeigt)"
                 if r.get("revised_prompt"):
                     result += f"\n\nRevisierter Prompt: {r['revised_prompt']}"
             else:
-                result = f"Bild-URL: {r.get('url', '(keine)')}"
+                result = f"Bild konnte nicht gespeichert werden (kein Bild-Daten vom Server erhalten)"
             _aal.log_subagent_result(config, resolved_name, result, "")
             return result
         except Exception as e:
@@ -3041,7 +3176,10 @@ def chat_round(
                     _aal.log_tool_call(config, name, args, result)
                     msgs.append({"role": "tool", "tool_name": name, "content": result})
                     if name in ("send_image", "send_audio"):
-                        _sent_image = True
+                        # Web/API: Bild kommt als Markdown-Image im Content → nicht unterdrücken
+                        _img_platform = (config.get("_chat_context") or {}).get("platform")
+                        if _img_platform not in ("web", "api"):
+                            _sent_image = True
                 rounds += 1
 
             # Wenn durch Cancellation abgebrochen, nicht weiter verarbeiten
@@ -3195,6 +3333,13 @@ def chat_round(
             pass
     # Strip inline <think> tags from content (phi4-reasoning, deepseek-r1 ohne API-think)
     _final_content, _final_thinking = _clean_response(total_content.strip(), total_thinking.strip())
+
+    # Pending Images injizieren (send_image/Bildgenerierung für Web/API)
+    _pending_imgs = config.pop("_pending_images", [])
+    if _pending_imgs:
+        _img_md = "\n\n".join(f"![{img['caption']}]({img['url']})" for img in _pending_imgs)
+        _final_content = f"{_final_content}\n\n{_img_md}" if _final_content else _img_md
+
     # Konversationshistorie bereinigen (spart Kontext-Tokens)
     if msgs_final:
         for _m in msgs_final:
@@ -3244,6 +3389,14 @@ def chat_round_stream(
         yield {"type": "status", "message": "Chat-Verlauf wird komprimiert…"}
         msgs = _compact_history(config, msgs, model, system_prompt, tools_schema, _compact_num_ctx)
         yield {"type": "status", "message": "Verlauf komprimiert."}
+    # Vision: Bilder via VL-Modell beschreiben falls Hauptmodell keine Vision hat
+    if images:
+        vision_model = _resolve_vision_model(config, model)
+        if not vision_model:
+            yield {"type": "done", "thinking": "", "content": "Kein Vision-Modell konfiguriert. Bitte `vision` in der Config setzen (z.B. `vision: llava:13b`).", "new_messages": msgs}
+            return
+        user_content, images = describe_images_with_vl_model(config, images, user_content, model)
+
     user_msg: dict[str, Any] = {"role": "user", "content": user_content}
     if images:
         user_msg["images"] = images
@@ -3457,18 +3610,19 @@ def chat_round_stream(
         if not tool_calls:
             total_content += round_content
 
-        # Announce-without-doing nudge: model announced tool usage in text but emitted no tool call.
-        # Detects short announcements (< 600 chars) where thinking mentioned tool names → retry.
+        # Announce-without-doing nudge: model announced tool usage in text/thinking but emitted no tool call.
+        # Detects (a) short announcements (< 600 chars) where thinking mentioned tool names, or
+        # (b) thinking-only responses (no content at all) where thinking mentioned tool names → retry.
         _TOOL_ANNOUNCE_KEYS = ("invoke_model", "web_search", "read_url", "check_url", "exec", "send_email", "schedule", "debate")
+        _thinking_mentions_tools = round_thinking and any(k in round_thinking for k in _TOOL_ANNOUNCE_KEYS)
         if (not tool_calls
-                and round_content.strip()
                 and not _sent_image
-                and round_thinking
-                and any(k in round_thinking for k in _TOOL_ANNOUNCE_KEYS)
+                and _thinking_mentions_tools
                 and len(round_content.strip()) < 600
-                and rounds < max_rounds - 1):
+                and rounds < max_tool_rounds - 1):
             _log.info("Announce-without-doing nudge (rounds=%d): thinking mentioned tools but no tool call emitted", rounds)
-            total_content = total_content[:-len(round_content)]  # revert premature accumulation
+            if round_content:
+                total_content = total_content[:-len(round_content)]  # revert premature accumulation
             msgs.append({"role": "user", "content": "STOP. You announced that you would call tools but did NOT emit any tool call. Call your tools RIGHT NOW — do not describe, just emit the tool call immediately."})
             rounds += 1
             continue
@@ -3559,10 +3713,15 @@ def chat_round_stream(
             # send_image war erfolgreich → Content unterdrücken (Bild IST die Antwort)
             _done_content, _done_thinking = _clean_response(
                 "" if _sent_image else total_content.strip(), total_thinking.strip())
+            # Pending Images injizieren
+            _pending_imgs = config.pop("_pending_images", [])
+            if _pending_imgs:
+                _img_md = "\n\n".join(f"![{img['caption']}]({img['url']})" for img in _pending_imgs)
+                _done_content = f"{_done_content}\n\n{_img_md}" if _done_content else _img_md
             # TPS: letzte Runde (_t0_stream) verwenden — schließt Tool-Wartezeit aus
             _done_tps = _aal.extract_tps(last_response, time.monotonic() - _t0_stream, _done_content, _done_thinking)
             _ctx_used = _last_real_ctx or (_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs))
-            yield {"type": "done", "thinking": _done_thinking, "content": _done_content, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info, "tps": _done_tps, "ctx": [_ctx_used, _ctx_max]}
+            yield {"type": "done", "thinking": _done_thinking, "content": _done_content, "images": _pending_imgs, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info, "tps": _done_tps, "ctx": [_ctx_used, _ctx_max]}
             return
 
         _tool_names = [n for n, _ in tool_calls]
@@ -3627,20 +3786,34 @@ def chat_round_stream(
             msgs.append({"role": "tool", "tool_name": _ct_name, "content": _ct_result})
 
         if _server_calls:
-            # Tool-Execution mit Keepalive (Playwright etc. kann Minuten dauern)
+            # Status-Callback einrichten: wait-Tool kann Fortschrittsmeldungen einstellen
+            _tool_status_q: Queue = Queue()
+            config["_tool_status_callback"] = _tool_status_q.put_nowait
+            # Tool-Execution mit Keepalive (wait, Playwright etc. können Minuten dauern)
             tool_results = None
             for _item in _call_with_keepalive(
                 lambda: _run_tools_maybe_concurrent(_server_calls, config, project_dir)
             ):
                 if _item is None:
-                    yield {"type": "status", "message": "⏳ Tool wird ausgeführt…"}
+                    # Neueste Status-Message vom wait-Tool abholen (falls vorhanden)
+                    _smsg = None
+                    try:
+                        while True:
+                            _smsg = _tool_status_q.get_nowait()
+                    except _QueueEmpty:
+                        pass
+                    yield {"type": "status", "message": _smsg if _smsg else "⏳ Tool wird ausgeführt…"}
                 else:
                     tool_results = _item
+            config.pop("_tool_status_callback", None)
             for name, args, result in (tool_results or []):
                 _aal.log_tool_call(config, name, args, result)
                 msgs.append({"role": "tool", "tool_name": name, "content": result})
                 if name == "send_image":
-                    _sent_image = True
+                    # Web/API: Bild kommt als Markdown-Image im Content zurück → nicht unterdrücken
+                    _img_platform = (config.get("_chat_context") or {}).get("platform")
+                    if _img_platform not in ("web", "api"):
+                        _sent_image = True
         rounds += 1
 
     # Max-Rounds-Exhaustion: Agent wollte noch weiterarbeiten aber hat keine Runden mehr
@@ -3726,8 +3899,17 @@ def chat_round_stream(
     # send_image war erfolgreich → Content unterdrücken (Bild IST die Antwort)
     _final_content, _final_thinking = _clean_response(
         "" if _sent_image else total_content.strip(), total_thinking.strip())
+
+    # Pending Images: Bilder die via send_image/Bildgenerierung erzeugt wurden,
+    # werden hier in den finalen Content injiziert (NICHT in Tool-Response,
+    # da base64-Daten den LLM-Context sprengen würden).
+    _pending_imgs = config.pop("_pending_images", [])
+    if _pending_imgs:
+        _img_md = "\n\n".join(f"![{img['caption']}]({img['url']})" for img in _pending_imgs)
+        _final_content = f"{_final_content}\n\n{_img_md}" if _final_content else _img_md
+
     _final_tps = _aal.extract_tps(last_response, time.monotonic() - _t0_stream, _final_content, _final_thinking)
-    yield {"type": "done", "thinking": _final_thinking, "content": _final_content, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info, "tps": _final_tps, "ctx": [_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs), _ctx_max]}
+    yield {"type": "done", "thinking": _final_thinking, "content": _final_content, "images": _pending_imgs, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info, "tps": _final_tps, "ctx": [_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs), _ctx_max]}
 
 
 def is_chat_command(user_input: str) -> bool:

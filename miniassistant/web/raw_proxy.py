@@ -9,6 +9,7 @@ Auth: Optional über raw_proxy.token (wenn konfiguriert), sonst ohne Auth.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -129,51 +130,57 @@ def _get_provider_url_and_key(provider_cfg: dict[str, Any]) -> tuple[str, str | 
 async def list_models(request: Request):
     """Listet alle Modelle von allen konfigurierten OpenAI-kompatiblen Providern."""
     _require_token(request)
-    
+
     config = load_config()
     raw_cfg = config.get("raw_proxy") or {}
-    
+
     if not raw_cfg.get("enabled", False):
         raise HTTPException(status_code=404, detail="Raw proxy not enabled")
-    
-    all_models = []
-    providers = config.get("providers") or {}
-    
-    for prov_name, prov_cfg in providers.items():
-        if not isinstance(prov_cfg, dict):
-            continue
-        
-        prov_type = str(prov_cfg.get("type", "ollama")).lower()
-        if prov_type not in ("openai", "openai-compat", "deepseek"):
-            continue
-        
-        base_url, api_key = _get_provider_url_and_key(prov_cfg)
-        
-        try:
-            _b = base_url.rstrip("/")
-            url = f"{_b}/models" if _b.endswith("/v1") else f"{_b}/v1/models"
-            headers = {"Content-Type": "application/json"}
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
-            
-            r = httpx.get(url, headers=headers, timeout=10)
-            r.raise_for_status()
-            data = r.json()
-            
-            for m in data.get("data") or []:
-                model_id = m.get("id", "")
-                full_id = f"{prov_name}/{model_id}"
-                if model_id and _is_model_allowed(raw_cfg, full_id):
-                    all_models.append({
-                        "id": full_id,
-                        "object": "model",
-                        "created": m.get("created", 0),
-                        "owned_by": prov_name,
-                    })
-        except Exception as e:
-            _log.warning("Failed to fetch models from %s: %s", prov_name, e)
-            continue
-    
+
+    def _fetch_all_models():
+        all_models = []
+        providers = config.get("providers") or {}
+
+        for prov_name, prov_cfg in providers.items():
+            if not isinstance(prov_cfg, dict):
+                continue
+
+            prov_type = str(prov_cfg.get("type", "ollama")).lower()
+            if prov_type not in ("openai", "openai-compat", "deepseek"):
+                continue
+
+            base_url, api_key = _get_provider_url_and_key(prov_cfg)
+
+            try:
+                _b = base_url.rstrip("/")
+                url = f"{_b}/models" if _b.endswith("/v1") else f"{_b}/v1/models"
+                headers = {"Content-Type": "application/json"}
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+
+                r = httpx.get(url, headers=headers, timeout=10)
+                r.raise_for_status()
+                data = r.json()
+
+                for m in data.get("data") or []:
+                    model_id = m.get("id", "")
+                    full_id = f"{prov_name}/{model_id}"
+                    if model_id and _is_model_allowed(raw_cfg, full_id):
+                        all_models.append({
+                            "id": full_id,
+                            "object": "model",
+                            "created": m.get("created", 0),
+                            "owned_by": prov_name,
+                        })
+            except Exception as e:
+                _log.warning("Failed to fetch models from %s: %s", prov_name, e)
+                continue
+        return all_models
+
+    from miniassistant.web.app import _chat_executor
+    loop = asyncio.get_event_loop()
+    all_models = await loop.run_in_executor(_chat_executor, _fetch_all_models)
+
     return JSONResponse({"object": "list", "data": all_models})
 
 
@@ -232,6 +239,8 @@ async def chat_completions(request: Request):
     # Timeout: kurze connect, lange read (Model-Laden bis 5 Min)
     _timeout = httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=300.0)
 
+    from miniassistant.web.app import _chat_executor
+
     try:
         if stream:
             from miniassistant.chat_loop import _iter_with_keepalive
@@ -252,8 +261,19 @@ async def chat_completions(request: Request):
                     else:
                         yield item
 
+            async def _async_stream():
+                """Sync-Generator im dedizierten Chat-Threadpool iterieren."""
+                _loop = asyncio.get_event_loop()
+                gen = _stream_with_keepalive()
+                _sentinel = object()
+                while True:
+                    chunk = await _loop.run_in_executor(_chat_executor, lambda: next(gen, _sentinel))
+                    if chunk is _sentinel:
+                        break
+                    yield chunk
+
             return StreamingResponse(
-                _stream_with_keepalive(),
+                _async_stream(),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -261,11 +281,15 @@ async def chat_completions(request: Request):
                 },
             )
         else:
-            # Non-Streaming Response
-            r = httpx.post(url, headers=headers, json=body, timeout=_timeout)
+            # Non-Streaming Response — im Threadpool ausführen, damit Event-Loop frei bleibt
+            loop = asyncio.get_event_loop()
+            r = await loop.run_in_executor(
+                _chat_executor,
+                lambda: httpx.post(url, headers=headers, json=body, timeout=_timeout),
+            )
             r.raise_for_status()
             return JSONResponse(r.json())
-    
+
     except httpx.HTTPStatusError as e:
         _log.error("Provider error: %s %s", e.response.status_code, e.response.text[:200])
         raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
@@ -307,8 +331,13 @@ async def completions(request: Request):
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     
+    from miniassistant.web.app import _chat_executor
     try:
-        r = httpx.post(url, headers=headers, json=body, timeout=120)
+        loop = asyncio.get_event_loop()
+        r = await loop.run_in_executor(
+            _chat_executor,
+            lambda: httpx.post(url, headers=headers, json=body, timeout=120),
+        )
         r.raise_for_status()
         return JSONResponse(r.json())
     except httpx.HTTPStatusError as e:

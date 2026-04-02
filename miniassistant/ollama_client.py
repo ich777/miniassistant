@@ -335,6 +335,29 @@ def _tools_schema(
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "wait",
+                "description": (
+                    "Pause for a specified number of seconds within the current session, then automatically continue. "
+                    "Use after starting a background process (build, download, slow exec) when you need "
+                    "to give it time before checking results. The user sees a live countdown. "
+                    "After the wait you receive a prompt to continue — check progress, retry, or proceed. "
+                    "Maximum: 600 seconds (10 minutes). "
+                    "Do NOT use to delay a direct answer to the user. "
+                    "Unknown duration → `watch`. Future/recurring → `schedule`."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "seconds": {"type": "integer", "description": "Seconds to wait (1–600)"},
+                        "reason": {"type": "string", "description": "What you are waiting for (shown as status, e.g. 'Build fertig', 'Download abgeschlossen')"},
+                    },
+                    "required": ["seconds"],
+                },
+            },
+        },
     ]
     search_engines = config.get("search_engines") or {}
     if search_engines:

@@ -10,6 +10,7 @@ Auth: Bearer <server.token> (gleicher Token wie fuer /api/*).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re as _re
@@ -311,7 +312,10 @@ async def chat_completions(request: Request):
         )
 
     # --- API-Kontext setzen (Platform-Info für Schedule-Tool und System-Prompt) ---
-    config["_chat_context"] = {"platform": "api"}
+    # _api_base_url wird von send_image / Bildgenerierung genutzt um absolute URLs
+    # zu bauen (statt base64, das OpenWebUI-Chunk-Limits sprengt).
+    _base = str(request.base_url).rstrip("/")
+    config["_chat_context"] = {"platform": "api", "_api_base_url": _base}
 
     # --- System-Prompt (Agent-Kontext) aufbauen ---
     system_prompt = build_system_prompt(config, project_dir)
@@ -345,8 +349,21 @@ async def chat_completions(request: Request):
 
     # --- Streaming ---
     if stream:
+        async def _async_stream():
+            """Sync-Generator im dedizierten Chat-Threadpool iterieren,
+            damit der Event-Loop nicht blockiert wird."""
+            from miniassistant.web.app import _chat_executor
+            _loop = asyncio.get_event_loop()
+            gen = _stream_generator(config, resolved, internal_messages, system_prompt, completion_id, model_display, project_dir, _vl_images)
+            _sentinel = object()
+            while True:
+                chunk = await _loop.run_in_executor(_chat_executor, lambda: next(gen, _sentinel))
+                if chunk is _sentinel:
+                    break
+                yield chunk
+
         return StreamingResponse(
-            _stream_generator(config, resolved, internal_messages, system_prompt, completion_id, model_display, project_dir, _vl_images),
+            _async_stream(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -361,17 +378,28 @@ async def chat_completions(request: Request):
     if history_messages and history_messages[-1].get("role") == "user":
         user_content = history_messages.pop().get("content", "")
 
+    # Blockierende LLM-Aufrufe in den dedizierten Chat-Threadpool verlagern,
+    # damit der asyncio Event-Loop (und damit die Web-UI) nicht blockiert wird.
+    from miniassistant.web.app import _chat_executor
+    loop = asyncio.get_event_loop()
+
     # Vision: Bildbeschreibung via VL-Modell injizieren (falls nötig)
     _ns_images = _vl_images
     if _ns_images:
-        user_content, _ns_images = describe_images_with_vl_model(config, _ns_images, user_content, resolved)
+        user_content, _ns_images = await loop.run_in_executor(
+            _chat_executor,
+            lambda: describe_images_with_vl_model(config, _ns_images, user_content, resolved),
+        )
 
     try:
         # chat_round loggt intern (PROMPT, TOOL, RESPONSE) — kein extra Logging hier
-        content, thinking, new_messages, _debug, _switch = chat_round(
-            config, history_messages, system_prompt, resolved,
-            user_content, project_dir,
-            images=_ns_images,
+        content, thinking, new_messages, _debug, _switch = await loop.run_in_executor(
+            _chat_executor,
+            lambda: chat_round(
+                config, history_messages, system_prompt, resolved,
+                user_content, project_dir,
+                images=_ns_images,
+            ),
         )
     except Exception as e:
         _log.error("Chat completion error: %s", e)
@@ -438,9 +466,17 @@ def _stream_generator(
                 # Keepalive: leerer Delta-Chunk hält den Socket offen
                 yield _make_stream_chunk(completion_id, model_display)
             elif ev_type == "done":
-                # done-Event: finale Inhalte (bereinigt) übernehmen
-                total_content = ev.get("content") or total_content
-                total_thinking = ev.get("thinking") or total_thinking
+                # done-Event: finale Inhalte (bereinigt) übernehmen.
+                # Pending images als separate Chunks senden — jedes Bild einzeln
+                # damit OpenWebUI die vollständige Markdown-Syntax parsen kann.
+                # Wir lesen das "images"-Feld direkt (kein fragiler String-Slice mehr).
+                final_content = ev.get("content") or total_content
+                final_thinking = ev.get("thinking") or total_thinking
+                for _img in (ev.get("images") or []):
+                    _img_md = f"\n\n![{_img['caption']}]({_img['url']})\n\n"
+                    yield _make_stream_chunk(completion_id, model_display, content=_img_md)
+                total_content = final_content
+                total_thinking = final_thinking
                 break
     except Exception as e:
         _log.error("Stream error: %s", e)

@@ -2,6 +2,23 @@
 
 Scheduled tasks are managed by the **schedule** tool and stored in `schedules.json` (config directory).
 
+## wait vs watch vs schedule
+
+| Tool | When to use | Duration |
+|------|-------------|----------|
+| `wait` | Need result **in this conversation** — pause then continue automatically | ≤10 min |
+| `watch` | Background monitoring — notify when condition met (file, PID, command) | Any |
+| `schedule` | Future or recurring task — runs in its own fresh session | Any |
+
+**`wait` example:** You ran `nohup make build &` and want to check the result in 3 minutes.
+→ `wait(seconds=180, reason="Build fertig")` — the session stays open, you continue after.
+
+**`watch` example:** You started a download and don't know when it'll finish.
+→ `watch(check="file_size_stable:/tmp/file.iso", message="Download fertig!")` — background, notifies when stable.
+
+**`schedule` example:** User wants a daily weather report at 8:00.
+→ `schedule(action='create', when='0 8 * * *', prompt='...')` — separate session, recurring.
+
 ## Create
 `schedule(action='create', when='30 7 * * *', prompt='...', once=false)`
 - `when`: 5 cron fields in system time (e.g. `0 8 * * *` = 08:00 daily) or `'in 30 minutes'`

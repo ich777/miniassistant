@@ -950,12 +950,23 @@ async def chat_page(request: Request):
     details.thinking summary {{ cursor: pointer; font-weight: 500; }}
     .thinking-placeholder {{ color: var(--muted); font-style: italic; }}
     .onboarding-notice {{ background: #fff9e6; padding: 0.6em 0.8em; border-radius: var(--radius); border-left: 4px solid var(--warning); font-size: 0.9em; margin-bottom: 0.5em; }}
-    .chat-input {{ display: flex; gap: 0.5em; align-items: flex-end; padding-top: 0.6em; border-top: 1px solid var(--border); flex-shrink: 0; }}
+    .chat-input {{ display: flex; gap: 0.5em; align-items: flex-end; padding-top: 0.6em; border-top: 1px solid var(--border); flex-shrink: 0; flex-wrap: wrap; }}
+    .chat-input-row {{ display: flex; gap: 0.5em; align-items: flex-end; width: 100%; }}
     .chat-input textarea {{ flex: 1; padding: 0.55em 0.7em; border: 1.5px solid var(--border); border-radius: var(--radius);
                             font-family: inherit; font-size: 0.95em; resize: none; outline: none; min-height: 2.5em; max-height: 8em; transition: border-color 0.15s; }}
     .chat-input textarea:focus {{ border-color: var(--primary); }}
     .chat-input button {{ height: 2.5em; }}
     .chat-footer {{ font-size: 0.8em; color: var(--muted); padding-top: 0.3em; text-align: center; flex-shrink: 0; }}
+    .btn-img-upload {{ background: none; border: 1.5px solid var(--border); border-radius: var(--radius); cursor: pointer; font-size: 1.2em; padding: 0.3em 0.5em; color: var(--muted); transition: border-color 0.15s, color 0.15s; height: 2.5em; }}
+    .btn-img-upload:hover {{ border-color: var(--primary); color: var(--primary); }}
+    #img-preview {{ display: none; gap: 0.4em; padding: 0.3em 0; width: 100%; flex-wrap: wrap; }}
+    #img-preview .img-thumb {{ position: relative; display: inline-block; }}
+    #img-preview .img-thumb img {{ max-height: 80px; max-width: 120px; border-radius: 6px; border: 1px solid var(--border); object-fit: cover; }}
+    #img-preview .img-thumb .img-remove {{ position: absolute; top: -6px; right: -6px; background: var(--danger); color: #fff; border: none; border-radius: 50%; width: 18px; height: 18px; font-size: 12px; line-height: 18px; text-align: center; cursor: pointer; padding: 0; }}
+    .msg .content img.chat-image, .msg .content .markdown img {{ max-width: min(100%, 520px); max-height: min(360px, 45vh); border-radius: 8px; margin: 0.4em 0; cursor: pointer; display: block; }}
+    .msg.msg-user .user-images {{ display: flex; gap: 0.4em; flex-wrap: wrap; justify-content: flex-end; margin-bottom: 0.3em; }}
+    .msg.msg-user .user-images img {{ max-height: 80px; max-width: 120px; border-radius: 6px; object-fit: cover; cursor: pointer; }}
+    .chat-input.drag-over {{ border-color: var(--primary); background: rgba(59,130,246,0.05); }}
     .thinking-live {{ white-space: pre-wrap; font-size: 0.88em; color: var(--muted); margin: 0.3em 0; }}
     .typing-dots {{ display: inline-flex; align-items: center; gap: 0.2em; margin: 0.3em 0; color: var(--muted); font-size: 1.2em; }}
     .typing-dots span {{ width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: typing-bounce 0.6s ease-in-out infinite both; }}
@@ -977,9 +988,14 @@ async def chat_page(request: Request):
     {"<div class=\"onboarding-notice\">Setup noch nicht abgeschlossen. <a href=\"/onboarding" + token_q + "\">Onboarding / Setup</a></div>" if show_onboarding else ""}
     <div id="log"></div>
     <form id="f" class="chat-input">
-      <textarea id="msg" placeholder="Nachricht… (Enter = Senden, Shift+Enter = Zeile)" rows="2" autocomplete="off"></textarea>
-      <button type="submit" class="btn btn-primary" id="btn-send">Senden</button>
-      <button type="button" class="btn btn-outline" id="btn-cancel" style="display:none;">Abbrechen</button>
+      <div id="img-preview"></div>
+      <div class="chat-input-row">
+        <button type="button" class="btn-img-upload" id="btn-img" title="Bild hochladen (oder Drag&amp;Drop / Ctrl+V)">&#128247;</button>
+        <input type="file" id="img-input" accept="image/*" multiple style="display:none;">
+        <textarea id="msg" placeholder="Nachricht… (Enter = Senden, Shift+Enter = Zeile)" rows="2" autocomplete="off"></textarea>
+        <button type="submit" class="btn btn-primary" id="btn-send">Senden</button>
+        <button type="button" class="btn btn-outline" id="btn-cancel" style="display:none;">Abbrechen</button>
+      </div>
     </form>
     <div class="chat-footer"><span id="no-save-hint" style="opacity:0.7;">Konversationen werden nicht gespeichert (Seite neu laden = neuer Chat).</span> {onboarding_link}<a href="/{token_q}" class="btn btn-outline" style="padding:0.3em 0.7em;font-size:0.85em;">Startseite</a></div>
     </div>
@@ -1003,6 +1019,69 @@ async def chat_page(request: Request):
     const btnCancel = document.getElementById("btn-cancel");
     btnCancel.addEventListener("click", function() {{
       if (currentAbort) {{ currentAbort.abort(); currentAbort = null; }}
+    }});
+    /* --- Bild-Upload --- */
+    const imgInput = document.getElementById("img-input");
+    const imgPreview = document.getElementById("img-preview");
+    const btnImg = document.getElementById("btn-img");
+    let pendingImages = []; /* {{data: base64, mime_type: string, name: string}} */
+    const MAX_IMG_SIZE = 20 * 1024 * 1024; /* 20MB */
+    const ALLOWED_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+    btnImg.addEventListener("click", function() {{ imgInput.click(); }});
+    imgInput.addEventListener("change", function() {{ handleFiles(this.files); this.value = ""; }});
+    function handleFiles(files) {{
+      for (const f of files) {{
+        if (!ALLOWED_TYPES.includes(f.type)) {{ alert("Nur JPEG, PNG, GIF und WebP werden unterstuetzt."); continue; }}
+        if (f.size > MAX_IMG_SIZE) {{ alert("Bild zu gross (max 20MB): " + f.name); continue; }}
+        const reader = new FileReader();
+        reader.onload = function(ev) {{
+          const dataUrl = ev.target.result;
+          const base64 = dataUrl.split(",")[1];
+          pendingImages.push({{ data: base64, mime_type: f.type, name: f.name }});
+          renderPreview();
+        }};
+        reader.readAsDataURL(f);
+      }}
+    }}
+    function renderPreview() {{
+      imgPreview.innerHTML = "";
+      if (!pendingImages.length) {{ imgPreview.style.display = "none"; return; }}
+      imgPreview.style.display = "flex";
+      pendingImages.forEach(function(img, idx) {{
+        const thumb = document.createElement("div");
+        thumb.className = "img-thumb";
+        const el = document.createElement("img");
+        el.src = "data:" + img.mime_type + ";base64," + img.data;
+        el.title = img.name || "Bild";
+        thumb.appendChild(el);
+        const rm = document.createElement("button");
+        rm.type = "button";
+        rm.className = "img-remove";
+        rm.textContent = "x";
+        rm.addEventListener("click", function() {{ pendingImages.splice(idx, 1); renderPreview(); }});
+        thumb.appendChild(rm);
+        imgPreview.appendChild(thumb);
+      }});
+    }}
+    /* Drag & Drop */
+    form.addEventListener("dragover", function(e) {{ e.preventDefault(); form.classList.add("drag-over"); }});
+    form.addEventListener("dragleave", function(e) {{ e.preventDefault(); form.classList.remove("drag-over"); }});
+    form.addEventListener("drop", function(e) {{
+      e.preventDefault(); form.classList.remove("drag-over");
+      if (e.dataTransfer && e.dataTransfer.files.length) handleFiles(e.dataTransfer.files);
+    }});
+    /* Ctrl+V / Paste */
+    document.addEventListener("paste", function(e) {{
+      const items = e.clipboardData && e.clipboardData.items;
+      if (!items) return;
+      const imageFiles = [];
+      for (const item of items) {{
+        if (item.type && item.type.startsWith("image/")) {{
+          const f = item.getAsFile();
+          if (f) imageFiles.push(f);
+        }}
+      }}
+      if (imageFiles.length) {{ e.preventDefault(); handleFiles(imageFiles); }}
     }});
     if (params.get("onboarding_saved") === "1") {{
       sessionStorage.removeItem("miniassistant_session");
@@ -1206,15 +1285,48 @@ async def chat_page(request: Request):
     form.addEventListener("submit", async (e) => {{
       e.preventDefault();
       const content = msgEl.value.trim();
-      if (!content) return;
+      if (!content && !pendingImages.length) return;
       msgEl.value = "";
       msgEl.style.height = "auto";
-      addLog("Du", content, false);
+      /* User-Message mit Bild-Thumbnails anzeigen */
+      const sentImages = pendingImages.slice();
+      if (sentImages.length) {{
+        const msgDiv = document.createElement("div");
+        msgDiv.className = "msg msg-user";
+        const roleDiv = document.createElement("div");
+        roleDiv.className = "msg-role user";
+        roleDiv.textContent = "Du";
+        msgDiv.appendChild(roleDiv);
+        const imagesDiv = document.createElement("div");
+        imagesDiv.className = "user-images";
+        sentImages.forEach(function(img) {{
+          const el = document.createElement("img");
+          el.src = "data:" + img.mime_type + ";base64," + img.data;
+          el.title = img.name || "Bild";
+          imagesDiv.appendChild(el);
+        }});
+        msgDiv.appendChild(imagesDiv);
+        if (content) {{
+          const contentDiv = document.createElement("div");
+          contentDiv.className = "content";
+          contentDiv.textContent = content;
+          msgDiv.appendChild(contentDiv);
+        }}
+        if (log.children.length > 0) {{
+          const sep = document.createElement("hr"); sep.className = "msg-sep"; log.appendChild(sep);
+        }}
+        log.appendChild(msgDiv);
+        log.scrollTop = log.scrollHeight;
+      }} else {{
+        addLog("Du", content, false);
+      }}
       showStreamContainer(content);
       btnSend.disabled = true; btnCancel.style.display = "";
       currentAbort = new AbortController();
       const url = "/api/chat/stream" + (token ? "?token=" + encodeURIComponent(token) : "");
-      const body = {{ message: content }};
+      const body = {{ message: content || "(Bild analysieren)" }};
+      if (sentImages.length) body.images = sentImages.map(function(img) {{ return {{ data: img.data, mime_type: img.mime_type }}; }});
+      pendingImages = []; renderPreview();
       if (sessionId) body.session_id = sessionId;
       if (params.get("track") === "1") body.track = true;
       try {{
@@ -1327,7 +1439,8 @@ async def api_ollama_models(request: Request):
     base_url = default_prov.get("base_url", "http://127.0.0.1:11434")
     try:
         from miniassistant.ollama_client import list_models
-        raw = list_models(base_url)
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(_chat_executor, lambda: list_models(base_url))
         names = [m.get("name") or m.get("model") or "" for m in (raw or []) if (m.get("name") or m.get("model"))]
         return JSONResponse({"models": names})
     except Exception as e:
@@ -1542,7 +1655,7 @@ async def api_schedule_run(request: Request, job_id: str):
             job_data["once"] = True
         job_data_json = _json.dumps(job_data, ensure_ascii=False)
         loop = asyncio.get_event_loop()
-        loop.run_in_executor(None, _run_scheduled_job, job_id, job_data_json)
+        loop.run_in_executor(_chat_executor, _run_scheduled_job, job_id, job_data_json)
         return JSONResponse({"ok": True, "message": f"Job {job_id[:8]} gestartet"})
     except HTTPException:
         raise
@@ -1562,7 +1675,8 @@ async def api_notify(request: Request):
     if client and client not in ("matrix", "discord"):
         raise HTTPException(status_code=400, detail="client muss 'matrix', 'discord' oder leer sein")
     from miniassistant.notify import send_notification
-    results = send_notification(message, client=client)
+    loop = asyncio.get_event_loop()
+    results = await loop.run_in_executor(_chat_executor, lambda: send_notification(message, client=client))
     return JSONResponse(results)
 
 
@@ -1632,7 +1746,7 @@ def _save_chat_to_file(session: dict, user_msg: str, assistant_msg: str) -> None
         _generate_title_bg(session, user_msg)
 
 
-def _chat_stream_generator(session_id: str, session: dict, message: str):
+def _chat_stream_generator(session_id: str, session: dict, message: str, images: list | None = None):
     """Sync generator: NDJSON-Zeilen mit type thinking | content | tool_call | done; fügt session_id hinzu."""
     lock = _get_session_lock(session_id)
     if not lock.acquire(timeout=5.0):
@@ -1640,12 +1754,12 @@ def _chat_stream_generator(session_id: str, session: dict, message: str):
         yield _json.dumps({"type": "done", "session_id": session_id, "content": "", "error": "Session wird bereits verwendet"}, ensure_ascii=False) + "\n"
         return
     try:
-        yield from _chat_stream_generator_locked(session_id, session, message)
+        yield from _chat_stream_generator_locked(session_id, session, message, images=images)
     finally:
         lock.release()
 
 
-def _chat_stream_generator_locked(session_id: str, session: dict, message: str):
+def _chat_stream_generator_locked(session_id: str, session: dict, message: str, images: list | None = None):
     """Interner Generator (mit Session-Lock gehalten)."""
     import json as _json
     for ev in chat_round_stream(
@@ -1655,6 +1769,7 @@ def _chat_stream_generator_locked(session_id: str, session: dict, message: str):
         model=session.get("model") or resolve_model(session["config"], None) or "",
         user_content=message,
         project_dir=session.get("project_dir"),
+        images=images,
     ):
         out = dict(ev, session_id=session_id)
         if ev.get("type") == "done":
@@ -1733,6 +1848,19 @@ async def api_chat_stream(request: Request):
         session["config"].pop("_client_tools", None)
         session["config"].pop("_tool_request_hook", None)
 
+    # Bilder aus Body extrahieren und validieren
+    _raw_images = body.get("images")
+    _chat_images = None
+    if _raw_images and isinstance(_raw_images, list):
+        _chat_images = []
+        for _img in _raw_images[:10]:  # Max 10 Bilder
+            if isinstance(_img, dict) and _img.get("data") and _img.get("mime_type"):
+                _mime = str(_img["mime_type"])
+                if _mime in ("image/jpeg", "image/png", "image/gif", "image/webp"):
+                    _chat_images.append({"data": str(_img["data"]), "mime_type": _mime})
+        if not _chat_images:
+            _chat_images = None
+
     if is_chat_command(message) or body.get("model"):
         is_new = message.strip().lower() == "/new"
         is_model_switch = message.strip().lower().startswith("/model ") or body.get("model")
@@ -1764,7 +1892,7 @@ async def api_chat_stream(request: Request):
 
     async def _stream_with_disconnect():
         """Wrapper: leitet sync generator weiter und signalisiert Cancellation bei Client-Disconnect."""
-        gen = _chat_stream_generator(session_id, session, message)
+        gen = _chat_stream_generator(session_id, session, message, images=_chat_images)
         loop = asyncio.get_event_loop()
         _done = False
 
@@ -2825,6 +2953,9 @@ async def workspace_page(request: Request):
 .ws-tab {{flex:1;padding:0.4rem 0.3rem;text-align:center;cursor:pointer;background:none;border:none;border-bottom:2px solid transparent;font-size:0.8rem;color:var(--muted)}}
 .ws-tab.active {{color:var(--primary);font-weight:600;border-bottom-color:var(--primary)}}
 .ws-tab:hover:not(.active) {{color:var(--primary)}}
+.ws-refresh-btn {{background:none;border:none;cursor:pointer;padding:0.4rem 0.55rem;color:var(--muted);font-size:1.1rem;line-height:1;transition:color 0.15s;display:inline-flex;align-items:center}}
+.ws-refresh-btn:hover {{color:var(--primary)}}
+.ws-refresh-btn.spinning {{animation:ws-spin 0.5s linear}}
 .ws-tree li {{border-bottom:1px solid var(--border)}}
 .ws-tree li:last-child {{border-bottom:none}}
 .ws-tree li.ws-frow {{display:flex;align-items:stretch}}
@@ -2846,6 +2977,7 @@ async def workspace_page(request: Request):
 .ws-viewer .md-body table {{border-collapse:collapse;width:100%}}
 .ws-viewer .md-body td,.ws-viewer .md-body th {{border:1px solid var(--border);padding:0.35rem 0.6rem}}
 .ws-viewer .md-body th {{background:var(--bg)}}
+@keyframes ws-spin {{from{{transform:rotate(0deg)}}to{{transform:rotate(360deg)}}}}
 .ws-filename {{font-weight:600;margin-bottom:0.8rem;color:var(--primary);font-size:0.95rem;word-break:break-all}}
 </style>
 <script src="/static/marked.umd.js"></script>
@@ -2866,6 +2998,7 @@ async def workspace_page(request: Request):
       <div class="ws-tree-hdr">
         <button class="ws-tab active" id="ws-tab-ws" onclick="wsSwitchTab('workspace')">Workspace</button>
         <button class="ws-tab" id="ws-tab-trash" onclick="wsSwitchTab('trash')">🗑️ Papierkorb</button>
+        <button class="ws-refresh-btn" id="ws-refresh-btn" onclick="wsRefresh()" title="Aktualisieren">&#x21BB;</button>
       </div>
       <div class="ws-tree" id="ws-tree" style="flex:1;border-top:none;border-radius:0 0 var(--radius) var(--radius)"><div class="ws-empty">Lade...</div></div>
     </div>
@@ -2903,6 +3036,17 @@ function wsSwitchTab(mode) {{
   document.getElementById('ws-viewer').innerHTML = '<div class="ws-empty">Datei auswählen</div>';
   if (mode === 'workspace') {{ wsLoadTree(WS_CURRENT_PATH); }}
   else {{ wsLoadTrash(); }}
+}}
+
+function wsRefresh() {{
+  var btn = document.getElementById('ws-refresh-btn');
+  btn.classList.remove('spinning');
+  void btn.offsetWidth;
+  btn.classList.add('spinning');
+  setTimeout(function() {{ btn.classList.remove('spinning'); }}, 600);
+  var isTrash = document.getElementById('ws-tab-trash').classList.contains('active');
+  if (isTrash) {{ wsLoadTrash(); }}
+  else {{ wsLoadTree(WS_CURRENT_PATH); }}
 }}
 
 function wsLoadTree(path) {{
@@ -3115,6 +3259,31 @@ async def api_workspace_file(request: Request):
         except Exception as e:
             return JSONResponse({"error": str(e)})
     return JSONResponse({"error": f"Dateityp '{ext}' wird nicht unterstützt"})
+
+
+@app.get("/api/img/{img_name}")
+async def api_serve_generated_image(img_name: str):
+    """Liefert ein generiertes Bild aus workspace/images/ anhand des Dateinamens (ohne Endung).
+    Kein Token nötig — der Dateiname ist durch Timestamp bereits unique genug für lokale Setups.
+    Permanent: kein Verfall, kein RAM-Registry."""
+    config = load_config()
+    workspace = Path(config.get("workspace") or "").expanduser().resolve()
+    if not workspace.is_dir():
+        raise HTTPException(status_code=404)
+    _mime_map = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                 ".gif": "image/gif", ".webp": "image/webp"}
+    # img_name kann mit oder ohne Extension kommen — beide Fälle abdecken
+    for ext, mime in _mime_map.items():
+        if img_name.lower().endswith(ext):
+            # img_name hat bereits Extension: direkt als Dateiname versuchen
+            candidate = (workspace / "images" / img_name).resolve()
+            if str(candidate).startswith(str(workspace)) and candidate.exists():
+                return FileResponse(str(candidate), media_type=mime)
+        # Fallback: Extension anhängen (Standard-Pfad)
+        candidate = (workspace / "images" / f"{img_name}{ext}").resolve()
+        if str(candidate).startswith(str(workspace)) and candidate.exists():
+            return FileResponse(str(candidate), media_type=mime)
+    raise HTTPException(status_code=404)
 
 
 @app.get("/api/workspace/raw")
