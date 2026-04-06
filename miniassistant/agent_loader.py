@@ -753,4 +753,6 @@ def build_system_prompt(
         _docs_reference_section(config),
         _vision_section(config),
         _voice_section(config),
-        "---\n*End of system instructions. Everything below is the co
+        "---\n*End of system instructions. Everything below is the conversation.*",
+    ]
+    return "\n".join(parts).strip()
