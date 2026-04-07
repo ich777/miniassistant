@@ -44,6 +44,38 @@ from threading import Thread as _Thread
 # Tools die sicher parallel ausgeführt werden können (kein shared state, kein Filesystem-Konflikt)
 _CONCURRENT_SAFE_TOOLS = frozenset({"invoke_model", "read_url", "check_url", "read_email"})
 
+
+def _save_uploaded_images(config: dict[str, Any], images: list[dict[str, Any]]) -> list[str]:
+    """Speichert hochgeladene Bilder (base64) auf Disk im Workspace/images/uploads/.
+    Gibt Liste der gespeicherten Pfade zurück. Wird benötigt damit das LLM
+    den Pfad an invoke_model(image_path=...) für Image Editing geben kann."""
+    import base64 as _b64
+    import uuid as _uuid
+    saved: list[str] = []
+    workspace = (config.get("workspace") or "").strip()
+    upload_dir = Path(workspace) / "images" / "uploads" if workspace else Path("images") / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    for img in images:
+        data = img.get("data", "")
+        mime = img.get("mime_type", "image/png")
+        if not data:
+            continue
+        ext = ".png"
+        if "jpeg" in mime or "jpg" in mime:
+            ext = ".jpg"
+        elif "webp" in mime:
+            ext = ".webp"
+        elif "gif" in mime:
+            ext = ".gif"
+        fpath = upload_dir / f"{_uuid.uuid4().hex}{ext}"
+        try:
+            fpath.write_bytes(_b64.b64decode(data))
+            saved.append(str(fpath))
+            _log.info("Uploaded image saved: %s (%d bytes)", fpath, fpath.stat().st_size)
+        except Exception as e:
+            _log.warning("Failed to save uploaded image: %s", e)
+    return saved
+
 # Keepalive-Intervall für Streaming (verhindert Socket-Timeout bei Modell-Laden)
 _KEEPALIVE_INTERVAL = 15.0  # Sekunden — unter den meisten Client-Timeouts (30-60s)
 _STREAM_DONE = object()      # Sentinel
@@ -140,12 +172,14 @@ def _clean_response(content: str, thinking: str) -> tuple[str, str]:
         thinking = (thinking + "\n" + extra).strip() if thinking else extra
     content = _strip_tool_call_tags(content)
     thinking = _strip_tool_call_tags(thinking)
-    content = _strip_hallucinated_base64(content)
+    content = _strip_hallucinated_images(content)
     return content, thinking
 
 
 _BASE64_IMG_RE = _re.compile(r'!\[[^\]]*\]\(data:image/[^;]+;base64,[A-Za-z0-9+/=\s]+\)')
 _NAKED_BASE64_RE = _re.compile(r'data:image/[^;]+;base64,[A-Za-z0-9+/=\s]{100,}')
+# Halluzinierte Bild-Markdown: ![...](/api/workspace/raw?path=...) oder ![...](images/...)
+_FAKE_IMG_MD_RE = _re.compile(r'!\[[^\]]*\]\(/(?:api/(?:workspace/raw|img)/?\??[^)]*)\)')
 
 
 def _has_hallucinated_base64(content: str) -> bool:
@@ -153,6 +187,24 @@ def _has_hallucinated_base64(content: str) -> bool:
     if "base64," not in content:
         return False
     return bool(_BASE64_IMG_RE.search(content) or _NAKED_BASE64_RE.search(content))
+
+
+def _has_hallucinated_image(content: str) -> bool:
+    """True wenn der Content halluzinierte Bild-Markdown enthält (base64 oder fake URLs)."""
+    if _has_hallucinated_base64(content):
+        return True
+    # Fake Workspace-Bild-URLs: ![...](/api/workspace/raw?path=images/...) etc.
+    return bool(_FAKE_IMG_MD_RE.search(content))
+
+
+def _strip_hallucinated_images(content: str) -> str:
+    """Entfernt halluzinierte Bild-Markdown aus dem Content (base64 UND fake URLs)."""
+    cleaned = content
+    if "base64," in cleaned:
+        cleaned = _BASE64_IMG_RE.sub("", cleaned)
+        cleaned = _NAKED_BASE64_RE.sub("", cleaned)
+    cleaned = _FAKE_IMG_MD_RE.sub("", cleaned)
+    return cleaned.strip()
 
 
 def _strip_hallucinated_base64(content: str) -> str:
@@ -1560,7 +1612,11 @@ def _run_tool(
                     _img_url = f"data:{_mime};base64,{_data}"
             # Deduplizieren: gleichen Pfad nicht zweimal senden
             # (passiert wenn Agent erst invoke_model, dann send_image für dasselbe Bild aufruft)
-            _already = any(img.get("url") == _img_url for img in config.get("_pending_images", []))
+            _img_stem = _img_p.stem
+            _already = any(
+                img.get("url") == _img_url or _img_stem in (img.get("url") or "")
+                for img in config.get("_pending_images", [])
+            )
             if not _already:
                 config.setdefault("_pending_images", []).append({
                     "url": _img_url,
@@ -1751,9 +1807,16 @@ def _run_tool(
             return "invoke_model not enabled (set subagents list in config or providers.<name>.models.subagents: true)"
         sub_model = arguments.get("model", "").strip()
         sub_msg = arguments.get("message", "").strip()
+        # Auto-select image gen model when model is missing but image_path is set
+        if not sub_model and arguments.get("image_path"):
+            from miniassistant.ollama_client import get_image_generation_models as _auto_img_models
+            _auto_models = _auto_img_models(config)
+            if _auto_models:
+                sub_model = _auto_models[0]
+                _log.info("invoke_model: auto-selected image model '%s' (model was missing)", sub_model)
         if not sub_model or not sub_msg:
             return "invoke_model requires 'model' and 'message'"
-        # Image generation parameters (optional, passed through to backend)
+        # Image generation/editing parameters (optional, passed through to backend)
         _img_params: dict[str, Any] = {}
         _img_size = arguments.get("size", "").strip() if isinstance(arguments.get("size"), str) else ""
         if _img_size:
@@ -1761,13 +1824,17 @@ def _run_tool(
         for _pk in ("steps", "seed"):
             if arguments.get(_pk) is not None:
                 _img_params[_pk] = int(arguments[_pk])
-        for _pk in ("cfg_scale", "guidance"):
+        for _pk in ("cfg_scale", "guidance", "strength"):
             if arguments.get(_pk) is not None:
                 _img_params[_pk] = float(arguments[_pk])
         for _pk in ("negative_prompt", "sampler", "scheduler"):
             _pv = arguments.get(_pk, "").strip() if isinstance(arguments.get(_pk), str) else ""
             if _pv:
                 _img_params[_pk] = _pv
+        # Image editing: source image path
+        _edit_image_path = (arguments.get("image_path") or "").strip()
+        if _edit_image_path:
+            _img_params["image_path"] = _edit_image_path
         if _img_params:
             config["_img_gen_params"] = _img_params
         else:
@@ -2373,7 +2440,21 @@ def _run_subagent_google(
         return err
     is_img_gen = _google_img_gen(api_model)
     sub_tools = get_subagent_tools_schema(config) if not is_img_gen else []
-    msgs: list[dict[str, Any]] = [{"role": "user", "content": user_msg}]
+    # Image Editing: Quellbild als inline image in der Message mitschicken
+    _explicit_g = config.get("_img_gen_params") or {}
+    _edit_src_g = _explicit_g.get("image_path", "").strip()
+    _user_msg_dict: dict[str, Any] = {"role": "user", "content": user_msg}
+    if is_img_gen and _edit_src_g:
+        from pathlib import Path as _PathG
+        _edit_p = _PathG(_edit_src_g)
+        if _edit_p.exists():
+            import base64 as _b64g
+            _mime_map_g = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                          ".webp": "image/webp", ".gif": "image/gif"}
+            _mime_g = _mime_map_g.get(_edit_p.suffix.lower(), "image/png")
+            _user_msg_dict["images"] = [{"data": _b64g.b64encode(_edit_p.read_bytes()).decode(), "mime_type": _mime_g}]
+            _log.info("Google image editing: injecting source image %s into request", _edit_src_g)
+    msgs: list[dict[str, Any]] = [_user_msg_dict]
     total_content = ""
     total_thinking = ""
     _ALLOWED_SUB_TOOLS = {"exec", "web_search", "check_url", "read_url"}
@@ -2502,12 +2583,12 @@ def _run_subagent_openai(
         _aal.log_subagent_result(config, resolved_name, err, "")
         return err
 
-    # Image Generation: DALL-E (Name-Check) ODER explizit in image_generation:-Config (z.B. LocalAI Flux)
+    # Image Generation/Editing: DALL-E (Name-Check) ODER explizit in image_generation:-Config (z.B. LocalAI Flux)
     _img_gen_models = get_image_generation_models(config)
     _is_img_gen = _oai_img_gen(api_model) or api_model in _img_gen_models or resolved_name in _img_gen_models
     if _is_img_gen:
         try:
-            from miniassistant.openai_client import api_generate_image
+            from miniassistant.openai_client import api_generate_image, api_edit_image
             import base64 as _b64
             from pathlib import Path as _Path
             import time as _time
@@ -2534,18 +2615,35 @@ def _run_subagent_openai(
                 if _cfg_m:
                     _img_kwargs["cfg_scale"] = float(_cfg_m.group(1))
             # Weitere Parameter direkt durchreichen (kein Regex-Fallback nötig)
-            for _ek in ("guidance", "seed", "negative_prompt", "sampler", "scheduler"):
+            for _ek in ("guidance", "seed", "negative_prompt", "sampler", "scheduler", "strength"):
                 if _explicit.get(_ek) is not None:
                     _img_kwargs[_ek] = _explicit[_ek]
             _quality_m = _img_re.search(r'\b(hd|high|hq|standard|low)\b', user_msg, _img_re.IGNORECASE)
             if _quality_m:
                 _q = _quality_m.group(1).lower()
                 _img_kwargs["quality"] = "hd" if _q in ("hd", "high", "hq") else "standard"
-            r = api_generate_image(
-                user_msg, api_key=api_key, model=api_model,
-                base_url=base_url or OPENAI_API_URL,
-                **_img_kwargs,
-            )
+            # Image Editing vs Generation: wenn image_path gesetzt → edit
+            _edit_src = _explicit.get("image_path", "").strip()
+            if _edit_src and _Path(_edit_src).exists():
+                _log.info("Image editing: source=%s, model=%s", _edit_src, api_model)
+                # quality ist kein Parameter von api_edit_image
+                _img_kwargs.pop("quality", None)
+                # image_api aus Provider-Config (z.B. "a1111" für A1111/Forge Backends)
+                _prov_cfg, _ = get_provider_config(config, resolved_name)
+                _image_api = str(_prov_cfg.get("image_api", "")).strip()
+                r = api_edit_image(
+                    user_msg, _edit_src,
+                    api_key=api_key, model=api_model,
+                    base_url=base_url or OPENAI_API_URL,
+                    image_api=_image_api,
+                    **_img_kwargs,
+                )
+            else:
+                r = api_generate_image(
+                    user_msg, api_key=api_key, model=api_model,
+                    base_url=base_url or OPENAI_API_URL,
+                    **_img_kwargs,
+                )
             workspace = (config.get("workspace") or "").strip()
             img_dir = _Path(workspace) / "images" if workspace else _Path("images")
             img_dir.mkdir(parents=True, exist_ok=True)
@@ -2565,7 +2663,8 @@ def _run_subagent_openai(
                     _log.warning("Image download from server URL %s failed: %s", _server_url, _dl_err)
             if b64_data:
                 fpath.write_bytes(_b64.b64decode(b64_data))
-                _log.info("DALL-E image generation: saved %s", fpath)
+                _op = "edited" if _edit_src else "generated"
+                _log.info("Image %s: saved %s", _op, fpath)
                 # Bild in _pending_images speichern (NICHT in Tool-Response!).
                 # base64 in der Tool-Response würde den LLM-Context sprengen → 500er.
                 _img_ctx = config.get("_chat_context") or {}
@@ -2578,11 +2677,13 @@ def _run_subagent_openai(
                     _img_url = f"{_api_base}/api/img/{fpath.stem}"
                 else:
                     _img_url = f"data:image/png;base64,{b64_data}"
+                _caption = "Bearbeitetes Bild" if _edit_src else "Generiertes Bild"
                 config.setdefault("_pending_images", []).append({
                     "url": _img_url,
-                    "caption": "Generiertes Bild",
+                    "caption": _caption,
                 })
-                result = f"Bild generiert und gespeichert: `{fpath}` (wird dem User inline angezeigt)"
+                _op_de = "bearbeitet" if _edit_src else "generiert"
+                result = f"Bild {_op_de} und gespeichert: `{fpath}` (wird dem User inline angezeigt)"
                 if r.get("revised_prompt"):
                     result += f"\n\nRevisierter Prompt: {r['revised_prompt']}"
             else:
@@ -2590,7 +2691,8 @@ def _run_subagent_openai(
             _aal.log_subagent_result(config, resolved_name, result, "")
             return result
         except Exception as e:
-            err = f"DALL-E Image Generation Fehler: {e}"
+            _op_name = "Image Edit" if (_explicit.get("image_path") or "").strip() else "Image Generation"
+            err = f"{_op_name} Fehler: {e}"
             _aal.log_subagent_result(config, resolved_name, err, "")
             return err
 
@@ -3266,14 +3368,16 @@ def chat_round(
                     _display_content = _strip_tool_call_tags(_msg_content)
 
                 if not tool_calls:
-                    # base64-Bild halluziniert? → strippen, Korrektur-Runde starten
-                    if _has_hallucinated_base64(_msg_content) and rounds < max_tool_rounds:
-                        _log.info("Halluziniertes base64-Bild erkannt — sende Korrektur-Nudge (Runde %d)", rounds)
-                        _stripped = _strip_hallucinated_base64(_msg_content)
-                        msgs.append({"role": "assistant", "content": _stripped or "(base64-Bild entfernt)", "thinking": msg.get("thinking") or ""})
+                    # Halluziniertes Bild erkannt (base64 oder fake URL)? → strippen, Korrektur-Runde starten
+                    if _has_hallucinated_image(_msg_content) and rounds < max_tool_rounds:
+                        _log.info("Halluziniertes Bild erkannt — sende Korrektur-Nudge (Runde %d)", rounds)
+                        _stripped = _strip_hallucinated_images(_msg_content)
+                        msgs.append({"role": "assistant", "content": _stripped or "(halluziniertes Bild entfernt)", "thinking": msg.get("thinking") or ""})
                         msgs.append({"role": "user", "content":
-                            "STOP. Du hast base64-Bilddaten in deiner Antwort ausgegeben. Das funktioniert NICHT — base64-Text ist kein echtes Bild. "
-                            "Nutze JETZT deine Tools: invoke_model um das Bild zu generieren, dann send_image um es zu senden."
+                            "STOP. Du hast ein Bild-Markdown in deiner Antwort ausgegeben (![...](...)). Das funktioniert NICHT — "
+                            "du kannst keine Bilder erzeugen indem du Markdown schreibst. Die URL die du geschrieben hast existiert NICHT. "
+                            "Nutze JETZT deine Tools: invoke_model(model='...', message='...') um das Bild zu generieren/bearbeiten, "
+                            "dann send_image(image_path='...') um es zu senden. Rufe die Tools JETZT auf."
                         })
                         rounds += 1
                         continue
@@ -3477,10 +3581,13 @@ def chat_round(
     _final_content, _final_thinking = _clean_response(total_content.strip(), total_thinking.strip())
 
     # Pending Images injizieren (send_image/Bildgenerierung für Web/API)
+    # Discord/Matrix senden Bilder direkt via notify.py, nicht als Markdown
     _pending_imgs = config.pop("_pending_images", [])
     if _pending_imgs:
-        _img_md = "\n\n".join(f"![{img['caption']}]({img['url']})" for img in _pending_imgs)
-        _final_content = f"{_final_content}\n\n{_img_md}" if _final_content else _img_md
+        _img_platform = (config.get("_chat_context") or {}).get("platform")
+        if _img_platform in ("web", "api"):
+            _img_md = "\n\n".join(f"![{img['caption']}]({img['url']})" for img in _pending_imgs)
+            _final_content = f"{_final_content}\n\n{_img_md}" if _final_content else _img_md
 
     # Pending Audio injizieren (send_audio für Web/API)
     _pending_auds = config.pop("_pending_audio", [])
@@ -3546,6 +3653,13 @@ def chat_round_stream(
         if not vision_model:
             yield {"type": "done", "thinking": "", "content": "Kein Vision-Modell konfiguriert. Bitte `vision` in der Config setzen (z.B. `vision: llava:13b`).", "new_messages": msgs}
             return
+        # Bilder auf Disk speichern (für Image Editing via invoke_model)
+        from miniassistant.ollama_client import get_image_generation_models as _get_img_models_stream
+        _img_gen_available_s = bool(_get_img_models_stream(config))
+        _saved_paths_s = _save_uploaded_images(config, images) if _img_gen_available_s else []
+        if _saved_paths_s:
+            _paths_info_s = "\n".join(f"- `{p}`" for p in _saved_paths_s)
+            user_content = f"{user_content}\n\n[Hochgeladenes Bild gespeichert unter:]\n{_paths_info_s}"
         user_content, images = describe_images_with_vl_model(config, images, user_content, model)
 
     user_msg: dict[str, Any] = {"role": "user", "content": user_content}
@@ -3782,16 +3896,18 @@ def chat_round_stream(
             _rc = round_content or full_msg.get("content") or ""
             _rt = round_thinking or full_msg.get("thinking") or ""
 
-            # base64-Bild halluziniert? → strippen, Korrektur-Runde starten
-            if _has_hallucinated_base64(_rc) and rounds < max_rounds:
-                _log.info("Halluziniertes base64-Bild im Stream erkannt — sende Korrektur-Nudge (Runde %d)", rounds)
+            # Halluziniertes Bild erkannt (base64 oder fake URL)? → strippen, Korrektur-Runde starten
+            if _has_hallucinated_image(_rc) and rounds < max_rounds:
+                _log.info("Halluziniertes Bild im Stream erkannt — sende Korrektur-Nudge (Runde %d)", rounds)
                 if _rc in total_content:
                     total_content = total_content.replace(_rc, "")
-                _stripped = _strip_hallucinated_base64(_rc)
-                msgs.append({"role": "assistant", "content": _stripped or "(base64-Bild entfernt)", "thinking": _rt})
+                _stripped = _strip_hallucinated_images(_rc)
+                msgs.append({"role": "assistant", "content": _stripped or "(halluziniertes Bild entfernt)", "thinking": _rt})
                 msgs.append({"role": "user", "content":
-                    "STOP. Du hast base64-Bilddaten in deiner Antwort ausgegeben. Das funktioniert NICHT — base64-Text ist kein echtes Bild. "
-                    "Nutze JETZT deine Tools: invoke_model um das Bild zu generieren, dann send_image um es zu senden."
+                    "STOP. Du hast ein Bild-Markdown in deiner Antwort ausgegeben (![...](...)). Das funktioniert NICHT — "
+                    "du kannst keine Bilder erzeugen indem du Markdown schreibst. Die URL die du geschrieben hast existiert NICHT. "
+                    "Nutze JETZT deine Tools: invoke_model(model='...', message='...') um das Bild zu generieren/bearbeiten, "
+                    "dann send_image(image_path='...') um es zu senden. Rufe die Tools JETZT auf."
                 })
                 rounds += 1
                 continue
@@ -3880,10 +3996,13 @@ def chat_round_stream(
             _done_content, _done_thinking = _clean_response(
                 "" if _sent_image else total_content.strip(), total_thinking.strip())
             # Pending Images injizieren
+            # Discord/Matrix senden Bilder direkt via notify.py, nicht als Markdown
             _pending_imgs = config.pop("_pending_images", [])
             if _pending_imgs:
-                _img_md = "\n\n".join(f"![{img['caption']}]({img['url']})" for img in _pending_imgs)
-                _done_content = f"{_done_content}\n\n{_img_md}" if _done_content else _img_md
+                _img_platform = (config.get("_chat_context") or {}).get("platform")
+                if _img_platform in ("web", "api"):
+                    _img_md = "\n\n".join(f"![{img['caption']}]({img['url']})" for img in _pending_imgs)
+                    _done_content = f"{_done_content}\n\n{_img_md}" if _done_content else _img_md
             # Pending Audio injizieren (send_audio für Web/API)
             _pending_auds = config.pop("_pending_audio", [])
             if _pending_auds:
@@ -4074,10 +4193,13 @@ def chat_round_stream(
     # Pending Images: Bilder die via send_image/Bildgenerierung erzeugt wurden,
     # werden hier in den finalen Content injiziert (NICHT in Tool-Response,
     # da base64-Daten den LLM-Context sprengen würden).
+    # Discord/Matrix senden Bilder direkt via notify.py, nicht als Markdown
     _pending_imgs = config.pop("_pending_images", [])
     if _pending_imgs:
-        _img_md = "\n\n".join(f"![{img['caption']}]({img['url']})" for img in _pending_imgs)
-        _final_content = f"{_final_content}\n\n{_img_md}" if _final_content else _img_md
+        _img_platform = (config.get("_chat_context") or {}).get("platform")
+        if _img_platform in ("web", "api"):
+            _img_md = "\n\n".join(f"![{img['caption']}]({img['url']})" for img in _pending_imgs)
+            _final_content = f"{_final_content}\n\n{_img_md}" if _final_content else _img_md
 
     # Pending Audio injizieren (send_audio für Web/API)
     _pending_auds = config.pop("_pending_audio", [])
@@ -4283,6 +4405,13 @@ def handle_user_input(
             return "Kein Vision-Modell konfiguriert. Bitte `vision` in der Config setzen (z.B. `vision: llava:13b`).", session, None, None, None, None
         mime_types = [img.get("mime_type", "?") if isinstance(img, dict) else "?" for img in images]
         _aal.log_image_received(config, len(images), mime_types, vision_model=vision_model if vision_model != model else "")
+        # Bilder auf Disk speichern (für Image Editing via invoke_model)
+        from miniassistant.ollama_client import get_image_generation_models as _get_img_models_ui
+        _img_gen_available = bool(_get_img_models_ui(config))
+        _saved_paths = _save_uploaded_images(config, images) if _img_gen_available else []
+        if _saved_paths:
+            _paths_info = "\n".join(f"- `{p}`" for p in _saved_paths)
+            rest = f"{rest}\n\n[Hochgeladenes Bild gespeichert unter:]\n{_paths_info}"
         rest, images = describe_images_with_vl_model(config, images, rest, model)
 
     # Chat-Kontext (room_id/channel_id) in System-Prompt injizieren

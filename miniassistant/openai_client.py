@@ -636,16 +636,50 @@ def api_generate_image(
         body["response_format"] = "b64_json"
         body["size"] = size
 
-    def _parse(resp: dict) -> dict:
-        data = (resp.get("data") or [{}])[0]
-        b64 = data.get("b64_json", "")
-        if not b64 and data.get("url", "").startswith("data:"):
-            # Some backends return data-URI instead of b64_json field
-            b64 = data["url"].split(",", 1)[-1]
+    def _parse(resp) -> dict:
+        import base64 as _b64
+        from urllib.parse import urljoin
+        # Normalize response — some backends return list or nested structures
+        if isinstance(resp, list):
+            data = resp[0] if resp else {}
+        elif isinstance(resp, dict):
+            if isinstance(resp.get("data"), list):
+                data = resp["data"][0] if resp["data"] else {}
+            else:
+                data = resp
+        else:
+            data = {}
+
+        b64 = ""
+        img_url = ""
+
+        if isinstance(data, dict):
+            img_url = data.get("url", "")
+            b64 = data.get("b64_json", "")
+
+            # Handle data URI (some backends return data-URI instead of b64_json)
+            if not b64 and isinstance(img_url, str) and img_url.startswith("data:"):
+                b64 = img_url.split(",", 1)[-1]
+
+            # Fetch from HTTP URL (e.g. OpenWebUI file endpoint)
+            if not b64 and img_url and not img_url.startswith("data:"):
+                full_url = urljoin(base_url, img_url) if not img_url.startswith(("http://", "https://")) else img_url
+                headers = {}
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                try:
+                    _r = httpx.get(full_url, headers=headers, timeout=120)
+                    _r.raise_for_status()
+                    content_type = _r.headers.get("content-type", "")
+                    if "image" in content_type:
+                        b64 = _b64.b64encode(_r.content).decode("utf-8")
+                except Exception:
+                    pass  # Caller has its own URL fallback
+
         return {
             "b64_json": b64,
-            "url": data.get("url", ""),
-            "revised_prompt": data.get("revised_prompt", ""),
+            "url": img_url,
+            "revised_prompt": data.get("revised_prompt", "") if isinstance(data, dict) else "",
             "mime_type": "image/png",
         }
 
@@ -666,6 +700,173 @@ def api_generate_image(
         raise RuntimeError(f"OpenAI Image Generation Fehler ({e.response.status_code}): {detail}")
     except Exception as e:
         raise RuntimeError(f"OpenAI Image Generation nicht erreichbar: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Image Editing (img2img) — POST /v1/images/edits
+# ═══════════════════════════════════════════════════════════════════════════
+
+def api_edit_image(
+    prompt: str,
+    image_path: str,
+    *,
+    api_key: str,
+    model: str = "dall-e-2",
+    size: str = "1024x1024",
+    base_url: str = OPENAI_API_URL,
+    timeout: int = 600,
+    mask_path: str | None = None,
+    steps: int | None = None,
+    cfg_scale: float | None = None,
+    guidance: float | None = None,
+    strength: float | None = None,
+    sampler: str | None = None,
+    scheduler: str | None = None,
+    seed: int | None = None,
+    negative_prompt: str | None = None,
+    image_api: str = "",
+) -> dict[str, Any]:
+    """
+    Image Editing (img2img).
+    image_api steuert den Endpunkt:
+      - "" (leer/default): OpenAI-kompatibel — POST /v1/images/edits multipart/form-data.
+        Für echtes OpenAI und sd-server/LocalAI (die /edits unterstützen).
+      - "a1111": POST /sdapi/v1/img2img mit JSON body (A1111/Forge/ComfyUI-kompatibel).
+    Fallback: wenn /v1/images/edits fehlschlägt → automatisch /sdapi/v1/img2img probieren.
+    Returns: {b64_json: str, url: str, revised_prompt: str, mime_type: str}.
+    """
+    import base64 as _b64
+    from pathlib import Path as _Path
+
+    url = _api_url(base_url, "/images/edits")
+    is_openai = OPENAI_API_URL in base_url
+    img_p = _Path(image_path)
+    if not img_p.exists():
+        raise RuntimeError(f"Quellbild nicht gefunden: {image_path}")
+
+    img_bytes = img_p.read_bytes()
+    img_mime = "image/png"
+    _suffix = img_p.suffix.lower()
+    if _suffix in (".jpg", ".jpeg"):
+        img_mime = "image/jpeg"
+    elif _suffix == ".webp":
+        img_mime = "image/webp"
+
+    def _parse(resp: dict) -> dict:
+        data = (resp.get("data") or [{}])[0]
+        b64 = data.get("b64_json", "")
+        img_url = data.get("url", "")
+        if not b64 and img_url and img_url.startswith("data:"):
+            b64 = img_url.split(",", 1)[-1]
+        if not b64 and img_url and not img_url.startswith("data:"):
+            full_url = urljoin(base_url, img_url) if not img_url.startswith(("http://", "https://")) else img_url
+            headers = {}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            try:
+                _r = httpx.get(full_url, headers=headers, timeout=120)
+                _r.raise_for_status()
+                if "image" in _r.headers.get("content-type", ""):
+                    b64 = _b64.b64encode(_r.content).decode("utf-8")
+            except Exception:
+                pass
+        return {
+            "b64_json": b64,
+            "url": img_url,
+            "revised_prompt": data.get("revised_prompt", "") if isinstance(data, dict) else "",
+            "mime_type": "image/png",
+        }
+
+    img_b64 = _b64.b64encode(img_bytes).decode("utf-8")
+    _api = (image_api or "").strip().lower()
+
+    # --- Hilfsfunktionen für die beiden Protokolle ---
+
+    def _try_openai_edits() -> dict[str, Any]:
+        """OpenAI-kompatibel: POST /v1/images/edits mit multipart/form-data.
+        Funktioniert mit echtem OpenAI, sd-server und LocalAI."""
+        # Extra-Parameter als <sd_cpp_extra_args> im Prompt einbetten (sd-server)
+        _prompt = prompt
+        _extra: dict[str, Any] = {}
+        if not is_openai:
+            if steps is not None: _extra["steps"] = steps
+            if cfg_scale is not None: _extra["cfg_scale"] = cfg_scale
+            if guidance is not None: _extra["guidance"] = guidance
+            if strength is not None: _extra["strength"] = strength
+            if sampler is not None: _extra["sample_method"] = sampler
+            if scheduler is not None: _extra["scheduler"] = scheduler
+            if seed is not None: _extra["seed"] = seed
+            if negative_prompt is not None: _extra["negative_prompt"] = negative_prompt
+            if _extra:
+                _prompt = f"{prompt}<sd_cpp_extra_args>{json.dumps(_extra)}</sd_cpp_extra_args>"
+        _files: dict[str, Any] = {"image": (img_p.name, img_bytes, img_mime)}
+        _form: dict[str, Any] = {"prompt": _prompt, "model": model, "size": size}
+        if is_openai:
+            _form["response_format"] = "b64_json"
+        if mask_path:
+            _mp = _Path(mask_path)
+            if _mp.exists():
+                _files["mask"] = (_mp.name, _mp.read_bytes(), "image/png")
+        _hdrs = {}
+        if api_key:
+            _hdrs["Authorization"] = f"Bearer {api_key}"
+        r = httpx.post(url, headers=_hdrs, data=_form, files=_files, timeout=timeout)
+        r.raise_for_status()
+        return _parse(r.json())
+
+    def _try_a1111_img2img() -> dict[str, Any]:
+        """A1111-kompatibel: POST /sdapi/v1/img2img mit JSON body.
+        Funktioniert mit A1111, Forge, ComfyUI und sd-server."""
+        _w, _h = 1024, 1024
+        _sp = size.split("x")
+        if len(_sp) == 2:
+            try: _w, _h = int(_sp[0]), int(_sp[1])
+            except ValueError: pass
+        _url = base_url.rstrip("/") + "/sdapi/v1/img2img"
+        _body: dict[str, Any] = {
+            "prompt": prompt,
+            "init_images": [img_b64],
+            "denoising_strength": strength if strength is not None else 0.75,
+            "width": _w, "height": _h,
+        }
+        if negative_prompt is not None: _body["negative_prompt"] = negative_prompt
+        if steps is not None: _body["steps"] = steps
+        if cfg_scale is not None: _body["cfg_scale"] = cfg_scale
+        if seed is not None: _body["seed"] = seed
+        if sampler is not None: _body["sampler_name"] = sampler
+        if scheduler is not None: _body["scheduler"] = scheduler
+        if mask_path:
+            _mp = _Path(mask_path)
+            if _mp.exists():
+                _body["mask"] = _b64.b64encode(_mp.read_bytes()).decode("utf-8")
+        r = httpx.post(_url, headers=_api_headers(api_key), json=_body, timeout=timeout)
+        r.raise_for_status()
+        _resp = r.json()
+        _imgs = _resp.get("images") or []
+        return {"b64_json": _imgs[0] if _imgs else "", "url": "", "revised_prompt": "", "mime_type": "image/png"}
+
+    # --- Routing basierend auf image_api Config ---
+
+    if _api == "a1111":
+        # Explizit A1111/Forge konfiguriert → direkt /sdapi/v1/img2img
+        try:
+            return _try_a1111_img2img()
+        except Exception as e:
+            raise RuntimeError(f"Image Edit Fehler (/sdapi/v1/img2img): {e}")
+
+    # Default: OpenAI-kompatibel (/v1/images/edits multipart)
+    # Bei lokalen Backends: Fallback auf A1111 wenn /edits fehlschlägt
+    try:
+        return _try_openai_edits()
+    except Exception as _edit_err:
+        if is_openai:
+            raise RuntimeError(f"OpenAI Image Edit Fehler: {_edit_err}")
+        _log.info("/v1/images/edits failed (%s), trying /sdapi/v1/img2img fallback", _edit_err)
+
+    try:
+        return _try_a1111_img2img()
+    except Exception as _a1111_err:
+        raise RuntimeError(f"Image Edit fehlgeschlagen — /v1/images/edits: {_edit_err} | /sdapi/v1/img2img: {_a1111_err}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

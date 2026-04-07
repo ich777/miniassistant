@@ -594,12 +594,14 @@ def _tools_schema(
             "type": "function",
             "function": {
                 "name": "invoke_model",
-                "description": "Delegate a task to another model (subagent) by name or alias. Use e.g. for compiling (qwen-coder), code review, or specialized tasks. Returns the other model's reply. For image generation models: pass the image prompt as message, and use the optional size/steps/cfg_scale parameters to control generation.",
+                "description": "Delegate a task to another model (subagent) by name or alias. Use e.g. for compiling (qwen-coder), code review, or specialized tasks. Returns the other model's reply. For image generation models: pass the image prompt as message. For image EDITING (img2img): pass image_path with the source image and the edit prompt as message.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "model": {"type": "string", "description": "Model name or alias (e.g. qwen2.5-coder:14b or alias 'compiler')"},
-                        "message": {"type": "string", "description": "Task or question to delegate (e.g. 'Review this code: ...'). Pass the task itself — NEVER a pre-written answer. For image generation: the image prompt."},
+                        "message": {"type": "string", "description": "Task or question to delegate (e.g. 'Review this code: ...'). Pass the task itself — NEVER a pre-written answer. For image generation/editing: the image prompt describing what to generate or how to edit."},
+                        "image_path": {"type": "string", "description": "Path to source image for image EDITING (img2img). When set, the image generation model will edit/transform this image based on the prompt instead of generating from scratch. Use the path from the [Hochgeladenes Bild] info."},
+                        "strength": {"type": "number", "description": "How much to change the source image (0.0 = keep original, 1.0 = ignore original). Default depends on backend. Only for image editing."},
                         "size": {"type": "string", "description": "Image size for image generation models (e.g. '512x512', '1024x1024'). Default: 1024x1024."},
                         "steps": {"type": "integer", "description": "Number of diffusion steps. Only pass when the user explicitly requests a specific step count."},
                         "cfg_scale": {"type": "number", "description": "CFG scale. Only pass when the user explicitly requests it."},

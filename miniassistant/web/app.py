@@ -990,7 +990,7 @@ async def chat_page(request: Request):
     <form id="f" class="chat-input">
       <div id="img-preview"></div>
       <div class="chat-input-row">
-        <button type="button" class="btn-img-upload" id="btn-img" title="Bild hochladen (oder Drag&amp;Drop / Ctrl+V)">&#128247;</button>
+        <button type="button" class="btn-img-upload" id="btn-img" title="Bild hochladen zum Analysieren oder Bearbeiten (Drag&amp;Drop / Ctrl+V)">&#128247;</button>
         <input type="file" id="img-input" accept="image/*" multiple style="display:none;">
         <textarea id="msg" placeholder="Nachricht… (Enter = Senden, Shift+Enter = Zeile)" rows="2" autocomplete="off"></textarea>
         <button type="submit" class="btn btn-primary" id="btn-send">Senden</button>
@@ -1326,7 +1326,7 @@ async def chat_page(request: Request):
       btnSend.disabled = true; btnCancel.style.display = "";
       currentAbort = new AbortController();
       const url = "/api/chat/stream" + (token ? "?token=" + encodeURIComponent(token) : "");
-      const body = {{ message: content || "(Bild analysieren)" }};
+      const body = {{ message: content || "(Bild analysieren / bearbeiten)" }};
       if (sentImages.length) body.images = sentImages.map(function(img) {{ return {{ data: img.data, mime_type: img.mime_type }}; }});
       pendingImages = []; renderPreview();
       if (sessionId) body.session_id = sessionId;
@@ -2973,7 +2973,9 @@ async def workspace_page(request: Request):
 .ws-empty-trash-btn {{display:block;width:calc(100% - 1.2rem);margin:0.6rem auto;background:#e53e3e;color:#fff;border:none;border-radius:var(--radius);padding:0.45rem;cursor:pointer;font-size:0.82rem}}
 .ws-empty-trash-btn:hover {{opacity:0.85}}
 .ws-empty {{color:var(--muted);font-size:0.9rem;padding:1rem}}
-.ws-viewer img {{max-width:100%;max-height:calc(100vh - 260px);object-fit:contain;display:block;border-radius:var(--radius)}}
+.ws-viewer img {{max-width:100%;max-height:calc(100vh - 260px);object-fit:contain;display:block;border-radius:var(--radius);cursor:zoom-in}}
+.ws-lightbox {{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.85);z-index:9999;display:flex;align-items:center;justify-content:center;cursor:zoom-out}}
+.ws-lightbox img {{max-width:95vw;max-height:95vh;object-fit:contain;border-radius:var(--radius);box-shadow:0 0 40px rgba(0,0,0,0.5)}}
 .ws-viewer pre {{background:var(--bg);padding:1rem;border-radius:var(--radius);overflow:auto;font-size:0.82rem;white-space:pre-wrap;word-break:break-all}}
 .ws-viewer .md-body h1,.ws-viewer .md-body h2,.ws-viewer .md-body h3 {{margin-top:1rem}}
 .ws-viewer .md-body code {{background:var(--bg);padding:0.1em 0.3em;border-radius:3px;font-size:0.85em}}
@@ -2984,6 +2986,10 @@ async def workspace_page(request: Request):
 .ws-viewer .md-body th {{background:var(--bg)}}
 @keyframes ws-spin {{from{{transform:rotate(0deg)}}to{{transform:rotate(360deg)}}}}
 .ws-filename {{font-weight:600;margin-bottom:0.8rem;color:var(--primary);font-size:0.95rem;word-break:break-all}}
+.ws-sort-bar {{display:flex;align-items:center;gap:0.3rem;padding:0.3rem 0.5rem;background:var(--card);border:1px solid var(--border);border-top:none;font-size:0.75rem}}
+.ws-sort-bar select {{font-size:0.75rem;padding:0.15rem 0.3rem;border:1px solid var(--border);border-radius:3px;background:var(--bg);color:var(--text);cursor:pointer}}
+.ws-sort-bar button {{font-size:0.75rem;padding:0.15rem 0.4rem;border:1px solid var(--border);border-radius:3px;background:var(--bg);color:var(--text);cursor:pointer;line-height:1}}
+.ws-sort-bar button:hover {{color:var(--primary);border-color:var(--primary)}}
 </style>
 <script src="/static/marked.umd.js"></script>
     <script src="/static/purify.min.js"></script>
@@ -3005,6 +3011,14 @@ async def workspace_page(request: Request):
         <button class="ws-tab" id="ws-tab-trash" onclick="wsSwitchTab('trash')">🗑️ Papierkorb</button>
         <button class="ws-refresh-btn" id="ws-refresh-btn" onclick="wsRefresh()" title="Aktualisieren">&#x21BB;</button>
       </div>
+      <div class="ws-sort-bar" id="ws-sort-bar">
+        <span style="color:var(--muted)">Sortierung:</span>
+        <select id="ws-sort-by" onchange="wsSortChanged()">
+          <option value="name">Name</option>
+          <option value="date">Datum</option>
+        </select>
+        <button id="ws-sort-dir" onclick="wsToggleSortDir()" title="Sortierrichtung umschalten">↑ A-Z</button>
+      </div>
       <div class="ws-tree" id="ws-tree" style="flex:1;border-top:none;border-radius:0 0 var(--radius) var(--radius)"><div class="ws-empty">Lade...</div></div>
     </div>
     <div class="ws-viewer" id="ws-viewer"><div class="ws-empty">Datei auswählen</div></div>
@@ -3014,6 +3028,69 @@ async def workspace_page(request: Request):
 <script>
 var WS_TOKEN = {repr(token_val)};
 var WS_CURRENT_PATH = '';
+
+function wsGetSort() {{
+  return {{
+    by: localStorage.getItem('ws_sort_by') || 'name',
+    dir: localStorage.getItem('ws_sort_dir') || 'asc'
+  }};
+}}
+
+function wsSetSort(by, dir) {{
+  localStorage.setItem('ws_sort_by', by);
+  localStorage.setItem('ws_sort_dir', dir);
+}}
+
+function wsUpdateSortUI() {{
+  var s = wsGetSort();
+  document.getElementById('ws-sort-by').value = s.by;
+  var btn = document.getElementById('ws-sort-dir');
+  if (s.by === 'name') {{
+    btn.textContent = s.dir === 'asc' ? '↑ A-Z' : '↓ Z-A';
+  }} else {{
+    btn.textContent = s.dir === 'asc' ? '↑ Älteste' : '↓ Neueste';
+  }}
+}}
+
+function wsSortChanged() {{
+  var by = document.getElementById('ws-sort-by').value;
+  var s = wsGetSort();
+  wsSetSort(by, s.dir);
+  wsUpdateSortUI();
+  wsRefreshTree();
+}}
+
+function wsToggleSortDir() {{
+  var s = wsGetSort();
+  wsSetSort(s.by, s.dir === 'asc' ? 'desc' : 'asc');
+  wsUpdateSortUI();
+  wsRefreshTree();
+}}
+
+function wsRefreshTree() {{
+  var isTrash = document.getElementById('ws-tab-trash').classList.contains('active');
+  if (isTrash) wsLoadTrash();
+  else wsLoadTree(WS_CURRENT_PATH);
+}}
+
+function wsSortItems(items) {{
+  var s = wsGetSort();
+  var dirs = items.filter(function(i) {{ return i.type === 'dir'; }});
+  var files = items.filter(function(i) {{ return i.type !== 'dir'; }});
+  function cmp(a, b) {{
+    if (s.by === 'date') {{
+      var at = a.mtime_ts || 0, bt = b.mtime_ts || 0;
+      return s.dir === 'asc' ? at - bt : bt - at;
+    }} else {{
+      var an = a.name.toLowerCase(), bn = b.name.toLowerCase();
+      var r = an < bn ? -1 : (an > bn ? 1 : 0);
+      return s.dir === 'asc' ? r : -r;
+    }}
+  }}
+  dirs.sort(cmp);
+  files.sort(cmp);
+  return dirs.concat(files);
+}}
 
 function wsApiUrl(endpoint, params) {{
   var u = new URL('/api/workspace/' + endpoint, location.origin);
@@ -3062,12 +3139,13 @@ function wsLoadTree(path) {{
     .then(function(r) {{ return r.json(); }})
     .then(function(data) {{
       if (data.error) {{ tree.innerHTML = '<div class="ws-empty">' + wsEscape(data.error) + '</div>'; return; }}
+      var sortedItems = wsSortItems(data.items);
       var html = '<ul>';
       if (WS_CURRENT_PATH) {{
         var parent = WS_CURRENT_PATH.includes('/') ? WS_CURRENT_PATH.split('/').slice(0,-1).join('/') : '';
         html += '<li><a data-dir="' + wsEscape(parent) + '">⬆️ ..</a></li>';
       }}
-      data.items.forEach(function(item) {{
+      sortedItems.forEach(function(item) {{
         if (item.type === 'dir') {{
           html += '<li class="ws-frow"><a data-dir="' + wsEscape(item.path) + '" title="' + wsEscape(item.name) + '" style="flex:1">' + wsIcon(item) + ' ' + wsEscape(item.name) + '</a>'
                 + '<button class="ws-del-btn" data-delete="' + wsEscape(item.path) + '" title="In Papierkorb verschieben">🗑️</button></li>';
@@ -3159,7 +3237,8 @@ function wsLoadFile(path) {{
       var name = path.split('/').pop();
       var html = '<div class="ws-filename">' + wsEscape(name) + '</div>';
       if (data.type === 'image') {{
-        html += '<img src="' + wsApiUrl('raw', {{path: path}}) + '" alt="' + wsEscape(name) + '">';
+        var imgUrl = wsApiUrl('raw', {{path: path}});
+        html += '<img src="' + imgUrl + '" alt="' + wsEscape(name) + '" onclick="wsOpenLightbox(this.src)" title="Klicken für Originalgröße">';
       }} else if (data.type === 'markdown') {{
         html += '<div class="md-body">' + DOMPurify.sanitize(marked.parse(data.content)) + '</div>';
       }} else {{
@@ -3182,7 +3261,8 @@ function wsLoadTrashFile(path) {{
       var name = path.split('/').pop();
       var html = '<div class="ws-filename">' + wsEscape(name) + '</div>';
       if (data.type === 'image') {{
-        html += '<img src="' + wsApiUrl('trash/raw', {{path: path}}) + '" alt="' + wsEscape(name) + '">';
+        var imgUrl = wsApiUrl('trash/raw', {{path: path}});
+        html += '<img src="' + imgUrl + '" alt="' + wsEscape(name) + '" onclick="wsOpenLightbox(this.src)" title="Klicken für Originalgröße">';
       }} else if (data.type === 'markdown') {{
         html += '<div class="md-body">' + DOMPurify.sanitize(marked.parse(data.content)) + '</div>';
       }} else {{
@@ -3193,6 +3273,18 @@ function wsLoadTrashFile(path) {{
     .catch(function(err) {{ viewer.innerHTML = '<div class="ws-empty">Fehler: ' + wsEscape(String(err)) + '</div>'; }});
 }}
 
+function wsOpenLightbox(src) {{
+  var overlay = document.createElement('div');
+  overlay.className = 'ws-lightbox';
+  overlay.innerHTML = '<img src="' + src.replace(/"/g, '&quot;') + '">';
+  overlay.addEventListener('click', function() {{ overlay.remove(); }});
+  document.addEventListener('keydown', function handler(e) {{
+    if (e.key === 'Escape') {{ overlay.remove(); document.removeEventListener('keydown', handler); }}
+  }});
+  document.body.appendChild(overlay);
+}}
+
+wsUpdateSortUI();
 wsLoadTree('');
 </script>
 {_THEME_JS}
@@ -3224,7 +3316,7 @@ async def api_workspace_files(request: Request):
         rel_path = str(p.relative_to(workspace))
         st = p.stat()
         if p.is_dir():
-            items.append({"name": p.name, "type": "dir", "path": rel_path, "size": ""})
+            items.append({"name": p.name, "type": "dir", "path": rel_path, "size": "", "mtime_ts": st.st_mtime})
         else:
             size = st.st_size
             size_str = f"{size}B" if size < 1024 else (f"{size//1024}KB" if size < 1024*1024 else f"{size//1024//1024}MB")
@@ -3233,7 +3325,7 @@ async def api_workspace_files(request: Request):
                 mtime_str = mt.strftime("%d.%m. %H:%M")
             else:
                 mtime_str = mt.strftime("%d.%m.%y %H:%M")
-            items.append({"name": p.name, "type": "file", "path": rel_path, "size": size_str, "mtime": mtime_str})
+            items.append({"name": p.name, "type": "file", "path": rel_path, "size": size_str, "mtime": mtime_str, "mtime_ts": st.st_mtime})
     return JSONResponse({"items": items, "path": str(rel)})
 
 

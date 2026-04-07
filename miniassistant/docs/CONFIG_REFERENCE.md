@@ -106,9 +106,16 @@ vision:
 # Short form also works: vision: "llava:13b"
 
 image_generation:
-  model: "stable-diffusion"              # Image generation model
-  num_ctx: 32768
+  - "llama-swap/flux.2-klein-9b"          # Image generation model (list of model names)
+  - "openai/dall-e-3"
 # Short form: image_generation: "stable-diffusion"
+# Provider with image_api for img2img backend selection:
+#   providers:
+#     sd-server:
+#       type: openai-compat
+#       base_url: http://127.0.0.1:8080
+#       image_api: ""                       # "" = OpenAI-compat /v1/images/edits (default, works with sd-server/LocalAI)
+#                                           # "a1111" = /sdapi/v1/img2img (for A1111/Forge/ComfyUI backends)
 
 voice:
   stt:

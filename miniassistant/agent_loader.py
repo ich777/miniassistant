@@ -651,13 +651,19 @@ def _vision_section(config: dict[str, Any]) -> str:
         models_str = ", ".join(f"`{m}`" for m in img_gen_models)
         # Konkretes Aufruf-Beispiel mit erstem Modellnamen statt Platzhalter
         example_model = img_gen_models[0]
-        lines.append(f"- **Image generation models:** {models_str}.")
+        lines.append(f"- **Image generation & editing models:** {models_str}.")
         lines.append(f"  Generate images: `invoke_model(model='{example_model}', message='YOUR PROMPT')`")
-        lines.append(f"  Optional parameters: `size`, `steps`, `cfg_scale`, `guidance`, `seed`, `negative_prompt`, `sampler`, `scheduler`.")
+        lines.append(f"  Edit images: `invoke_model(model='{example_model}', message='EDIT PROMPT', image_path='/path/to/source.png')`")
+        lines.append(f"  **IMPORTANT: `model` is ALWAYS required for invoke_model.** Never omit it.")
+        lines.append(f"  When user uploads an image, the path appears as `[Hochgeladenes Bild gespeichert unter:]` — use that path as `image_path`.")
+        lines.append(f"  Optional parameters: `size`, `steps`, `cfg_scale`, `guidance`, `seed`, `negative_prompt`, `sampler`, `scheduler`, `strength`.")
         lines.append(f"  **Only pass these parameters when the user explicitly requests them.** Do NOT invent default values. If the user says nothing about steps/cfg/size, omit them entirely — the server has sensible defaults.")
         lines.append(f"  **Copy the model name EXACTLY as shown — including any `provider/` prefix.**")
+        docs = _docs_dir_path(config)
+        img_doc = str(docs / "IMAGE_GENERATION.md") if docs else "docs/IMAGE_GENERATION.md"
+        lines.append(f"  For details on generate vs edit: read `{img_doc}`.")
         lines.append(
-            "- **After generating an image:** Use `send_image(image_path='/path/to/image.png', caption='...')` to upload it to the current chat. "
+            "- **After generating/editing an image:** Use `send_image(image_path='/path/to/image.png', caption='...')` to upload it to the current chat. "
             "The tool handles Matrix upload (via bot client, E2EE-capable), Discord upload, and Web-UI automatically. No curl needed.\n"
             "  **After a successful `send_image`: do NOT reply with text.** The user already sees the image — a confirmation message would be redundant. Only reply if the tool fails."
         )

@@ -386,6 +386,14 @@ async def chat_completions(request: Request):
     # Vision: Bildbeschreibung via VL-Modell injizieren (falls nötig)
     _ns_images = _vl_images
     if _ns_images:
+        # Bilder auf Disk speichern (für Image Editing via invoke_model)
+        from miniassistant.ollama_client import get_image_generation_models as _get_img_models_ns
+        from miniassistant.chat_loop import _save_uploaded_images
+        if _get_img_models_ns(config):
+            _saved_ns = _save_uploaded_images(config, _ns_images)
+            if _saved_ns:
+                _paths_ns = "\n".join(f"- `{p}`" for p in _saved_ns)
+                user_content = f"{user_content}\n\n[Hochgeladenes Bild gespeichert unter:]\n{_paths_ns}"
         user_content, _ns_images = await loop.run_in_executor(
             _chat_executor,
             lambda: describe_images_with_vl_model(config, _ns_images, user_content, resolved),
@@ -462,6 +470,14 @@ def _stream_generator(
 
     # Vision: Bildbeschreibung via VL-Modell injizieren (falls nötig)
     if images:
+        # Bilder auf Disk speichern (für Image Editing via invoke_model)
+        from miniassistant.ollama_client import get_image_generation_models as _get_img_models_api
+        from miniassistant.chat_loop import _save_uploaded_images
+        if _get_img_models_api(config):
+            _saved_api = _save_uploaded_images(config, images)
+            if _saved_api:
+                _paths_api = "\n".join(f"- `{p}`" for p in _saved_api)
+                user_content = f"{user_content}\n\n[Hochgeladenes Bild gespeichert unter:]\n{_paths_api}"
         user_content, images = describe_images_with_vl_model(config, images, user_content, model)
 
     total_content = ""
