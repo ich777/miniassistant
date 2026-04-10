@@ -143,6 +143,8 @@ def _check_mempalace(project_dir: str | None = None, auto_init: bool = True) -> 
     """Prüft ob mempalace installiert und ein Palace vorhanden ist.
 
     auto_init=True: erstellt Palace automatisch wenn enabled aber noch nicht vorhanden.
+    Prüft ChromaDB-Versionskompatibilität — bei Mismatch wird der Palace
+    gelöscht und mit der aktuellen Version neu aufgebaut.
     Prüft außerdem ob bestehende Memory-Dateien importiert wurden (Marker-Datei).
     """
     global _mempalace_available
@@ -153,14 +155,25 @@ def _check_mempalace(project_dir: str | None = None, auto_init: bool = True) -> 
         _os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
         import chromadb  # noqa: F401
         palace = Path(_mempalace_palace_path(project_dir))
-        if palace.exists() and (palace / "chroma.sqlite3").exists():
+        palace_exists = palace.exists() and (palace / "chroma.sqlite3").exists()
+
+        # ChromaDB version migration: if DB was built with incompatible version, rebuild
+        if palace_exists and _chromadb_needs_migration(str(palace)):
+            _log.warning("mempalace: ChromaDB version mismatch — deleting old palace and rebuilding...")
+            import shutil
+            shutil.rmtree(str(palace), ignore_errors=True)
+            palace_exists = False  # treat as fresh init
+
+        if palace_exists:
             _mempalace_available = True
+            _log.info("mempalace: palace found and version OK — ready")
             _ensure_memory_imported(project_dir, str(palace))
         elif auto_init:
             mp_cfg = _get_mempalace_config(project_dir)
             if mp_cfg.get("enabled", False):
-                _log.info("mempalace enabled but no palace found — auto-initializing...")
+                _log.info("mempalace: no palace found — initializing...")
                 palace_path = init_mempalace(project_dir)
+                _log.info("mempalace: init complete — importing memories in background...")
                 _mempalace_available = True
                 _ensure_memory_imported(project_dir, palace_path)
             else:
@@ -177,7 +190,34 @@ def _check_mempalace(project_dir: str | None = None, auto_init: bool = True) -> 
 
 
 _IMPORT_MARKER = ".memory_imported"
+_CHROMADB_VERSION_MARKER = ".chromadb_version"
 _import_thread_started = False
+
+
+def _chromadb_needs_migration(palace_path: str) -> bool:
+    """Checks if the palace was built with a different ChromaDB major.minor version.
+
+    If the stored version doesn't match the installed version, the HNSW index
+    format may be incompatible and we need to rebuild.
+    """
+    import chromadb
+    installed = chromadb.__version__  # e.g. "0.6.3"
+    installed_mm = ".".join(installed.split(".")[:2])  # "0.6"
+
+    marker = Path(palace_path) / _CHROMADB_VERSION_MARKER
+    if not marker.exists():
+        return True  # no version info → assume migration needed
+
+    stored = marker.read_text(encoding="utf-8").strip()
+    stored_mm = ".".join(stored.split(".")[:2])
+    return stored_mm != installed_mm
+
+
+def _write_chromadb_version(palace_path: str) -> None:
+    """Write current ChromaDB version to marker file."""
+    import chromadb
+    marker = Path(palace_path) / _CHROMADB_VERSION_MARKER
+    marker.write_text(chromadb.__version__ + "\n", encoding="utf-8")
 
 
 def _ensure_memory_imported(project_dir: str | None, palace_path: str) -> None:
@@ -207,6 +247,7 @@ def _ensure_memory_imported(project_dir: str | None, palace_path: str) -> None:
                 f"noise={stats.get('skipped_noise', 0)}\n",
                 encoding="utf-8",
             )
+            _write_chromadb_version(palace_path)
             _log.info("mempalace: background import complete — %s", stats)
         except Exception as e:
             _log.warning("mempalace: background import failed — %s", e)
@@ -326,6 +367,12 @@ def import_existing_memories(
     stats = {"imported": 0, "skipped_noise": 0, "skipped_existing": 0, "files": 0}
     md_files = sorted(mem_d.glob("????-??-??.md"))
 
+    # Batch-collect all exchanges, then insert in chunks for speed
+    batch_ids: list[str] = []
+    batch_docs: list[str] = []
+    batch_metas: list[dict[str, Any]] = []
+    BATCH_SIZE = 100
+
     for md_path in md_files:
         date_str = md_path.stem  # "2026-03-17"
         try:
@@ -353,24 +400,33 @@ def import_existing_memories(
                 stats["skipped_existing"] += 1
                 continue
 
-            try:
-                col.add(
-                    ids=[doc_id],
-                    documents=[content],
-                    metadatas=[{
-                        "wing": wing,
-                        "room": room,
-                        "hall": "hall_events",
-                        "source_file": f"miniassistant_{date_str}",
-                        "date": date_str,
-                        "importance": 3,
-                    }],
-                )
-                existing_ids.add(doc_id)
-                stats["imported"] += 1
-            except Exception as e:
-                if "already exists" not in str(e).lower():
-                    _log.warning("mempalace import failed for %s: %s", doc_id, e)
+            batch_ids.append(doc_id)
+            batch_docs.append(content)
+            batch_metas.append({
+                "wing": wing,
+                "room": room,
+                "hall": "hall_events",
+                "source_file": f"miniassistant_{date_str}",
+                "date": date_str,
+                "importance": 3,
+            })
+            existing_ids.add(doc_id)
+
+            if len(batch_ids) >= BATCH_SIZE:
+                try:
+                    col.add(ids=batch_ids, documents=batch_docs, metadatas=batch_metas)
+                    stats["imported"] += len(batch_ids)
+                except Exception as e:
+                    _log.warning("mempalace batch import failed: %s", e)
+                batch_ids, batch_docs, batch_metas = [], [], []
+
+    # Flush remaining
+    if batch_ids:
+        try:
+            col.add(ids=batch_ids, documents=batch_docs, metadatas=batch_metas)
+            stats["imported"] += len(batch_ids)
+        except Exception as e:
+            _log.warning("mempalace batch import failed: %s", e)
 
     _log.info(
         "mempalace import: %d imported, %d noise, %d existing, %d files",
