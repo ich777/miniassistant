@@ -4904,6 +4904,18 @@ def create_session(config: dict[str, Any] | None = None, project_dir: str | None
     }
 
 
+def _should_append_exchange_to_memory(session: dict[str, Any], config: dict[str, Any]) -> bool:
+    """Nur bei Web/API-Chat in Memory + mempalace schreiben, wenn der Nutzer explizit speichert.
+
+    Matrix, Discord, CLI, Scheduler: weiterhin immer persistieren (kein track-Flag).
+    """
+    _ctx = (config.get("_chat_context") or session.get("chat_context") or {})
+    _p = str(_ctx.get("platform") or "").strip().lower()
+    if _p in ("web", "api"):
+        return bool(session.get("_track_chat"))
+    return True
+
+
 def handle_user_input(
     session: dict[str, Any],
     user_input: str,
@@ -5102,11 +5114,12 @@ def handle_user_input(
                 _msg["content"] = "[Bild angehängt] " + (_msg.get("content") or "")
     session["messages"] = new_messages
 
-    # Memory: nur Inhalt speichern (kein Thinking), täglich, für späteren Auszug
-    try:
-        append_exchange(rest, content or "", project_dir=project_dir)
-    except Exception:
-        pass
+    # Memory + mempalace: Web/API nur mit explizitem Speichern (_track_chat), sonst nichts persistieren
+    if _should_append_exchange_to_memory(session, config):
+        try:
+            append_exchange(rest, content or "", project_dir=project_dir)
+        except Exception:
+            pass
 
     response_text = f"[Thinking]\n{thinking}\n\n{content}" if (thinking and content) else (thinking if thinking else (content or "(Keine Antwort)"))
     if did_compact:
