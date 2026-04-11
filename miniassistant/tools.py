@@ -171,10 +171,11 @@ def _is_ssrf_target(url: str) -> bool:
     return False
 
 
-# Browser User-Agent um Bot-Detection und Anubis-Checks zu vermeiden
+# Browser User-Agent: Safari 18.4.1 auf macOS Sequoia (Apple Silicon meldet
+# ebenfalls "Intel" im UA — das ist Apples bewusstes Privacy-Verhalten)
 _USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_5) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/18.4.1 Safari/605.1.15"
 )
 
 # Fixes unmatched quotes in heredoc delimiters that LLMs commonly produce,
@@ -248,9 +249,10 @@ def web_search(searxng_url: str, query: str, max_results: int = 5, categories: s
     if categories:
         params["categories"] = categories
     last_err: Exception | None = None
+    _ws_headers = {"User-Agent": _USER_AGENT}
     for attempt in range(_RETRY_ATTEMPTS):
         try:
-            with httpx.Client(timeout=15.0) as client:
+            with httpx.Client(timeout=15.0, headers=_ws_headers) as client:
                 r = client.get(url, params=params)
                 r.raise_for_status()
                 data = r.json()
@@ -301,9 +303,10 @@ def check_url(url: str, timeout: float = 10.0) -> dict[str, Any]:
     if _is_ssrf_target(u):
         return {"reachable": False, "status_code": None, "final_url": None, "error": "Access to internal/private networks is blocked"}
     last_err: Exception | None = None
+    _cu_headers = {"User-Agent": _USER_AGENT}
     for attempt in range(_RETRY_ATTEMPTS):
         try:
-            with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+            with httpx.Client(timeout=timeout, follow_redirects=True, headers=_cu_headers) as client:
                 r = client.get(u)
                 final = str(r.url)
                 if r.status_code in _RETRYABLE_STATUS_CODES and attempt < _RETRY_ATTEMPTS - 1:
@@ -534,7 +537,8 @@ def read_url(url: str, max_chars: int = 8000, timeout: float = 15.0, config: dic
     headers = {
         "User-Agent": _USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+        "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
     }
     client_kwargs: dict[str, Any] = {
         "timeout": timeout,
@@ -573,10 +577,10 @@ def read_url(url: str, max_chars: int = 8000, timeout: float = 15.0, config: dic
         except httpx.HTTPStatusError as e:
             last_err = e
             if e.response.status_code in (403, 429) and _CURL_CFFI_AVAILABLE:
-                # Bot-Detection (Cloudflare etc.) → Chrome-Impersonation als Fallback
-                _log.info("read_url: HTTP %d → retrying with curl_cffi Chrome impersonation", e.response.status_code)
+                # Bot-Detection (Cloudflare etc.) → Safari-Impersonation als Fallback
+                _log.info("read_url: HTTP %d → retrying with curl_cffi Safari impersonation", e.response.status_code)
                 try:
-                    cr = _curl_requests.get(u, impersonate="chrome", timeout=timeout)
+                    cr = _curl_requests.get(u, impersonate="safari17_0", timeout=timeout)
                     if cr.status_code < 400:
                         ct = cr.headers.get("content-type", "")
                         if "html" in ct:

@@ -195,6 +195,7 @@ def _check_mempalace(project_dir: str | None = None, auto_init: bool = True) -> 
 _IMPORT_MARKER = ".memory_imported"
 _CHROMADB_VERSION_MARKER = ".chromadb_version"
 _import_thread_started = False
+_import_thread_lock = __import__("threading").Lock()
 
 
 def _chromadb_needs_migration(palace_path: str) -> bool:
@@ -233,10 +234,13 @@ def _ensure_memory_imported(project_dir: str | None, palace_path: str) -> None:
     marker = Path(palace_path) / _IMPORT_MARKER
     if marker.exists() or _import_thread_started:
         return
-    mp_cfg = _get_mempalace_config(project_dir)
-    if not mp_cfg.get("enabled", False):
-        return
-    _import_thread_started = True
+    with _import_thread_lock:
+        if _import_thread_started:
+            return
+        mp_cfg = _get_mempalace_config(project_dir)
+        if not mp_cfg.get("enabled", False):
+            return
+        _import_thread_started = True
 
     import threading
 

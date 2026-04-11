@@ -590,7 +590,11 @@ def _tools_section(config: dict[str, Any]) -> str:
         "Example: user asks 'search 3 sources for X' → return 3× `web_search` in one response (not 3 separate rounds). "
         "**Ordering is preserved:** if you return [web_search, web_search, exec, read_url], the searches run first in parallel, "
         "then exec runs after they finish, then read_url. So place dependent calls AFTER the calls they depend on. "
-        "`exec` always runs sequentially (filesystem safety)."
+        "`exec` always runs sequentially (filesystem safety).\n"
+        "  **IMPORTANT — all parallel tools are SYNCHRONOUS:** The results of invoke_model, web_search, read_url etc. "
+        "are returned **immediately as tool output** in the same round. There is NOTHING running in the background after they return. "
+        "Do NOT use `wait` after these tools — process the results directly. "
+        "`wait` is ONLY for background processes started via `exec` (e.g. a build or download running in the background)."
     )
     # Subagents: global config (subagents: [list]) oder per-provider subagents: true
     subagent_list = config.get("subagents") or []
@@ -629,6 +633,9 @@ def _tools_section(config: dict[str, Any]) -> str:
                     sub_display.append(f"`{prefix}{alias}`")
         lines.append(
             "- `invoke_model`: Delegate tasks to subagents via `invoke_model(model='...', message='...')`.\n"
+            "  **SYNCHRONOUS:** invoke_model blocks until the subagent finishes. The result is returned as tool output "
+            "in the SAME round. There is NO background process — do NOT use `wait` after invoke_model. "
+            "When you receive the tool result, the subagent is DONE — process the result immediately.\n"
             "  **When to use:** ONLY in these cases: (1) the user explicitly asks for a subagent/worker, "
             "(2) the user names a specific subagent model, "
             "(3) the task requires a specialized model (image generation, audio generation). "
@@ -638,11 +645,12 @@ def _tools_section(config: dict[str, Any]) -> str:
             "  Message must be self-contained: goal, expected output format, language, relevant context, paths.\n"
             "  Tell the subagent to complete the full task and return the result (not a TODO list).\n"
             "  If a plan file exists: 'Arbeite gemäß Plan in [PFAD]. Markiere jeden Schritt als [x]/[!].'\n"
-            "  **On timeout or error: retry the same subagent once with the same message. Then report to user.**\n"
-            "  Do NOT do the work yourself after a subagent failure — ask the user how to proceed.\n"
+            "  **On timeout or error: retry the same subagent once with the same message. If it fails again: report to user and ASK how to proceed.**\n"
+            "  **NEVER do the subagent's work yourself after a failure.** Do not fall back to web_search/exec to replicate what the subagent was supposed to do. "
+            "The user explicitly requested subagent execution — honor that. Report the failure, present any partial results you did receive, and ask the user.\n"
             "  If result is incomplete: re-invoke with a continuation instruction, or ask the user.\n"
-            "  **Sanity-check results:** If a subagent found concrete data (links, prices, products) but then concludes 'doesn't exist' or 'not available' — that is contradictory. Present the actual findings, not the wrong conclusion. Subagents may have outdated knowledge (= outdated training data).\n"
-            "  **If subagent returns raw JSON instead of a result:** the subagent failed to execute — do NOT pretend it succeeded. Either retry the subagent or do the task yourself with your own tools.\n"
+            "  **Sanity-check results:** If a subagent found concrete data (links, prices, products) but then concludes 'doesn't exist' or 'not available' — that is contradictory. Present the actual findings, not the wrong conclusion.\n"
+            "  **If subagent returns raw thinking/planning text or <tool_call> XML instead of a result:** the subagent failed to execute its tools — retry once. If still broken, report to user.\n"
             "  Present the subagent's result directly — never redo it yourself.\n"
             "  **Parallel execution:** Multiple tool calls in a single response run concurrently for: invoke_model, web_search, read_url, check_url, read_email.\n"
             "  When you have multiple independent tasks (e.g. delegate to 3 subagents, or search 4 sources), call ALL of them in ONE response — they execute in parallel, saving time.\n"
@@ -655,8 +663,11 @@ def _tools_section(config: dict[str, Any]) -> str:
                          f"  Use the full name (e.g. `llama-swap/qwen3-35b-a3b`) or any listed alias (e.g. `qwen`). Do NOT invent names not listed here.")
         lines.append(
             "- `debate`: Start a **structured multi-round debate/discussion** between two AI perspectives.\n"
-            "  **IMPORTANT: Use this tool when the user says things like:** 'diskutiere mit einem Subworker', 'halte eine Diskussion', "
-            "'debattiere über', 'lass zwei Modelle diskutieren', 'hole zwei Meinungen ein', 'Diskussion mit Subagent'.\n"
+            "  **IMPORTANT: Use this tool ONLY for DEBATES/DISCUSSIONS — NOT for research or information gathering.**\n"
+            "  Use when the user says things like: 'diskutiere', 'halte eine Diskussion', "
+            "'debattiere über', 'lass zwei Modelle diskutieren', 'hole zwei Meinungen ein'.\n"
+            "  **Do NOT use debate for:** 'recherchiere', 'such mir raus', 'finde heraus', 'beauftrage Subworker mit Recherche' "
+            "— these are research tasks → use `invoke_model` instead (one call per subtask).\n"
             "  Do NOT just do a web_search and answer yourself — use the `debate` tool to let subagents argue both sides.\n"
             "  Both sides are argued by subagent(s) — the full transcript is saved to a Markdown file in the workspace.\n"
             "  Between rounds, previous arguments are automatically summarized so small models keep context.\n"
