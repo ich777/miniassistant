@@ -52,13 +52,79 @@ def log_prompt(config: dict[str, Any], model: str, user_content: str, system_pro
 
 
 def log_thinking(config: dict[str, Any], thinking: str) -> None:
-    """Loggt das Thinking der KI."""
+    """Loggt das Thinking der KI (final, nach Stream-Ende)."""
     path = _log_path(config)
     if not path or not thinking:
         return
-    # Kürzen auf max 2000 Zeichen
     t = thinking if len(thinking) <= 2000 else thinking[:2000] + "…"
     _write(path, f"[{_ts()}] THINKING\n{t}\n")
+
+
+class StreamLogger:
+    """Akkumuliert Thinking/Content-Deltas und flusht periodisch ins Log.
+    Verhindert Disk-Thrashing bei schnellem Token-Stream."""
+
+    def __init__(self, config: dict[str, Any], flush_interval: float = 2.0):
+        self._path = _log_path(config)
+        self._flush_interval = flush_interval
+        self._thinking_buf = ""
+        self._content_buf = ""
+        self._last_flush = 0.0
+        self._started = False
+        self._model = ""
+        self._role = ""
+        import time as _time
+        self._time = _time
+
+    def _label(self) -> str:
+        parts = []
+        if self._role:
+            parts.append(self._role)
+        if self._model:
+            parts.append(self._model)
+        return f"  {' '.join(parts)}" if parts else ""
+
+    def _maybe_flush(self, force: bool = False) -> None:
+        if not self._path:
+            return
+        now = self._time.monotonic()
+        if not force and (now - self._last_flush) < self._flush_interval:
+            return
+        lbl = self._label()
+        parts = []
+        if self._thinking_buf:
+            t = self._thinking_buf if len(self._thinking_buf) <= 500 else "…" + self._thinking_buf[-500:]
+            parts.append(f"[{_ts()}] STREAM_THINKING{lbl}\n{t}\n")
+            self._thinking_buf = ""
+        if self._content_buf:
+            c = self._content_buf if len(self._content_buf) <= 500 else "…" + self._content_buf[-500:]
+            parts.append(f"[{_ts()}] STREAM_CONTENT{lbl}\n{c}\n")
+            self._content_buf = ""
+        if parts:
+            _write(self._path, "".join(parts))
+        self._last_flush = now
+
+    def start(self, model: str, role: str = "orchestrator") -> None:
+        if not self._path:
+            return
+        self._model = model
+        self._role = role
+        _write(self._path, f"[{_ts()}] STREAM_START  {role} model={model}\n")
+        self._started = True
+        self._last_flush = self._time.monotonic()
+
+    def thinking_delta(self, delta: str) -> None:
+        self._thinking_buf += delta
+        self._maybe_flush()
+
+    def content_delta(self, delta: str) -> None:
+        self._content_buf += delta
+        self._maybe_flush()
+
+    def finish(self) -> None:
+        self._maybe_flush(force=True)
+        if self._path and self._started:
+            _write(self._path, f"[{_ts()}] STREAM_END\n")
 
 
 def extract_tps(response: dict[str, Any], elapsed_s: float, content: str = "", thinking: str = "") -> tuple[float, bool] | None:
@@ -118,7 +184,7 @@ def log_response(config: dict[str, Any], content: str, tps: tuple[float, bool] |
 
 
 def log_tool_call(config: dict[str, Any], tool_name: str, arguments: dict[str, Any], result: str) -> None:
-    """Loggt einen Tool-Call (exec, web_search, schedule, etc.)."""
+    """Loggt einen Tool-Call (exec, web_search, schedule, etc.) — Start + Result zusammen (Legacy)."""
     path = _log_path(config)
     if not path:
         return
@@ -133,6 +199,28 @@ def log_tool_call(config: dict[str, Any], tool_name: str, arguments: dict[str, A
         f"  result: {res_str}\n",
     ]
     _write(path, "".join(lines))
+
+
+def log_tool_start(config: dict[str, Any], tool_name: str, arguments: dict[str, Any]) -> None:
+    """Loggt den START eines Tool-Calls sofort (vor Execution)."""
+    path = _log_path(config)
+    if not path:
+        return
+    import json
+    args_str = json.dumps(arguments, ensure_ascii=False, indent=None)
+    if len(args_str) > 1000:
+        args_str = args_str[:1000] + "…"
+    _write(path, f"[{_ts()}] TOOL_START  {tool_name}\n  args: {args_str}\n")
+
+
+def log_tool_result(config: dict[str, Any], tool_name: str, result: str, elapsed_s: float = 0) -> None:
+    """Loggt das ERGEBNIS eines Tool-Calls (nach Execution)."""
+    path = _log_path(config)
+    if not path:
+        return
+    res_str = result if len(result) <= 1000 else result[:1000] + "…"
+    elapsed_str = f"  ({elapsed_s:.1f}s)" if elapsed_s else ""
+    _write(path, f"[{_ts()}] TOOL_DONE  {tool_name}{elapsed_str}\n  result: {res_str}\n")
 
 
 def log_image_received(config: dict[str, Any], num_images: int, mime_types: list[str], vision_model: str = "") -> None:

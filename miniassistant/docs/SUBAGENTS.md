@@ -41,10 +41,15 @@ If the user explicitly names a subagent (e.g. "beauftrage qwen3-coder-max"), the
 
 ## Timeout and retry behavior
 
-If `invoke_model` returns an error or times out:
-1. **Retry once** with the same model and message.
+The system automatically retries each `invoke_model` call once (with 5s delay) before returning an error.
+If you still receive an error after the automatic retry:
+
+1. **Retry once more** yourself — call `invoke_model` again with the same model and message. Do NOT skip this step.
 2. If it fails again: tell the user (e.g. "Subagent qwen3-coder-max ist nicht erreichbar.") and ask how to proceed.
 3. **Never do the subagent's work yourself** after a failure — ask the user first.
+4. **Never substitute subagent results with your own knowledge** or with data from other tools (e.g. web_search). The user explicitly requested subagent execution — honor that.
+
+**You are the orchestrator.** Your job is to delegate, collect results, and synthesize. If a subagent fails, your first action is ALWAYS to retry it — not to work around it with data you already have.
 
 ## Parallel execution
 

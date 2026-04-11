@@ -341,11 +341,14 @@ def _tools_schema(
                 "name": "wait",
                 "description": (
                     "Pause for a specified number of seconds within the current session, then automatically continue. "
-                    "Use after starting a background process (build, download, slow exec) when you need "
+                    "Use ONLY after starting a background process via `exec` (build, download, slow command) when you need "
                     "to give it time before checking results. The user sees a live countdown. "
                     "After the wait you receive a prompt to continue — check progress, retry, or proceed. "
                     "Maximum: 600 seconds (10 minutes). "
                     "Do NOT use to delay a direct answer to the user. "
+                    "NEVER use after invoke_model, web_search, read_url, or check_url — these tools are SYNCHRONOUS: "
+                    "their results are returned immediately as tool output in the same round. There is nothing running "
+                    "in the background to wait for. Process the tool results directly. "
                     "Unknown duration → `watch`. Future/recurring → `schedule`."
                 ),
                 "parameters": {

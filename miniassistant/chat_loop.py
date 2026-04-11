@@ -134,10 +134,12 @@ _KEEPALIVE_INTERVAL = 15.0  # Sekunden — unter den meisten Client-Timeouts (30
 _STREAM_DONE = object()      # Sentinel
 
 
-def _iter_with_keepalive(gen_fn, interval=_KEEPALIVE_INTERVAL):
+def _iter_with_keepalive(gen_fn, interval=_KEEPALIVE_INTERVAL, max_timeout=None):
     """Generator in Thread ausführen, bei Stille >interval Sekunden None yielden.
-    Caller kann None als Keepalive-Signal behandeln."""
+    Caller kann None als Keepalive-Signal behandeln.
+    max_timeout: Gesamt-Zeitlimit in Sekunden. Bei Überschreitung wird abgebrochen."""
     q: Queue = Queue()
+    _t0 = time.monotonic()
 
     def _run():
         try:
@@ -150,6 +152,9 @@ def _iter_with_keepalive(gen_fn, interval=_KEEPALIVE_INTERVAL):
     _Thread(target=_run, daemon=True).start()
 
     while True:
+        if max_timeout and (time.monotonic() - _t0) > max_timeout:
+            _log.warning("_iter_with_keepalive: max_timeout exceeded (%.0fs)", max_timeout)
+            return
         try:
             item = q.get(timeout=interval)
         except _QueueEmpty:
@@ -162,10 +167,12 @@ def _iter_with_keepalive(gen_fn, interval=_KEEPALIVE_INTERVAL):
         yield item
 
 
-def _call_with_keepalive(fn, interval=_KEEPALIVE_INTERVAL):
+def _call_with_keepalive(fn, interval=_KEEPALIVE_INTERVAL, max_timeout=None):
     """Blockierenden Aufruf in Thread ausführen, bei Stille None yielden.
-    Letztes yield ist das Ergebnis (nicht None). Für Tool-Execution etc."""
+    Letztes yield ist das Ergebnis (nicht None). Für Tool-Execution etc.
+    max_timeout: Gesamt-Zeitlimit in Sekunden. Bei Überschreitung → TimeoutError."""
     q: Queue = Queue()
+    _t0 = time.monotonic()
 
     def _run():
         try:
@@ -176,6 +183,8 @@ def _call_with_keepalive(fn, interval=_KEEPALIVE_INTERVAL):
     _Thread(target=_run, daemon=True).start()
 
     while True:
+        if max_timeout and (time.monotonic() - _t0) > max_timeout:
+            raise TimeoutError(f"_call_with_keepalive: exceeded max_timeout ({max_timeout}s)")
         try:
             kind, val = q.get(timeout=interval)
             if kind == "ok":
@@ -267,6 +276,87 @@ def _strip_hallucinated_base64(content: str) -> str:
     cleaned = _BASE64_IMG_RE.sub("", content)
     cleaned = _NAKED_BASE64_RE.sub("", cleaned)
     return cleaned.strip()
+
+
+def _is_planning_only(text: str, threshold: float = 0.7) -> bool:
+    """Erkennt ob ein Subagent-Ergebnis nur Planungstext statt echte Ergebnisse enthält.
+    Prüft auf typische Planungsphrasen (DE+EN) relativ zur Textlänge."""
+    _PLANNING_PHRASES = (
+        "ich muss", "ich sollte", "ich werde", "lass mich", "lassen sie mich",
+        "i need to", "i should", "i will", "let me", "i must",
+        "versuche ich", "versuche es mit",
+        "ich versuche", "ich starte", "ich beginne",
+        "lese noch", "suche nach", "recherchiere",
+    )
+    lower = text.lower()
+    lines = [l.strip() for l in lower.splitlines() if l.strip()]
+    if not lines:
+        return False
+    planning_lines = sum(1 for l in lines if any(p in l for p in _PLANNING_PHRASES))
+    return (planning_lines / len(lines)) >= threshold
+
+
+_SUBAGENT_FAILURE_MARKERS = (
+    "[api error:", "[openai api error:", "[timeout",
+    "timed out", "all retries failed",
+    "[subagent returned planning text",
+    "(keine antwort)", "nicht erreichbar",
+)
+
+_RESEARCH_TOOLS = frozenset({"web_search", "read_url", "check_url", "exec"})
+
+
+def _is_subagent_failure(result: str) -> bool:
+    """Prüft ob ein invoke_model-Ergebnis ein Subagent-Fehler ist."""
+    lower = result.lower()[:500]
+    return any(m in lower for m in _SUBAGENT_FAILURE_MARKERS)
+
+
+def _guard_subagent_fallback(
+    tool_calls: list[tuple[str, dict[str, Any] | str]],
+    msgs: list[dict[str, Any]],
+    config: dict[str, Any],
+    project_dir: str | None,
+) -> list[tuple[str, dict[str, Any] | str, str]] | None:
+    """Hard Guard: Blockt Research-Tool-Calls wenn der Orchestrator versucht,
+    nach Subagent-Fehler die Arbeit selbst zu machen.
+
+    Returns: Fake tool_results zum Einspeisen in msgs, oder None wenn kein Block nötig.
+    """
+    _has_invoke = any(n == "invoke_model" for n, _ in tool_calls)
+    if _has_invoke:
+        return None
+    _research_calls = [(n, a) for n, a in tool_calls if n in _RESEARCH_TOOLS]
+    if not _research_calls:
+        return None
+
+    _blocked = []
+    _allowed = []
+    for n, a in tool_calls:
+        if n in _RESEARCH_TOOLS:
+            _blocked.append((n, a))
+        else:
+            _allowed.append((n, a))
+
+    _log.warning(
+        "GUARD: Blocking %d research tool(s) after subagent failure: %s",
+        len(_blocked), [n for n, _ in _blocked],
+    )
+
+    results: list[tuple[str, dict[str, Any] | str, str]] = []
+    for n, a in _blocked:
+        results.append((n, a,
+            f"BLOCKED: Tool '{n}' was not executed. A subagent failed or timed out in the previous round. "
+            "You MUST report the failure and any partial results to the user. "
+            "Ask the user how to proceed (retry, different approach, etc.). "
+            "Do NOT attempt to replicate the subagent's work yourself."
+        ))
+
+    if _allowed:
+        for name, args, result in _run_tools_maybe_concurrent(_allowed, config, project_dir):
+            results.append((name, args, result))
+
+    return results
 
 
 def _strip_tool_call_tags(content: str) -> str:
@@ -733,15 +823,139 @@ def _trim_messages_to_fit(
     return out + [current_message]
 
 
+def _trim_subagent_msgs(
+    msgs: list[dict[str, Any]],
+    system: str,
+    tools: list[dict[str, Any]] | None,
+    num_ctx: int,
+    quota: float = 0.80,
+) -> list[dict[str, Any]]:
+    """Hard-trim subagent messages (fallback when compacting fails).
+
+    Always keeps msgs[0] (the user task). Removes oldest messages from the
+    middle so the most recent tool results survive.
+    """
+    budget = int(num_ctx * quota)
+    fixed = _estimate_tokens(system or "") + _estimate_tokens(json.dumps(tools or [], ensure_ascii=False))
+    msg_budget = max(0, budget - fixed)
+    if _messages_token_estimate(msgs) <= msg_budget:
+        return msgs
+    if len(msgs) <= 1:
+        return msgs
+    first = msgs[0]
+    rest = list(msgs[1:])
+    first_tokens = _message_tokens_estimate(first)
+    remaining_budget = max(0, msg_budget - first_tokens)
+    while rest and _messages_token_estimate(rest) > remaining_budget:
+        rest.pop(0)
+    trimmed = [first] + rest
+    _log.info(
+        "Subagent context trimmed: %d → %d messages (budget: %d tokens, num_ctx: %d)",
+        len(msgs), len(trimmed), budget, num_ctx,
+    )
+    return trimmed
+
+
+_COMPACT_SUBAGENT_SYSTEM = (
+    "Compress subagent research results. Maximum density, technically exact.\n"
+    "Rules:\n"
+    "- Fragments, not sentences. Arrows (→) for causality/sequence. Abbreviations: DB/API/Auth/Config/Req/Res/Srv/Pkg.\n"
+    "- VERBATIM: URLs, error messages, filenames, paths, version numbers, prices, numbers.\n"
+    "- Keep: all discovered facts, results, errors.\n"
+    "- Drop: articles, filler, introductions, explanations.\n"
+    "- Preserve ORIGINAL LANGUAGE of content (don't translate German findings to English or vice versa).\n"
+    "- Format: bullet points, max 150 words. ONLY the summary."
+)
+
+
+def _compact_subagent_msgs(
+    config: dict[str, Any],
+    msgs: list[dict[str, Any]],
+    resolved_name: str,
+    system: str,
+    tools: list[dict[str, Any]] | None,
+    num_ctx: int,
+    quota: float = 0.80,
+) -> list[dict[str, Any]]:
+    """Compact subagent messages by summarising older tool interactions.
+
+    Keeps msgs[0] (the task) + a generated summary + the most recent messages.
+    Falls back to hard trimming (_trim_subagent_msgs) on any failure.
+    """
+    budget = int(num_ctx * quota)
+    fixed = _estimate_tokens(system or "") + _estimate_tokens(json.dumps(tools or [], ensure_ascii=False))
+    msg_budget = max(0, budget - fixed)
+
+    if _messages_token_estimate(msgs) <= msg_budget:
+        return msgs
+
+    # Zu wenige Messages → Trimming reicht
+    if len(msgs) < 5:
+        return _trim_subagent_msgs(msgs, system, tools, num_ctx, quota)
+
+    # Split: erste Message (Aufgabe) + letzte 2 (aktuellste Arbeit) behalten
+    first = msgs[0]
+    recent = msgs[-2:]
+    old = msgs[1:-2]
+
+    if not old:
+        return _trim_subagent_msgs(msgs, system, tools, num_ctx, quota)
+
+    conversation_text = _format_messages_for_summary(old)
+    if not conversation_text.strip():
+        return [first] + recent
+
+    # Conversation-Text kürzen falls er selbst zu lang ist (max 50% von num_ctx in Zeichen)
+    max_summary_input = int(num_ctx * 0.5 * 3)  # ~50% Context, 3 Zeichen/Token
+    if len(conversation_text) > max_summary_input:
+        conversation_text = conversation_text[:max_summary_input] + "\n[… truncated]"
+
+    try:
+        response = _dispatch_chat(
+            config, resolved_name,
+            [{"role": "user", "content": f"Compress these research results:\n\n{conversation_text}"}],
+            system=_COMPACT_SUBAGENT_SYSTEM,
+            timeout=60.0,
+        )
+        summary = ((response.get("message") or {}).get("content") or "").strip()
+    except Exception as e:
+        _log.warning("Subagent %s compacting failed: %s — falling back to trim", resolved_name, e)
+        return _trim_subagent_msgs(msgs, system, tools, num_ctx, quota)
+
+    if not summary:
+        return _trim_subagent_msgs(msgs, system, tools, num_ctx, quota)
+
+    summary_msg = {
+        "role": "user",
+        "content": (
+            f"[Compressed summary of your research so far]\n{summary}\n\n"
+            "Continue the task — use findings above, do not repeat searches."
+        ),
+    }
+    compacted = [first, summary_msg] + recent
+    _log.info(
+        "Subagent %s compacted: %d old messages → summary (%d tokens) + %d recent (budget: %d, num_ctx: %d)",
+        resolved_name, len(old), _estimate_tokens(summary), len(recent), budget, num_ctx,
+    )
+    return compacted
+
+
 # ---------------------------------------------------------------------------
 #  Smart Chat Compacting
 # ---------------------------------------------------------------------------
 
 _COMPACT_SYSTEM = (
-    "Du bist ein Zusammenfassungs-Assistent. Fasse den Chatverlauf kurz und präzise zusammen.\n"
-    "Behalte: Fakten, Entscheidungen, offene Aufgaben, User-Präferenzen, wichtige Ergebnisse, Tool-Aufrufe und deren Resultate.\n"
-    "IPs, Hostnamen, Ports, Pfade die der User nannte wörtlich übernehmen.\n"
-    "Format: Stichpunkte, max 400 Wörter. Antworte NUR mit der Zusammenfassung, keine Einleitung."
+    "Compress chat history. Maximum density, technically exact.\n"
+    "Rules:\n"
+    "- Fragments, not sentences. Arrows for causality (→). Abbreviations: DB/API/Auth/Config/Req/Res/Srv/Pkg.\n"
+    "- VERBATIM: IPs, hostnames, ports, paths, URLs, error messages, commands, filenames.\n"
+    "- Keep: facts, decisions, open tasks, user preferences, tool results.\n"
+    "- Drop: articles (the/a/an, der/die/das/ein), filler words, introductions, pleasantries, explanations implied by context.\n"
+    "- Preserve the ORIGINAL LANGUAGE of each piece of content (German stays German, English stays English, commands stay as-is).\n"
+    "- Format: bullet points, max 200 words. ONLY the summary, no intro/comments.\n"
+    "Example:\n"
+    "- User → check system logs. exec /var/log/syslog → nginx won't start after update.\n"
+    "  Error: 'bind() 0.0.0.0:443 failed (98: Address already in use)'. User → resolve conflict."
 )
 
 
@@ -769,8 +983,8 @@ def _needs_compacting(
     num_ctx: int,
 ) -> bool:
     """Prüft ob system + tools + messages die context_quota von num_ctx überschreiten.
-    Mindestens 6 Messages nötig (sonst lohnt Compacting nicht / Loop-Gefahr)."""
-    if len(messages) < 6:
+    Mindestens 4 Messages nötig (sonst lohnt Compacting nicht / Loop-Gefahr)."""
+    if len(messages) < 4:
         return False
     budget = _context_budget(config, num_ctx)
     used = (
@@ -860,7 +1074,7 @@ def _compact_history(
     try:
         response = _dispatch_chat(
             config, model,
-            [{"role": "user", "content": f"Fasse diesen Chatverlauf zusammen:\n\n{conversation_text}"}],
+            [{"role": "user", "content": f"Compress this chat history:\n\n{conversation_text}"}],
             system=_COMPACT_SYSTEM,
         )
         summary = ((response.get("message") or {}).get("content") or "").strip()
@@ -879,7 +1093,7 @@ def _compact_history(
 
     summary_msg = {
         "role": "system",
-        "content": f"[Zusammenfassung des bisherigen Gesprächs]\n{summary}",
+        "content": f"[Compressed summary of previous conversation]\n{summary}",
     }
     summary_tokens = _estimate_tokens(summary)
     _log.info(
@@ -1209,10 +1423,12 @@ _EXTERNAL_CONTENT_TOOLS = frozenset({"exec", "web_search", "read_url", "check_ur
 def _run_tool_safe(
     name: str, args: dict[str, Any] | str, config: dict[str, Any], project_dir: str | None,
 ) -> str:
-    """Wrapper: führt Tool aus und sanitized Output bei externem Content."""
+    """Wrapper: führt Tool aus, sanitized Output, loggt Elapsed-Time."""
+    _t0 = time.monotonic()
     result = _run_tool(name, args, config, project_dir)
     if name in _EXTERNAL_CONTENT_TOOLS:
         result = _sanitize_tool_output(result, tool_name=name)
+    _aal.log_tool_result(config, name, result, elapsed_s=time.monotonic() - _t0)
     return result
 
 
@@ -1271,6 +1487,11 @@ def _run_tools_maybe_concurrent(
     # Blöcke der Reihe nach abarbeiten — jeder Block wartet auf den vorherigen
     results_by_idx: dict[int, str] = {}
 
+    # Gesamt-Timeout pro Tool-Block: invoke_model/subagent-Calls können mit Retries
+    # sehr lange dauern (15 Runden × 300s × 3 API-Retries). Dieses Timeout stellt sicher,
+    # dass der Orchestrator die Kontrolle zurückbekommt.
+    _concurrent_timeout = float(config.get("invoke_model_timeout") or 600)  # Default 10 min
+
     for block_type, indices in blocks:
         if block_type == "concurrent" and len(indices) >= 2:
             # Parallel ausführen
@@ -1278,21 +1499,42 @@ def _run_tools_maybe_concurrent(
                 future_to_idx = {}
                 for i in indices:
                     name, args = tool_calls[i]
-                    future = pool.submit(_run_tool, name, args, config, project_dir)
+                    future = pool.submit(_run_tool_safe, name, args, config, project_dir)
                     future_to_idx[future] = i
-                for future in as_completed(future_to_idx):
-                    idx = future_to_idx[future]
-                    try:
-                        results_by_idx[idx] = future.result()
-                    except Exception as e:
+                done_futures: set = set()
+                try:
+                    for future in as_completed(future_to_idx, timeout=_concurrent_timeout):
+                        done_futures.add(future)
+                        idx = future_to_idx[future]
+                        try:
+                            results_by_idx[idx] = future.result()
+                        except Exception as e:
+                            tname = tool_calls[idx][0]
+                            _log.error("Concurrent tool %s failed: %s", tname, e)
+                            results_by_idx[idx] = f"Tool {tname} failed: {e}"
+                except TimeoutError:
+                    pass  # Timeout — noch laufende Futures werden unten behandelt
+                # Timeout: noch laufende Futures abbrechen und Fehler melden
+                for future, idx in future_to_idx.items():
+                    if future not in done_futures:
+                        future.cancel()
                         tname = tool_calls[idx][0]
-                        _log.error("Concurrent tool %s failed: %s", tname, e)
-                        results_by_idx[idx] = f"Tool {tname} failed: {e}"
+                        targs = tool_calls[idx][1]
+                        _tmodel = targs.get("model", "") if isinstance(targs, dict) else ""
+                        _log.warning("Concurrent tool %s(%s) timed out after %ds", tname, _tmodel, int(_concurrent_timeout))
+                        results_by_idx[idx] = (
+                            f"Tool {tname} timed out after {int(_concurrent_timeout)}s. "
+                            f"The subagent did not respond in time. You should retry this call."
+                        )
         else:
             # Sequenziell ausführen (einzelner concurrent-safe oder sequential tool)
             for i in indices:
                 name, args = tool_calls[i]
+                _seq_t0 = time.monotonic()
                 results_by_idx[i] = _run_tool_safe(name, args, config, project_dir)
+                _seq_elapsed = time.monotonic() - _seq_t0
+                if _seq_elapsed > _concurrent_timeout:
+                    _log.warning("Sequential tool %s took %.0fs (> timeout %.0fs)", name, _seq_elapsed, _concurrent_timeout)
 
     return [(tool_calls[i][0], tool_calls[i][1], results_by_idx[i]) for i in range(len(tool_calls))]
 
@@ -1311,6 +1553,7 @@ def _run_tool(
             arguments = {}
     if not isinstance(arguments, dict):
         arguments = {}
+    _aal.log_tool_start(config, name, arguments)
     if name == "wait":
         _wait_secs = max(1, min(int(arguments.get("seconds") or 30), 600))
         _wait_reason = (arguments.get("reason") or "").strip()
@@ -1990,62 +2233,86 @@ def _run_tool(
                     _sub_usage_type = "image"
             except Exception:
                 pass
-        try:
-            if provider_type == "claude-code":
-                # Claude Code CLI – eigener Connector, keine Ollama-API
-                _sub_result = _run_subagent_claude_code(
-                    config, api_model_sub, sub_system, sub_msg, resolved,
-                )
-            elif provider_type == "anthropic":
-                # Anthropic Messages API – eigener Connector
-                base_url = get_base_url_for_model(config, resolved)
-                sub_api_key = get_api_key_for_model(config, resolved)
-                think = get_think_for_model(config, resolved)
-                _sub_result = _run_subagent_anthropic(
-                    config, api_model_sub, sub_system, sub_msg,
-                    sub_api_key, base_url, think, resolved,
-                )
-            elif provider_type == "google":
-                # Google Gemini API – Subagent mit Tool-Support
-                _sub_result = _run_subagent_google(
-                    config, api_model_sub, sub_system, sub_msg, resolved,
-                )
-            elif provider_type in ("openai", "deepseek", "openai-compat"):
-                # OpenAI / DeepSeek / OpenAI-kompatible API – Subagent mit Tool-Support
-                _sub_result = _run_subagent_openai(
-                    config, api_model_sub, sub_system, sub_msg, resolved,
-                )
-            else:
-                # Ollama-basierter Subagent (default)
-                base_url = get_base_url_for_model(config, resolved)
-                sub_api_key = get_api_key_for_model(config, resolved)
-                think = get_think_for_model(config, resolved)
-                options = get_options_for_model(config, resolved)
-                from miniassistant.ollama_client import get_subagent_tools_schema
-                sub_tools = get_subagent_tools_schema(config)
-                # Tools nur mitschicken wenn Modell sie unterstützt
-                if not model_supports_tools(base_url, api_model_sub):
-                    _log.info("Subagent %s: model does not support tools, calling without tools", resolved)
-                    sub_tools = []
-                _sub_result = _run_subagent_with_tools(
-                    config, base_url, api_model_sub, sub_system, sub_msg,
-                    sub_tools, think, options, sub_api_key, resolved,
-                )
+        # Programmatischer Retry: 1 automatischer Wiederholungsversuch bei Fehler/Timeout
+        # bevor der Fehler die Haupt-LLM erreicht. Die Haupt-LLM wird über Retry informiert.
+        _max_invoke_attempts = 2
+        _last_invoke_err: Exception | None = None
+        for _invoke_attempt in range(_max_invoke_attempts):
+            if _invoke_attempt > 0:
+                _log.info("invoke_model: retry %d/%d for %s after error: %s",
+                          _invoke_attempt + 1, _max_invoke_attempts, resolved, _last_invoke_err)
+                time.sleep(5)
+                _t0_sub = time.monotonic()  # Timer für Retry neu starten
             try:
-                from miniassistant.usage import record as _usage_record
-                _usage_record(config, resolved, _sub_usage_type, time.monotonic() - _t0_sub)
-            except Exception:
-                pass
-            return _sub_result
-        except Exception as e:
-            try:
-                from miniassistant.usage import record as _usage_record
-                _usage_record(config, resolved, _sub_usage_type + "_error", time.monotonic() - _t0_sub)
-            except Exception:
-                pass
-            err = f"invoke_model failed ({resolved}): {e}"
-            _aal.log_subagent_result(config, resolved, err, "")
-            return err
+                if provider_type == "claude-code":
+                    _sub_result = _run_subagent_claude_code(
+                        config, api_model_sub, sub_system, sub_msg, resolved,
+                    )
+                elif provider_type == "anthropic":
+                    base_url = get_base_url_for_model(config, resolved)
+                    sub_api_key = get_api_key_for_model(config, resolved)
+                    think = get_think_for_model(config, resolved)
+                    _sub_result = _run_subagent_anthropic(
+                        config, api_model_sub, sub_system, sub_msg,
+                        sub_api_key, base_url, think, resolved,
+                    )
+                elif provider_type == "google":
+                    _sub_result = _run_subagent_google(
+                        config, api_model_sub, sub_system, sub_msg, resolved,
+                    )
+                elif provider_type in ("openai", "deepseek", "openai-compat"):
+                    _sub_result = _run_subagent_openai(
+                        config, api_model_sub, sub_system, sub_msg, resolved,
+                    )
+                else:
+                    base_url = get_base_url_for_model(config, resolved)
+                    sub_api_key = get_api_key_for_model(config, resolved)
+                    think = get_think_for_model(config, resolved)
+                    options = get_options_for_model(config, resolved)
+                    from miniassistant.ollama_client import get_subagent_tools_schema
+                    sub_tools = get_subagent_tools_schema(config)
+                    if not model_supports_tools(base_url, api_model_sub):
+                        _log.info("Subagent %s: model does not support tools, calling without tools", resolved)
+                        sub_tools = []
+                    _sub_num_ctx = get_num_ctx_for_model(config, resolved)
+                    _sub_result = _run_subagent_with_tools(
+                        config, base_url, api_model_sub, sub_system, sub_msg,
+                        sub_tools, think, options, sub_api_key, resolved,
+                        num_ctx=_sub_num_ctx,
+                    )
+                try:
+                    from miniassistant.usage import record as _usage_record
+                    _usage_record(config, resolved, _sub_usage_type, time.monotonic() - _t0_sub)
+                except Exception:
+                    pass
+                if _invoke_attempt > 0:
+                    _log.info("invoke_model: retry succeeded for %s on attempt %d", resolved, _invoke_attempt + 1)
+                # Ergebnis begrenzen damit der Orchestrator-Context nicht gesprengt wird
+                _orch_model = resolve_model(config, None)
+                _orch_ctx = get_num_ctx_for_model(config, _orch_model) if _orch_model else 32768
+                _max_result_tokens = int(_orch_ctx * 0.15)
+                if _estimate_tokens(_sub_result) > _max_result_tokens:
+                    _max_chars = _max_result_tokens * 3
+                    _log.info(
+                        "invoke_model: result from %s truncated (%d → max %d tokens, orchestrator ctx=%d)",
+                        resolved, _estimate_tokens(_sub_result), _max_result_tokens, _orch_ctx,
+                    )
+                    _sub_result = _sub_result[:_max_chars] + "\n\n[… Ergebnis gekürzt]"
+                return _sub_result
+            except Exception as e:
+                _last_invoke_err = e
+                try:
+                    from miniassistant.usage import record as _usage_record
+                    _usage_record(config, resolved, _sub_usage_type + "_error", time.monotonic() - _t0_sub)
+                except Exception:
+                    pass
+                if _invoke_attempt < _max_invoke_attempts - 1:
+                    _log.warning("invoke_model: attempt %d/%d failed for %s: %s — retrying in 5s",
+                                 _invoke_attempt + 1, _max_invoke_attempts, resolved, e)
+                    continue
+                err = f"invoke_model failed ({resolved}) after {_max_invoke_attempts} attempts: {e}"
+                _aal.log_subagent_result(config, resolved, err, "")
+                return err
     return f"Unknown tool: {name}"
 
 
@@ -2054,11 +2321,14 @@ def _run_tool(
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _append_to_file(path, text: str) -> None:
-    """Hängt Text an eine Datei an (UTF-8)."""
-    from pathlib import Path as _P
-    _P(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(text)
+    """Hängt Text an eine Datei an (UTF-8). I/O-Fehler werden geloggt, nicht geworfen."""
+    try:
+        from pathlib import Path as _P
+        _P(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text)
+    except OSError as e:
+        _log.warning("_append_to_file(%s) failed: %s", path, e)
 
 
 def _send_debate_status(config: dict[str, Any], message: str) -> None:
@@ -2396,12 +2666,13 @@ def _run_subagent_claude_code(
     # Claude Code bekommt System-Prompt + Aufgabe, handled Tools selbst
     # model=None nutzt das Default-Modell von Claude Code, sonst den konfigurierten
     model_arg = api_model if api_model and api_model != resolved_name else None
+    _sub_timeout = int(config.get("subagent_api_timeout") or config.get("api_timeout") or 900)
     r = claude_chat(
         user_msg,
         system=system,
         model=model_arg,
         max_turns=3,
-        timeout=300,
+        timeout=_sub_timeout,
     )
     content = (r.get("message") or {}).get("content", "").strip()
     result = content or "(Keine Antwort)"
@@ -2447,7 +2718,9 @@ def _run_subagent_anthropic(
         if msg.get("thinking"):
             total_thinking += msg["thinking"]
         if msg.get("content"):
-            total_content += msg["content"]
+            _clean = _strip_tool_call_tags(msg["content"])
+            if _clean.strip():
+                total_content += _clean
         tool_calls = _extract_tool_calls(msg)
         if not tool_calls:
             break
@@ -2505,7 +2778,14 @@ def _run_subagent_anthropic(
             _aal.log_tool_call(config, f"subagent:{tc_name}", tc_args, tool_result)
             msgs.append({"role": "tool", "tool_name": tc_name, "content": str(tool_result)})
         rounds_used += 1
-    result = total_content.strip() or total_thinking.strip() or "(Keine Antwort)"
+    result = _strip_tool_call_tags(total_content).strip()
+    if not result:
+        result = _strip_tool_call_tags(total_thinking).strip()
+    if not result:
+        result = "(Keine Antwort)"
+    elif _is_planning_only(result):
+        _log.warning("Subagent %s (anthropic): result looks like planning text — flagging", resolved_name)
+        result = f"[Subagent returned planning text instead of results — may need retry]\n{result}"
     _aal.log_subagent_result(config, resolved_name, result, total_thinking)
     return result
 
@@ -2565,7 +2845,9 @@ def _run_subagent_google(
         if msg.get("thinking"):
             total_thinking += msg["thinking"]
         if msg.get("content"):
-            total_content += msg["content"]
+            _clean = _strip_tool_call_tags(msg["content"])
+            if _clean.strip():
+                total_content += _clean
         tool_calls = _extract_tool_calls(msg)
         if not tool_calls:
             break
@@ -2648,7 +2930,14 @@ def _run_subagent_google(
             paths_str = ", ".join(f"`{p}`" for p in saved_paths)
             total_content += f"\n\nBild(er) gespeichert: {paths_str}"
 
-    result = total_content.strip() or total_thinking.strip() or "(Keine Antwort)"
+    result = _strip_tool_call_tags(total_content).strip()
+    if not result:
+        result = _strip_tool_call_tags(total_thinking).strip()
+    if not result:
+        result = "(Keine Antwort)"
+    elif _is_planning_only(result):
+        _log.warning("Subagent %s (google): result looks like planning text — flagging", resolved_name)
+        result = f"[Subagent returned planning text instead of results — may need retry]\n{result}"
     _aal.log_subagent_result(config, resolved_name, result, total_thinking)
     return result
 
@@ -2788,12 +3077,15 @@ def _run_subagent_openai(
             return err
 
     sub_tools = get_subagent_tools_schema(config)
+    _sub_num_ctx = get_num_ctx_for_model(config, resolved_name)
     msgs: list[dict[str, Any]] = [{"role": "user", "content": user_msg}]
     total_content = ""
     total_thinking = ""
     _ALLOWED_SUB_TOOLS = {"exec", "web_search", "check_url", "read_url"}
     rounds_used = 0
     for _round in range(int(config.get("max_tool_rounds", 15))):
+        # Proaktiv compacten bevor Context voll ist
+        msgs = _compact_subagent_msgs(config, msgs, resolved_name, system, sub_tools, _sub_num_ctx)
         try:
             r = openai_chat(
                 msgs, api_key=api_key, model=api_model,
@@ -2801,13 +3093,30 @@ def _run_subagent_openai(
                 base_url=base_url or OPENAI_API_URL,
             )
         except Exception as e:
-            total_content += f"[OpenAI API error: {e}]"
-            break
+            # Bei Context-Exceeded: aggressiv trimmen (kein API-Call) und einmal retrien
+            _err_str = str(e).lower()
+            if "context" in _err_str and ("exceeded" in _err_str or "size" in _err_str or "length" in _err_str):
+                _log.warning("Subagent %s: context exceeded — trimming and retrying", resolved_name)
+                msgs = _trim_subagent_msgs(msgs, system, sub_tools, _sub_num_ctx, quota=0.60)
+                try:
+                    r = openai_chat(
+                        msgs, api_key=api_key, model=api_model,
+                        system=system, thinking=think, tools=sub_tools,
+                        base_url=base_url or OPENAI_API_URL,
+                    )
+                except Exception as e2:
+                    total_content += f"[OpenAI API error: {e2}]"
+                    break
+            else:
+                total_content += f"[OpenAI API error: {e}]"
+                break
         msg = r.get("message") or {}
         if msg.get("thinking"):
             total_thinking += msg["thinking"]
         if msg.get("content"):
-            total_content += msg["content"]
+            _clean = _strip_tool_call_tags(msg["content"])
+            if _clean.strip():
+                total_content += _clean
         tool_calls = _extract_tool_calls(msg)
         if not tool_calls:
             break
@@ -2865,7 +3174,14 @@ def _run_subagent_openai(
             _aal.log_tool_call(config, f"subagent:{tc_name}", tc_args, tool_result)
             msgs.append({"role": "tool", "tool_name": tc_name, "content": str(tool_result)})
         rounds_used += 1
-    result = total_content.strip() or total_thinking.strip() or "(Keine Antwort)"
+    result = _strip_tool_call_tags(total_content).strip()
+    if not result:
+        result = _strip_tool_call_tags(total_thinking).strip()
+    if not result:
+        result = "(Keine Antwort)"
+    elif _is_planning_only(result):
+        _log.warning("Subagent %s (openai): result looks like planning text — flagging", resolved_name)
+        result = f"[Subagent returned planning text instead of results — may need retry]\n{result}"
     _aal.log_subagent_result(config, resolved_name, result, total_thinking)
     return result
 
@@ -2882,16 +3198,24 @@ def _run_subagent_with_tools(
     api_key: str | None,
     resolved_name: str,
     max_rounds: int = 15,
+    num_ctx: int | None = None,
 ) -> str:
     """Führt einen Subagent-Call mit eigener Tool-Loop aus (exec, web_search, check_url).
     Kein save_config, schedule, invoke_model. Max 15 Tool-Runden + Nudge bei leerem Content."""
+    if num_ctx is None:
+        num_ctx = get_num_ctx_for_model(config, resolved_name)
+    _sub_timeout = float(config.get("subagent_api_timeout") or config.get("api_timeout") or 900)
     msgs: list[dict[str, Any]] = [{"role": "user", "content": user_msg}]
     total_content = ""
     total_thinking = ""
     # Erlaubte Tools für Subagents (kein save_config, schedule, invoke_model)
     _ALLOWED_SUB_TOOLS = {"exec", "web_search", "check_url", "read_url"}
     rounds_used = 0
+    _consecutive_search_fails = 0
+    _MAX_SEARCH_FAILS = 3
     for _round in range(max_rounds):
+        # Proaktiv compacten bevor Context voll ist
+        msgs = _compact_subagent_msgs(config, msgs, resolved_name, system, tools, num_ctx)
         r = None
         for _attempt in range(3):
             try:
@@ -2900,16 +3224,28 @@ def _run_subagent_with_tools(
                     msgs,
                     model=api_model,
                     system=system,
+                    num_ctx=num_ctx,
                     think=think,
                     tools=tools,
                     options=options or None,
                     api_key=api_key,
-                    timeout=300.0,
+                    timeout=_sub_timeout,
                 )
                 break
             except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.RemoteProtocolError) as e:
                 if _attempt < 2:
                     code = getattr(getattr(e, "response", None), "status_code", None)
+                    _err_body = ""
+                    try:
+                        _err_body = getattr(e, "response", None).text if getattr(e, "response", None) else ""
+                    except Exception:
+                        pass
+                    # Context-Exceeded (500): aggressiv trimmen und retrien
+                    if code == 500 and "context" in _err_body.lower():
+                        _log.warning("Subagent %s: context exceeded (attempt %d/3) — trimming and retrying", resolved_name, _attempt + 1)
+                        msgs = _trim_subagent_msgs(msgs, system, tools, num_ctx, quota=0.60)
+                        time.sleep(2)
+                        continue
                     if isinstance(e, (httpx.TimeoutException, httpx.RemoteProtocolError)) or code == 400:
                         _log.warning("Subagent %s: API call failed (attempt %d/3): %s — retrying", resolved_name, _attempt + 1, e)
                         time.sleep(2)
@@ -2926,7 +3262,9 @@ def _run_subagent_with_tools(
         if msg.get("thinking"):
             total_thinking += msg["thinking"]
         if msg.get("content"):
-            total_content += msg["content"]
+            _clean = _strip_tool_call_tags(msg["content"])
+            if _clean.strip():
+                total_content += _clean
         tool_calls = _extract_tool_calls(msg)
         if not tool_calls:
             break
@@ -2949,22 +3287,42 @@ def _run_subagent_with_tools(
                 _exec_r = run_exec(tc_args.get("command", ""), cwd=_ws, extra_env=_exec_env(config))
                 tool_result = f"returncode: {_exec_r['returncode']}\nstdout:\n{_exec_r['stdout']}\nstderr:\n{_exec_r['stderr']}"
             elif tc_name == "web_search":
-                from miniassistant.config import get_search_engine_url
-                _ws_url = get_search_engine_url(config, tc_args.get("engine"))
-                if not _ws_url:
-                    tool_result = "web_search not configured (no search_engines or invalid engine)"
+                if _consecutive_search_fails >= _MAX_SEARCH_FAILS:
+                    tool_result = (
+                        f"BLOCKED: {_consecutive_search_fails} consecutive searches returned no results. "
+                        "The search engine appears to be unavailable or these queries are too specific. "
+                        "STOP searching. Summarize what you already know and give your answer now."
+                    )
+                    _log.warning("Subagent %s: blocking web_search after %d consecutive failures", resolved_name, _consecutive_search_fails)
                 else:
-                    _ws_res = tool_web_search(_ws_url, tc_args.get("query", ""), categories=tc_args.get("categories"))
-                    if _ws_res.get("error"):
-                        tool_result = f"Error: {_ws_res['error']}"
+                    from miniassistant.config import get_search_engine_url
+                    _ws_url = get_search_engine_url(config, tc_args.get("engine"))
+                    if not _ws_url:
+                        tool_result = "web_search not configured (no search_engines or invalid engine)"
                     else:
-                        _ws_lines = []
-                        for _r in _ws_res.get("results") or []:
-                            _wl = f"- {_r.get('title', '')} | {_r.get('url', '')}\n  {_r.get('snippet', '')}"
-                            if _r.get("img_src"):
-                                _wl += f"\n  img_src: {_r['img_src']}"
-                            _ws_lines.append(_wl)
-                        tool_result = "\n".join(_ws_lines) if _ws_lines else "Search engine returned no results. This is a search engine failure — do NOT conclude that nothing exists. Tell the user the search returned no results and suggest rephrasing."
+                        _ws_res = tool_web_search(_ws_url, tc_args.get("query", ""), categories=tc_args.get("categories"))
+                        if _ws_res.get("error"):
+                            tool_result = f"Error: {_ws_res['error']}"
+                            _consecutive_search_fails += 1
+                        else:
+                            _ws_lines = []
+                            for _r in _ws_res.get("results") or []:
+                                _wl = f"- {_r.get('title', '')} | {_r.get('url', '')}\n  {_r.get('snippet', '')}"
+                                if _r.get("img_src"):
+                                    _wl += f"\n  img_src: {_r['img_src']}"
+                                _ws_lines.append(_wl)
+                            if _ws_lines:
+                                tool_result = "\n".join(_ws_lines)
+                                _consecutive_search_fails = 0
+                            else:
+                                _consecutive_search_fails += 1
+                                tool_result = (
+                                    f"Search engine returned no results ({_consecutive_search_fails}/{_MAX_SEARCH_FAILS} consecutive failures). "
+                                    "Try a simpler/shorter query, or use read_url on a known URL instead."
+                                ) if _consecutive_search_fails < _MAX_SEARCH_FAILS else (
+                                    f"BLOCKED: {_consecutive_search_fails} consecutive searches returned no results. "
+                                    "STOP searching. Summarize what you already know and give your answer now."
+                                )
             elif tc_name == "check_url":
                 _cu_r = tool_check_url(tc_args.get("url", ""))
                 _cu_parts = [f"reachable: {_cu_r.get('reachable', False)}", f"status_code: {_cu_r.get('status_code', '')}"]
@@ -2989,10 +3347,12 @@ def _run_subagent_with_tools(
     if not total_content.strip() and rounds_used > 0:
         _log.info("Subagent %s: empty content after %d tool rounds — sending nudge", resolved_name, rounds_used)
         msgs.append({"role": "user", "content": "You have not provided a text response yet. Please summarize your findings and give your final answer now."})
+        msgs = _compact_subagent_msgs(config, msgs, resolved_name, system, tools, num_ctx)
         try:
             nudge_r = ollama_chat(
                 base_url, msgs, model=api_model, system=system,
-                think=think, tools=tools, options=options or None, api_key=api_key,
+                num_ctx=num_ctx, think=think, tools=tools, options=options or None, api_key=api_key,
+                timeout=_sub_timeout,
             )
             nudge_msg = nudge_r.get("message") or {}
             if nudge_msg.get("thinking"):
@@ -3035,10 +3395,12 @@ def _run_subagent_with_tools(
                     _aal.log_tool_call(config, f"subagent:{tc_name}", tc_args, tool_result)
                     msgs.append({"role": "tool", "content": str(tool_result)})
                 # Finale Antwort nach Nudge-Tools
+                msgs = _compact_subagent_msgs(config, msgs, resolved_name, system, tools, num_ctx)
                 try:
                     final_r = ollama_chat(
                         base_url, msgs, model=api_model, system=system,
-                        think=think, options=options or None, api_key=api_key,
+                        num_ctx=num_ctx, think=think, options=options or None, api_key=api_key,
+                        timeout=_sub_timeout,
                     )
                     final_msg = final_r.get("message") or {}
                     if final_msg.get("thinking"):
@@ -3051,10 +3413,14 @@ def _run_subagent_with_tools(
                 total_content += _strip_tool_call_tags(nudge_msg["content"])
         except Exception as nudge_err:
             _log.warning("Subagent nudge failed (%s): %s", resolved_name, nudge_err)
-    result = total_content.strip()
+    result = _strip_tool_call_tags(total_content).strip()
     if not result and total_thinking.strip():
-        result = total_thinking.strip()
-    result = result or "(Keine Antwort)"
+        result = _strip_tool_call_tags(total_thinking).strip()
+    if not result:
+        result = "(Keine Antwort)"
+    elif _is_planning_only(result):
+        _log.warning("Subagent %s: result looks like planning text, not actual findings — flagging", resolved_name)
+        result = f"[Subagent returned planning text instead of results — may need retry]\n{result}"
     _aal.log_subagent_result(config, resolved_name, result, total_thinking)
     return result
 
@@ -3362,6 +3728,7 @@ def chat_round(
     effective_model = model
     switch_info: dict[str, str] | None = None
     last_error: Exception | None = None
+    _subagent_failed = False
 
     # Smart Compacting: History zusammenfassen wenn Quota überschritten
     compacted_messages = list(messages)
@@ -3406,7 +3773,7 @@ def chat_round(
                     _log_estimated_tokens(config, system_effective, msgs, tools)
                     _aal.log_prompt(config, try_model, user_content, len(system_effective), len(msgs))
                     _ctx_log.log_context(config, try_model, system_effective, msgs, tools=tools, num_ctx=num_ctx, think=think)
-                _api_timeout = float(config.get("api_timeout") or 600)
+                _api_timeout = float(config.get("api_timeout") or 900)
                 response = None
                 _t0 = time.monotonic()
                 _usage_type = "vision" if images else "chat"
@@ -3508,12 +3875,23 @@ def chat_round(
                         msgs_final = msgs
                         effective_model = try_model
                         break
+                if _subagent_failed:
+                    _guard_results = _guard_subagent_fallback(tool_calls, msgs, config, project_dir)
+                    if _guard_results is not None:
+                        for name, args, result in _guard_results:
+                            msgs.append({"role": "tool", "tool_name": name, "content": result})
+                        _subagent_failed = False
+                        rounds += 1
+                        continue
+                    _subagent_failed = False
+
                 tool_results = _run_tools_maybe_concurrent(tool_calls, config, project_dir)
+                _subagent_failed = False
                 for name, args, result in tool_results:
-                    _aal.log_tool_call(config, name, args, result)
                     msgs.append({"role": "tool", "tool_name": name, "content": result})
+                    if name == "invoke_model" and _is_subagent_failure(result):
+                        _subagent_failed = True
                     if name in ("send_image", "send_audio"):
-                        # Web/API: Bild kommt als Markdown-Image im Content → nicht unterdrücken
                         _img_platform = (config.get("_chat_context") or {}).get("platform")
                         if _img_platform not in ("web", "api"):
                             _sent_image = True
@@ -3577,7 +3955,6 @@ def chat_round(
                         msgs.append({"role": "assistant", "content": _nudge_hist, "thinking": nudge_msg.get("thinking") or "", "tool_calls": nudge_resp.get("message", {}).get("tool_calls") or []})
                         nudge_results = _run_tools_maybe_concurrent(nudge_tool_calls, config, project_dir)
                         for n, a, r in nudge_results:
-                            _aal.log_tool_call(config, n, a, r)
                             msgs.append({"role": "tool", "tool_name": n, "content": r})
                         # Nochmal Model aufrufen für finale Antwort (ohne tools → nur Text)
                         try:
@@ -3760,6 +4137,7 @@ def chat_round_stream(
     total_thinking = ""
     total_content = ""
     _sent_image = False
+    _subagent_failed = False
     rounds = 0
     _stream_start = time.monotonic()  # Gesamtzeit für TPS-Berechnung im done-Event
     _ctx_max = _compact_num_ctx  # num_ctx für Kontext-Auslastungsanzeige (bereits berechnet)
@@ -3769,7 +4147,7 @@ def chat_round_stream(
     while rounds < max_tool_rounds:
         # Per-round smart compaction: after round 0, check if tool results grew context past budget.
         # Use prompt_eval_count from last response (accurate) + delta estimate for new messages.
-        if rounds > 0 and len(msgs) >= 6:
+        if rounds > 0 and len(msgs) >= 4:
             _new_delta = _messages_token_estimate(msgs[_msgs_len_at_call:])
             _ctx_for_check = (
                 (_last_real_ctx + _new_delta) if _last_real_ctx is not None
@@ -3818,6 +4196,10 @@ def chat_round_stream(
         _msgs_len_at_call = len(msgs)   # snapshot for per-round delta estimation
         _t0_stream = time.monotonic()
         _stream_usage_type = "vision" if images else "chat"
+        _stall_timeout = float(config.get("stream_stall_timeout") or 120)
+        _round_wall_clock = float(config.get("stream_round_timeout") or 600)
+        _stream_log = _aal.StreamLogger(config)
+        _stream_log.start(try_model, role="orchestrator")
         try:
             for attempt in range(3):
                 round_thinking = ""
@@ -3825,7 +4207,7 @@ def chat_round_stream(
                 round_tool_calls_raw = []
                 _tc_stream_buf = ""      # Buffer für tool_call-Tag-Erkennung über Chunk-Grenzen
                 _raw_stream_content = "" # Unbereinigter Content für Tool-Call-Extraction
-                _stream_timeout = float(config.get("api_timeout") or 600)
+                _stream_timeout = float(config.get("api_timeout") or 900)
                 try:
                     _stream_gen = lambda: _dispatch_chat_stream(
                         config, try_model, msgs,
@@ -3833,13 +4215,42 @@ def chat_round_stream(
                         tools=tools, options=options or None,
                         timeout=_stream_timeout,
                     )
-                    for chunk in _iter_with_keepalive(_stream_gen):
+                    _last_any_chunk_at = time.monotonic()
+                    _round_start = time.monotonic()
+                    _thinking_start = 0.0
+                    _has_any_content = False
+                    _thinking_timeout = float(config.get("stream_thinking_timeout") or 300)
+                    _stall_warned = False
+                    for chunk in _iter_with_keepalive(_stream_gen, max_timeout=_round_wall_clock):
                         if chunk is None:
-                            # Keepalive: Modell wird noch geladen
-                            yield {"type": "status", "message": "⏳ Modell wird geladen…"}
+                            _now = time.monotonic()
+                            _elapsed_no_chunk = _now - _last_any_chunk_at
+                            _elapsed_round = _now - _round_start
+                            if _elapsed_round > _round_wall_clock:
+                                _log.warning("Stream round wall-clock exceeded (%.0fs > %.0fs) — aborting", _elapsed_round, _round_wall_clock)
+                                yield {"type": "status", "message": f"⚠️ Runde abgebrochen (Zeitlimit {int(_round_wall_clock)}s)"}
+                                break
+                            if _thinking_start and not _has_any_content and (_now - _thinking_start) > _thinking_timeout:
+                                _log.warning("Thinking stall: model thinking for %.0fs without content (threshold: %.0fs)", _now - _thinking_start, _thinking_timeout)
+                                yield {"type": "status", "message": f"⚠️ Modell denkt seit {int(_now - _thinking_start)}s ohne Antwort — breche ab"}
+                                break
+                            if _elapsed_no_chunk > _stall_timeout * 2:
+                                _log.warning("Stream stall: hard abort after %.0fs without chunks (threshold: %.0fs)", _elapsed_no_chunk, _stall_timeout * 2)
+                                yield {"type": "status", "message": f"⚠️ Modell reagiert seit {int(_elapsed_no_chunk)}s nicht — breche ab"}
+                                break
+                            elif _elapsed_no_chunk > _stall_timeout and not _stall_warned:
+                                _log.warning("Stream stall: no chunk for %.0fs (threshold: %.0fs)", _elapsed_no_chunk, _stall_timeout)
+                                yield {"type": "status", "message": f"⏳ Modell reagiert seit {int(_elapsed_no_chunk)}s nicht…"}
+                                _stall_warned = True
+                            elif not _stall_warned:
+                                yield {"type": "status", "message": "⏳ Modell wird geladen…"}
                             continue
+                        _last_any_chunk_at = time.monotonic()
+                        _stall_warned = False
                         msg = chunk.get("message") or {}
                         if msg.get("thinking"):
+                            if not _thinking_start:
+                                _thinking_start = time.monotonic()
                             round_thinking += msg["thinking"]
                             # Tool-Call-XML aus Thinking-Display entfernen (Modell schreibt manchmal
                             # <tool_call>-Blöcke in seinen Denkprozess; im History-Content belassen,
@@ -3848,10 +4259,13 @@ def chat_round_stream(
                                 any(tag in msg["thinking"] for tag in ("<tool_call>", "<tools>", "<function=", "<exec>", "<web_search>", "<read_url>", "<check_url>"))
                             ) else msg["thinking"]
                             if _think_display:
+                                _stream_log.thinking_delta(_think_display)
                                 yield {"type": "thinking", "delta": _think_display}
                         if msg.get("content"):
-                            # Tool-Call-XML buffered entfernen — Tags können über Chunk-Grenzen gehen
+                            _has_any_content = True
+                            _thinking_start = 0.0
                             _raw_stream_content += msg["content"]
+                            _stream_log.content_delta(msg["content"])
                             # <details type="reasoning"> aus Display-Buffer entfernen:
                             # llama-swap dupliziert thinking als <details>-Blöcke im content-Feld
                             # (zusätzlich zu reasoning_content). Für Display und History nicht nötig.
@@ -3940,6 +4354,7 @@ def chat_round_stream(
                 _err_delta = f"⚠️ Verbindungsfehler (Runde {rounds + 1}): {str(e)[:120]}"
                 yield {"type": "content", "delta": _err_delta}
                 total_content = _err_delta
+            _stream_log.finish()
             yield {"type": "done", "error": str(e), "thinking": total_thinking, "content": total_content, "new_messages": msgs, "debug_info": None, "switch_info": switch_info, "ctx": [_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs), _ctx_max]}
             return
 
@@ -3988,7 +4403,7 @@ def chat_round_stream(
             _rt = round_thinking or full_msg.get("thinking") or ""
 
             # Halluziniertes Bild erkannt (base64 oder fake URL)? → strippen, Korrektur-Runde starten
-            if _has_hallucinated_image(_rc) and rounds < max_rounds:
+            if _has_hallucinated_image(_rc) and rounds < max_tool_rounds:
                 _log.info("Halluziniertes Bild im Stream erkannt — sende Korrektur-Nudge (Runde %d)", rounds)
                 if _rc in total_content:
                     total_content = total_content.replace(_rc, "")
@@ -4005,8 +4420,6 @@ def chat_round_stream(
 
             # Content/Thinking aus den gestreamten Deltas verwenden (Done-Chunk hat oft leere Werte)
             msgs.append({"role": "assistant", "content": _rc, "thinking": _rt})
-            _aal.log_thinking(config, _rt)
-            _aal.log_response(config, _rc, tps=_aal.extract_tps(last_response, time.monotonic() - _t0_stream, _rc, _rt))
 
             # Stuck-Prevention: wenn kein Content, Nudge senden
             # Aber NICHT wenn send_image erfolgreich war (Bild IST die Antwort)
@@ -4033,7 +4446,6 @@ def chat_round_stream(
                         msgs.append({"role": "assistant", "content": _nudge_hist, "thinking": nudge_msg.get("thinking") or "", "tool_calls": nudge_resp.get("message", {}).get("tool_calls") or []})
                         nudge_results = _run_tools_maybe_concurrent(nudge_tool_calls, config, project_dir)
                         for n, a, r in nudge_results:
-                            _aal.log_tool_call(config, n, a, r)
                             msgs.append({"role": "tool", "tool_name": n, "content": r})
                         # Finale Antwort nach Tool-Execution
                         try:
@@ -4103,6 +4515,7 @@ def chat_round_stream(
                 _aud_html = "\n\n".join(f'<audio controls src="{aud["url"]}"></audio>' for aud in _pending_auds)
                 _done_content = f"{_done_content}\n\n{_aud_html}" if _done_content else _aud_html
             # TPS: letzte Runde (_t0_stream) verwenden — schließt Tool-Wartezeit aus
+            _stream_log.finish()
             _done_tps = _aal.extract_tps(last_response, time.monotonic() - _t0_stream, _done_content, _done_thinking)
             _ctx_used = _last_real_ctx or (_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs))
             yield {"type": "done", "thinking": _done_thinking, "content": _done_content, "images": _pending_imgs, "audio": _pending_auds, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info, "tps": _done_tps, "ctx": [_ctx_used, _ctx_max]}
@@ -4137,9 +4550,22 @@ def chat_round_stream(
                 _final_content, _final_thinking = _clean_response(
                     "" if _sent_image else total_content.strip(), total_thinking.strip())
                 yield {"type": "content", "delta": "\n\n*(Verarbeitung abgebrochen)*"}
+                _stream_log.finish()
                 _cancel_tps = _aal.extract_tps(last_response, time.monotonic() - _t0_stream, _final_content, _final_thinking)
                 yield {"type": "done", "thinking": _final_thinking, "content": _final_content, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info, "tps": _cancel_tps, "ctx": [_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs), _ctx_max]}
                 return
+        # Hard Guard: nach Subagent-Fehler keine Research-Tools erlauben
+        if _subagent_failed:
+            _guard_results = _guard_subagent_fallback(tool_calls, msgs, config, project_dir)
+            if _guard_results is not None:
+                for name, args, result in _guard_results:
+                    msgs.append({"role": "tool", "tool_name": name, "content": result})
+                    yield {"type": "status", "message": f"⛔ Tool {name} blockiert (Subagent fehlgeschlagen)"}
+                _subagent_failed = False
+                rounds += 1
+                continue
+            _subagent_failed = False
+
         # Client-Tool-Routing: Tools die der Client lokal ausführen soll
         _tool_hook = config.get("_tool_request_hook")
         _client_tool_set: set[str] = set(config.get("_client_tools") or [])
@@ -4173,13 +4599,16 @@ def chat_round_stream(
             msgs.append({"role": "tool", "tool_name": _ct_name, "content": _ct_result})
 
         if _server_calls:
+            _stream_log._maybe_flush(force=True)
             # Status-Callback einrichten: wait-Tool kann Fortschrittsmeldungen einstellen
             _tool_status_q: Queue = Queue()
             config["_tool_status_callback"] = _tool_status_q.put_nowait
             # Tool-Execution mit Keepalive (wait, Playwright etc. können Minuten dauern)
+            _tool_max_timeout = float(config.get("tool_execution_timeout") or 900)
             tool_results = None
             for _item in _call_with_keepalive(
-                lambda: _run_tools_maybe_concurrent(_server_calls, config, project_dir)
+                lambda: _run_tools_maybe_concurrent(_server_calls, config, project_dir),
+                max_timeout=_tool_max_timeout,
             ):
                 if _item is None:
                     # Neueste Status-Message vom wait-Tool abholen (falls vorhanden)
@@ -4194,10 +4623,10 @@ def chat_round_stream(
                     tool_results = _item
             config.pop("_tool_status_callback", None)
             for name, args, result in (tool_results or []):
-                _aal.log_tool_call(config, name, args, result)
                 msgs.append({"role": "tool", "tool_name": name, "content": result})
+                if name == "invoke_model" and _is_subagent_failure(result):
+                    _subagent_failed = True
                 if name in ("send_image", "send_audio"):
-                    # Web/API: Bild/Audio kommt als HTML im Content zurück → nicht unterdrücken
                     _img_platform = (config.get("_chat_context") or {}).get("platform")
                     if _img_platform not in ("web", "api"):
                         _sent_image = True
@@ -4253,7 +4682,6 @@ def chat_round_stream(
                 msgs.append({"role": "assistant", "content": _nudge_hist, "thinking": nudge_msg.get("thinking") or "", "tool_calls": nudge_resp.get("message", {}).get("tool_calls") or []})
                 nudge_results = _run_tools_maybe_concurrent(nudge_tool_calls, config, project_dir)
                 for n, a, r in nudge_results:
-                    _aal.log_tool_call(config, n, a, r)
                     msgs.append({"role": "tool", "tool_name": n, "content": r})
                 try:
                     final_resp = _dispatch_chat(
@@ -4277,11 +4705,6 @@ def chat_round_stream(
                     yield {"type": "content", "delta": _nudge_c}
         except Exception as nudge_err:
             _log.warning("Stream nudge (max rounds) failed: %s", nudge_err)
-
-    # Response loggen wenn es noch nicht innerhalb der Schleife geloggt wurde
-    # TPS: letzte Runde (_t0_stream) — keine Tool-Wartezeit im Nenner
-    if total_content.strip():
-        _aal.log_response(config, total_content.strip(), tps=_aal.extract_tps(last_response, time.monotonic() - _t0_stream, total_content.strip(), total_thinking))
 
     # send_image war erfolgreich → Content unterdrücken (Bild IST die Antwort)
     _final_content, _final_thinking = _clean_response(
@@ -4309,6 +4732,7 @@ def chat_round_stream(
         if _m.get("role") == "assistant" and _m.get("content") and "base64," in _m["content"]:
             _m["content"] = _strip_hallucinated_base64(_m["content"])
 
+    _stream_log.finish()
     _final_tps = _aal.extract_tps(last_response, time.monotonic() - _t0_stream, _final_content, _final_thinking)
     yield {"type": "done", "thinking": _final_thinking, "content": _final_content, "images": _pending_imgs, "audio": _pending_auds, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info, "tps": _final_tps, "ctx": [_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs), _ctx_max]}
 

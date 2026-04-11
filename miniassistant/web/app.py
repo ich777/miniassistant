@@ -37,6 +37,16 @@ from miniassistant.ollama_client import resolve_model
 ROOT = Path(__file__).resolve().parent.parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
+def _is_path_within(target: Path, base: Path) -> bool:
+    """Sichere Pfad-Prüfung: True wenn target innerhalb von base liegt.
+    Verwendet resolve() + is_relative_to() statt unsicherem startswith()."""
+    try:
+        target.resolve().relative_to(base.resolve())
+        return True
+    except ValueError:
+        return False
+
+
 # In-Memory-Sessions (session_id -> session dict)
 _sessions: dict[str, dict] = {}
 _session_last_access: dict[str, float] = {}  # session_id -> timestamp (letzter Zugriff)
@@ -267,7 +277,12 @@ async def _rate_limit_middleware(request: Request, call_next):
     path = request.url.path
     if path.startswith("/static/") or path == "/favicon.ico":
         return await call_next(request)
-    ip = (request.client.host if request.client else None) or "unknown"
+    ip = (
+        request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or request.headers.get("x-real-ip", "").strip()
+        or (request.client.host if request.client else None)
+        or "unknown"
+    )
     if not _check_rate_limit(ip, path):
         return JSONResponse(
             status_code=429,
@@ -1548,7 +1563,8 @@ async def api_config_save(request: Request):
 
 @app.get("/api/token")
 async def api_show_token(request: Request):
-    """Token anzeigen (nur wenn bereits gesetzt; sonst 204)."""
+    """Token anzeigen (nur wenn bereits gesetzt; sonst 204). Erfordert gültiges Token."""
+    _require_token(request)
     cfg = load_config()
     t = (cfg.get("server") or {}).get("token")
     if not t:
@@ -3333,7 +3349,7 @@ async def api_workspace_files(request: Request):
     workspace = Path(config.get("workspace") or "").expanduser().resolve()
     rel = request.query_params.get("path", "").strip().lstrip("/")
     target = (workspace / rel).resolve()
-    if not str(target).startswith(str(workspace)):
+    if not _is_path_within(target, workspace):
         raise HTTPException(status_code=403, detail="Pfad außerhalb des Workspace")
     if not target.exists():
         return JSONResponse({"error": "Verzeichnis nicht gefunden", "items": []})
@@ -3369,7 +3385,7 @@ async def api_workspace_file(request: Request):
     workspace = Path(config.get("workspace") or "").expanduser().resolve()
     rel = request.query_params.get("path", "").strip().lstrip("/")
     target = (workspace / rel).resolve()
-    if not str(target).startswith(str(workspace)):
+    if not _is_path_within(target, workspace):
         raise HTTPException(status_code=403, detail="Pfad außerhalb des Workspace")
     if not target.exists() or not target.is_file():
         return JSONResponse({"error": "Datei nicht gefunden"})
@@ -3391,10 +3407,9 @@ async def api_workspace_file(request: Request):
 
 
 @app.get("/api/img/{img_name}")
-async def api_serve_generated_image(img_name: str):
-    """Liefert ein generiertes Bild aus workspace/images/ anhand des Dateinamens (ohne Endung).
-    Kein Token nötig — der Dateiname ist durch Timestamp bereits unique genug für lokale Setups.
-    Permanent: kein Verfall, kein RAM-Registry."""
+async def api_serve_generated_image(img_name: str, request: Request):
+    """Liefert ein generiertes Bild aus workspace/images/."""
+    _require_token(request)
     config = load_config()
     workspace = Path(config.get("workspace") or "").expanduser().resolve()
     if not workspace.is_dir():
@@ -3406,19 +3421,18 @@ async def api_serve_generated_image(img_name: str):
         if img_name.lower().endswith(ext):
             # img_name hat bereits Extension: direkt als Dateiname versuchen
             candidate = (workspace / "images" / img_name).resolve()
-            if str(candidate).startswith(str(workspace)) and candidate.exists():
+            if _is_path_within(candidate, workspace) and candidate.exists():
                 return FileResponse(str(candidate), media_type=mime)
-        # Fallback: Extension anhängen (Standard-Pfad)
         candidate = (workspace / "images" / f"{img_name}{ext}").resolve()
-        if str(candidate).startswith(str(workspace)) and candidate.exists():
+        if _is_path_within(candidate, workspace) and candidate.exists():
             return FileResponse(str(candidate), media_type=mime)
     raise HTTPException(status_code=404)
 
 
 @app.get("/api/audio/{audio_name}")
-async def api_serve_audio(audio_name: str):
-    """Liefert eine generierte Audio-Datei aus workspace/audio/ anhand des Dateinamens.
-    Kein Token nötig — der Dateiname enthält UUID und ist unique."""
+async def api_serve_audio(audio_name: str, request: Request):
+    """Liefert eine generierte Audio-Datei aus workspace/audio/."""
+    _require_token(request)
     config = load_config()
     workspace = Path(config.get("workspace") or "").expanduser().resolve()
     if not workspace.is_dir():
@@ -3427,11 +3441,11 @@ async def api_serve_audio(audio_name: str):
     for ext in (".wav", ".mp3", ".ogg"):
         if audio_name.lower().endswith(ext):
             candidate = (workspace / "audio" / audio_name).resolve()
-            if str(candidate).startswith(str(workspace)) and candidate.exists():
+            if _is_path_within(candidate, workspace) and candidate.exists():
                 _mime = {".wav": "audio/wav", ".mp3": "audio/mpeg", ".ogg": "audio/ogg"}[ext]
                 return FileResponse(str(candidate), media_type=_mime)
         candidate = (workspace / "audio" / f"{audio_name}{ext}").resolve()
-        if str(candidate).startswith(str(workspace)) and candidate.exists():
+        if _is_path_within(candidate, workspace) and candidate.exists():
             _mime = {".wav": "audio/wav", ".mp3": "audio/mpeg", ".ogg": "audio/ogg"}[ext]
             return FileResponse(str(candidate), media_type=_mime)
     raise HTTPException(status_code=404)
@@ -3445,7 +3459,7 @@ async def api_workspace_raw(request: Request):
     workspace = Path(config.get("workspace") or "").expanduser().resolve()
     rel = request.query_params.get("path", "").strip().lstrip("/")
     target = (workspace / rel).resolve()
-    if not str(target).startswith(str(workspace)):
+    if not _is_path_within(target, workspace):
         raise HTTPException(status_code=403, detail="Pfad außerhalb des Workspace")
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404)
@@ -3466,7 +3480,7 @@ async def api_workspace_delete(request: Request):
     config = load_config()
     workspace = Path(config.get("workspace") or "").expanduser().resolve()
     target = (workspace / rel).resolve()
-    if not str(target).startswith(str(workspace)):
+    if not _is_path_within(target, workspace):
         raise HTTPException(status_code=403, detail="Pfad außerhalb des Workspace")
     if not target.exists():
         return JSONResponse({"error": "Nicht gefunden"})
@@ -3513,7 +3527,7 @@ async def api_workspace_trash_file(request: Request):
     trash_dir = Path(config.get("trash_dir") or "~/.trash").expanduser().resolve()
     rel = request.query_params.get("path", "").strip().lstrip("/")
     target = (trash_dir / rel).resolve()
-    if not str(target).startswith(str(trash_dir)):
+    if not _is_path_within(target, trash_dir):
         raise HTTPException(status_code=403, detail="Pfad außerhalb des Papierkorbs")
     if not target.exists() or not target.is_file():
         return JSONResponse({"error": "Datei nicht gefunden"})
@@ -3542,7 +3556,7 @@ async def api_workspace_trash_raw(request: Request):
     trash_dir = Path(config.get("trash_dir") or "~/.trash").expanduser().resolve()
     rel = request.query_params.get("path", "").strip().lstrip("/")
     target = (trash_dir / rel).resolve()
-    if not str(target).startswith(str(trash_dir)):
+    if not _is_path_within(target, trash_dir):
         raise HTTPException(status_code=403, detail="Pfad außerhalb des Papierkorbs")
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404)
@@ -3776,7 +3790,7 @@ async def api_chats_file(request: Request):
     if not stem:
         return JSONResponse({"error": "Kein stem angegeben"})
     target = (chats_dir / (stem + ".json")).resolve()
-    if not str(target).startswith(str(chats_dir.resolve())):
+    if not _is_path_within(target, chats_dir):
         raise HTTPException(status_code=403)
     if not target.exists():
         return JSONResponse({"error": "Datei nicht gefunden"})
@@ -3799,7 +3813,7 @@ async def api_chats_resume(request: Request):
     config = load_config()
     chats_dir = _get_chats_dir(config)
     sidecar = (chats_dir / (stem + ".json")).resolve()
-    if not str(sidecar).startswith(str(chats_dir.resolve())):
+    if not _is_path_within(sidecar, chats_dir):
         raise HTTPException(status_code=403)
     if not sidecar.exists():
         return JSONResponse({"error": "Keine gespeicherte Session für diesen Chat"})
