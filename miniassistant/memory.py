@@ -86,6 +86,7 @@ def append_exchange(
     user_content: str,
     assistant_content: str,
     project_dir: str | None = None,
+    user_id: str | None = None,
 ) -> Path | None:
     """
     Hängt einen User/Assistant-Austausch an die Tages-Datei an.
@@ -104,11 +105,13 @@ def append_exchange(
     path = d / f"{_today_iso()}.md"
     user_line = (user_content or "").strip().replace("\n", " ")
     asst_block = (assistant_content or "").strip()
-    line = f"User: {user_line}\nAssistant: {asst_block}\n\n"
+    # Format with user_id prefix if available (e.g., for Discord/Matrix tracking)
+    user_prefix = f"User [{user_id}]: " if user_id else "User: "
+    line = f"{user_prefix}{user_line}\nAssistant: {asst_block}\n\n"
     with open(path, "a", encoding="utf-8") as f:
         f.write(line)
     # mempalace Dual-Write (fire-and-forget, Fehler ignorieren)
-    _mempalace_store(user_content, assistant_content, project_dir)
+    _mempalace_store(user_content, assistant_content, project_dir, user_id)
     return path
 
 
@@ -439,6 +442,7 @@ def _mempalace_store(
     user_content: str | None,
     assistant_content: str | None,
     project_dir: str | None = None,
+    user_id: str | None = None,
 ) -> None:
     """Speichert einen Exchange als mempalace-Drawer (fire-and-forget)."""
     mp_cfg = _get_mempalace_config(project_dir)
@@ -463,7 +467,9 @@ def _mempalace_store(
         # Assistent-Antwort auf sinnvolle Länge kürzen für Drawer
         if len(asst_block) > 800:
             asst_block = asst_block[:797] + "..."
-        content = f"User: {user_line}\nAssistant: {asst_block}"
+        # Add user_id prefix for tracking
+        user_prefix = f"User [{user_id}]: " if user_id else "User: "
+        content = f"{user_prefix}{user_line}\nAssistant: {asst_block}"
 
         import hashlib
         doc_id = hashlib.sha256(content.encode()).hexdigest()[:16]

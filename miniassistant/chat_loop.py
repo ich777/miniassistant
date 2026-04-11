@@ -4560,7 +4560,10 @@ def handle_user_input(
 
     # Memory: nur Inhalt speichern (kein Thinking), täglich, für späteren Auszug
     try:
-        append_exchange(rest, content or "", project_dir=project_dir)
+        # Extract user_id from chat_context if available (for Discord/Matrix user tracking)
+        chat_ctx = session.get("chat_context") or {}
+        user_id = chat_ctx.get("user_id")
+        append_exchange(rest, content or "", project_dir=project_dir, user_id=user_id)
     except Exception:
         pass
 
