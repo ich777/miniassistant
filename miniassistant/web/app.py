@@ -1855,10 +1855,10 @@ async def api_chat_stream(request: Request):
         session = create_session(None, project_dir)
         if restore_msgs and isinstance(restore_msgs, list):
             session["messages"] = [m for m in restore_msgs if isinstance(m, dict)]
-        if body.get("track"):
-            session["_track_chat"] = True
         _sessions[session_id] = session
-    
+    if body.get("track"):
+        session["_track_chat"] = True
+
     # Modell aus Body lesen und in Session setzen
     requested_model = body.get("model")
     if requested_model:
@@ -1867,9 +1867,9 @@ async def api_chat_stream(request: Request):
     _session_last_access[session_id] = time.time()
 
     # Cancellation-User-ID setzen (damit chat_round_stream bei Disconnect abbrechen kann)
-    # chat_context auf Session setzen (für handle_user_input → System-Prompt-Injection + Tools)
-    if "chat_context" not in session:
-        session["chat_context"] = {"platform": "web", "user_id": f"web:{session_id}"}
+    # chat_context: immer Web — handle_user_input persistiert nur bei _track_chat
+    session.setdefault("chat_context", {})["platform"] = "web"
+    session["chat_context"]["user_id"] = f"web:{session_id}"
     session["config"].setdefault("_chat_context", {})["user_id"] = f"web:{session_id}"
     session["config"]["_chat_context"]["platform"] = "web"
 
@@ -2022,10 +2022,18 @@ async def api_chat(request: Request):
         project_dir = getattr(request.app.state, "project_dir", None)
         session = create_session(None, project_dir)
         _sessions[session_id] = session
+    if body.get("track"):
+        session["_track_chat"] = True
     _session_last_access[session_id] = time.time()
     # Run in threadpool to avoid blocking the event loop during Ollama model pulls
     loop = asyncio.get_event_loop()
     executor = _chat_executor
+    # Wie /api/chat/stream: Web-Plattform setzen — handle_user_input persistiert nur bei _track_chat
+    session.setdefault("chat_context", {})["platform"] = "web"
+    session["chat_context"]["user_id"] = f"web:{session_id}"
+    session["config"].setdefault("_chat_context", {})["user_id"] = f"web:{session_id}"
+    session["config"]["_chat_context"]["platform"] = "web"
+
     result = await loop.run_in_executor(executor, lambda: handle_user_input(session, message))
     response_text = result[0]
     session = result[1]

@@ -311,6 +311,9 @@ async def chat_completions(request: Request):
             detail="No model specified and no default model configured",
         )
 
+    # Memory/mempalace nur bei explizitem Wunsch (wie Web-Chat mit track)
+    _persist_exchange = bool(body.get("persist_memory") or body.get("track"))
+
     # --- API-Kontext setzen (Platform-Info für Schedule-Tool und System-Prompt) ---
     # _api_base_url wird von send_image / Bildgenerierung genutzt um absolute URLs
     # zu bauen (statt base64, das OpenWebUI-Chunk-Limits sprengt).
@@ -354,7 +357,10 @@ async def chat_completions(request: Request):
             damit der Event-Loop nicht blockiert wird."""
             from miniassistant.web.app import _chat_executor
             _loop = asyncio.get_event_loop()
-            gen = _stream_generator(config, resolved, internal_messages, system_prompt, completion_id, model_display, project_dir, _vl_images)
+            gen = _stream_generator(
+                config, resolved, internal_messages, system_prompt, completion_id, model_display,
+                project_dir, _vl_images, persist_exchange=_persist_exchange,
+            )
             _sentinel = object()
             while True:
                 chunk = await _loop.run_in_executor(_chat_executor, lambda: next(gen, _sentinel))
@@ -434,8 +440,8 @@ async def chat_completions(request: Request):
         content,
     )
 
-    # Memory speichern
-    append_exchange(user_content, content)
+    if _persist_exchange:
+        append_exchange(user_content, content)
 
     return JSONResponse(_make_response(completion_id, model_display, content, thinking or None))
 
@@ -449,6 +455,8 @@ def _stream_generator(
     model_display: str,
     project_dir: str | None = None,
     images: list[dict[str, Any]] | None = None,
+    *,
+    persist_exchange: bool = False,
 ):
     """SSE-Stream-Generator im OpenAI-Format (data: {...}\\n\\n).
     Nutzt chat_round_stream für vollständige Tool-Execution."""
@@ -569,8 +577,8 @@ def _stream_generator(
 
     # chat_round_stream loggt intern (PROMPT, TOOL, RESPONSE) — kein extra Logging hier
 
-    # Memory speichern
-    append_exchange(user_content, total_content)
+    if persist_exchange:
+        append_exchange(user_content, total_content)
 
     # Finish-Chunk
     yield _make_stream_chunk(completion_id, model_display, finish_reason="stop")

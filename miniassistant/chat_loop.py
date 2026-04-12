@@ -304,6 +304,39 @@ _SUBAGENT_FAILURE_MARKERS = (
 )
 
 _RESEARCH_TOOLS = frozenset({"web_search", "read_url", "check_url", "exec"})
+_SYNC_TOOLS = frozenset({"invoke_model", "web_search", "read_url", "check_url", "debate"})
+
+
+def _filter_wait_after_sync(
+    tool_calls: list[tuple[str, dict[str, Any] | str]],
+    msgs: list[dict[str, Any]],
+) -> tuple[list[tuple[str, dict[str, Any] | str]], list[tuple[str, dict[str, Any] | str, str]]]:
+    """Blockt `wait` wenn die vorherige Runde synchrone Tools enthielt.
+    Returns (filtered_calls, blocked_results)."""
+    has_wait = any(n == "wait" for n, _ in tool_calls)
+    if not has_wait:
+        return tool_calls, []
+    prev_tool_names: set[str] = set()
+    for m in reversed(msgs):
+        if m.get("role") == "tool":
+            prev_tool_names.add(m.get("tool_name", ""))
+        elif m.get("role") == "assistant":
+            break
+    if not prev_tool_names & _SYNC_TOOLS:
+        return tool_calls, []
+    filtered = []
+    blocked: list[tuple[str, dict[str, Any] | str, str]] = []
+    for n, a in tool_calls:
+        if n == "wait":
+            blocked.append((n, a,
+                "BLOCKED: wait is not allowed after synchronous tools (invoke_model, web_search, "
+                "read_url, check_url, debate). These tools return results IMMEDIATELY — there is "
+                "nothing running in the background to wait for. Process the tool results directly."
+            ))
+            _log.warning("GUARD: Blocking wait after synchronous tools: %s", prev_tool_names & _SYNC_TOOLS)
+        else:
+            filtered.append((n, a))
+    return filtered, blocked
 
 
 def _is_subagent_failure(result: str) -> bool:
@@ -1924,9 +1957,12 @@ def _run_tool(
             _img_p = _Path(image_path).resolve()
             if platform == "web":
                 _workspace = _Path(config.get("workspace") or "").expanduser().resolve()
-                if str(_img_p).startswith(str(_workspace)):
+                try:
                     _rel = str(_img_p.relative_to(_workspace))
-                    from urllib.parse import quote as _url_quote
+                except ValueError:
+                    _rel = None
+                from urllib.parse import quote as _url_quote
+                if _rel is not None:
                     _img_url = f"/api/workspace/raw?path={_url_quote(_rel)}"
                 else:
                     _img_url = f"/api/workspace/raw?path={_url_quote(str(_img_p))}"
@@ -2125,6 +2161,21 @@ def _run_tool(
         sub_model = arguments.get("model", "").strip()
         if not topic or not perspective_a or not perspective_b or not sub_model:
             return "debate requires 'topic', 'perspective_a', 'perspective_b', and 'model'"
+        _all_text = f"{topic} {perspective_a} {perspective_b}".lower()
+        _RESEARCH_KEYWORDS = (
+            "recherch", "such ", "find", "herausfinden", "research",
+            "information", "überblick", "overview", "tools", "software",
+            "apps", "programme", "liste", "empfehl", "vergleich",
+            "welche ", "was gibt es", "was kann man",
+        )
+        if any(kw in _all_text for kw in _RESEARCH_KEYWORDS):
+            _log.warning("GUARD: debate called with research topic — redirecting to invoke_model. topic=%s", topic[:100])
+            return (
+                "BLOCKED: This topic is a RESEARCH task, not a debate. "
+                "You used the debate tool, but the user wants information/research, not a discussion. "
+                f"Use invoke_model instead to delegate research about: '{topic}'. "
+                "Call invoke_model once per subtopic with specific search instructions."
+            )
         model_b = arguments.get("model_b", "").strip() or sub_model
         rounds = max(1, min(10, int(arguments.get("rounds", 3) or 3)))
         language = arguments.get("language", "").strip() or "Deutsch"
@@ -2169,10 +2220,7 @@ def _run_tool(
         _edit_image_path = (arguments.get("image_path") or "").strip()
         if _edit_image_path:
             _img_params["image_path"] = _edit_image_path
-        if _img_params:
-            config["_img_gen_params"] = _img_params
-        else:
-            config.pop("_img_gen_params", None)
+        _img_gen_params_snapshot = dict(_img_params) if _img_params else None
         resolved = resolve_model(config, sub_model) or sub_model
         provider_type = get_provider_type(config, resolved)
         _, api_model_sub = get_provider_config(config, resolved)
@@ -2242,7 +2290,12 @@ def _run_tool(
                 _log.info("invoke_model: retry %d/%d for %s after error: %s",
                           _invoke_attempt + 1, _max_invoke_attempts, resolved, _last_invoke_err)
                 time.sleep(5)
-                _t0_sub = time.monotonic()  # Timer für Retry neu starten
+                _t0_sub = time.monotonic()
+            # Set params atomically before each attempt, clean up in finally
+            if _img_gen_params_snapshot:
+                config["_img_gen_params"] = dict(_img_gen_params_snapshot)
+            else:
+                config.pop("_img_gen_params", None)
             try:
                 if provider_type == "claude-code":
                     _sub_result = _run_subagent_claude_code(
@@ -2313,6 +2366,8 @@ def _run_tool(
                 err = f"invoke_model failed ({resolved}) after {_max_invoke_attempts} attempts: {e}"
                 _aal.log_subagent_result(config, resolved, err, "")
                 return err
+            finally:
+                config.pop("_img_gen_params", None)
     return f"Unknown tool: {name}"
 
 
@@ -2704,6 +2759,8 @@ def _run_subagent_anthropic(
     total_thinking = ""
     _ALLOWED_SUB_TOOLS = {"exec", "web_search", "check_url", "read_url"}
     rounds_used = 0
+    _consecutive_search_fails = 0
+    _MAX_SEARCH_FAILS = 2
     for _round in range(int(config.get("max_tool_rounds", 15))):
         try:
             r = api_chat(
@@ -2712,8 +2769,22 @@ def _run_subagent_anthropic(
                 base_url=base_url or ANTHROPIC_API_URL,
             )
         except Exception as e:
-            total_content += f"[Anthropic API error: {e}]"
-            break
+            _err_str = str(e).lower()
+            if "context" in _err_str and ("exceeded" in _err_str or "size" in _err_str or "length" in _err_str or "too long" in _err_str):
+                _log.warning("Subagent %s (anthropic): context exceeded — trimming", resolved_name)
+                msgs = _trim_subagent_msgs(msgs, system, sub_tools, None, quota=0.60)
+                try:
+                    r = api_chat(
+                        msgs, api_key=api_key, model=api_model,
+                        system=system, thinking=think, tools=sub_tools,
+                        base_url=base_url or ANTHROPIC_API_URL,
+                    )
+                except Exception as e2:
+                    total_content += f"[Anthropic API error: {e2}]"
+                    break
+            else:
+                total_content += f"[Anthropic API error: {e}]"
+                break
         msg = r.get("message") or {}
         if msg.get("thinking"):
             total_thinking += msg["thinking"]
@@ -2742,22 +2813,10 @@ def _run_subagent_anthropic(
                 _exec_r = run_exec(tc_args.get("command", ""), cwd=_ws, extra_env=_exec_env(config))
                 tool_result = f"returncode: {_exec_r['returncode']}\nstdout:\n{_exec_r['stdout']}\nstderr:\n{_exec_r['stderr']}"
             elif tc_name == "web_search":
-                from miniassistant.config import get_search_engine_url
-                _ws_url = get_search_engine_url(config, tc_args.get("engine"))
-                if not _ws_url:
-                    tool_result = "web_search not configured"
-                else:
-                    _ws_res = tool_web_search(_ws_url, tc_args.get("query", ""), categories=tc_args.get("categories"))
-                    if _ws_res.get("error"):
-                        tool_result = f"Error: {_ws_res['error']}"
-                    else:
-                        _ws_lines = []
-                        for _r in _ws_res.get("results") or []:
-                            _wl = f"- {_r.get('title', '')} | {_r.get('url', '')}\n  {_r.get('snippet', '')}"
-                            if _r.get("img_src"):
-                                _wl += f"\n  img_src: {_r['img_src']}"
-                            _ws_lines.append(_wl)
-                        tool_result = "\n".join(_ws_lines) if _ws_lines else "Search engine returned no results. This is a search engine failure — do NOT conclude that nothing exists. Tell the user the search returned no results and suggest rephrasing."
+                tool_result, _consecutive_search_fails = _subagent_web_search(
+                    config, tc_args, resolved_name,
+                    consecutive_fails=_consecutive_search_fails, max_fails=_MAX_SEARCH_FAILS,
+                )
             elif tc_name == "check_url":
                 _cu_r = tool_check_url(tc_args.get("url", ""))
                 _cu_parts = [f"reachable: {_cu_r.get('reachable', False)}", f"status_code: {_cu_r.get('status_code', '')}"]
@@ -2830,6 +2889,8 @@ def _run_subagent_google(
     total_thinking = ""
     _ALLOWED_SUB_TOOLS = {"exec", "web_search", "check_url", "read_url"}
     rounds_used = 0
+    _consecutive_search_fails = 0
+    _MAX_SEARCH_FAILS = 2
     for _round in range(int(config.get("max_tool_rounds", 15))):
         try:
             r = google_chat(
@@ -2839,8 +2900,23 @@ def _run_subagent_google(
                 image_generation=is_img_gen,
             )
         except Exception as e:
-            total_content += f"[Google API error: {e}]"
-            break
+            _err_str = str(e).lower()
+            if "context" in _err_str or "too long" in _err_str or "payload" in _err_str:
+                _log.warning("Subagent %s (google): context/payload exceeded — trimming", resolved_name)
+                msgs = _trim_subagent_msgs(msgs, system, sub_tools, None, quota=0.60)
+                try:
+                    r = google_chat(
+                        msgs, api_key=api_key, model=api_model,
+                        system=system, thinking=think, tools=sub_tools,
+                        base_url=base_url or GOOGLE_API_URL,
+                        image_generation=is_img_gen,
+                    )
+                except Exception as e2:
+                    total_content += f"[Google API error: {e2}]"
+                    break
+            else:
+                total_content += f"[Google API error: {e}]"
+                break
         msg = r.get("message") or {}
         if msg.get("thinking"):
             total_thinking += msg["thinking"]
@@ -2869,22 +2945,10 @@ def _run_subagent_google(
                 _exec_r = run_exec(tc_args.get("command", ""), cwd=_ws, extra_env=_exec_env(config))
                 tool_result = f"returncode: {_exec_r['returncode']}\nstdout:\n{_exec_r['stdout']}\nstderr:\n{_exec_r['stderr']}"
             elif tc_name == "web_search":
-                from miniassistant.config import get_search_engine_url
-                _ws_url = get_search_engine_url(config, tc_args.get("engine"))
-                if not _ws_url:
-                    tool_result = "web_search not configured"
-                else:
-                    _ws_res = tool_web_search(_ws_url, tc_args.get("query", ""), categories=tc_args.get("categories"))
-                    if _ws_res.get("error"):
-                        tool_result = f"Error: {_ws_res['error']}"
-                    else:
-                        _ws_lines = []
-                        for _r in _ws_res.get("results") or []:
-                            _wl = f"- {_r.get('title', '')} | {_r.get('url', '')}\n  {_r.get('snippet', '')}"
-                            if _r.get("img_src"):
-                                _wl += f"\n  img_src: {_r['img_src']}"
-                            _ws_lines.append(_wl)
-                        tool_result = "\n".join(_ws_lines) if _ws_lines else "Search engine returned no results. This is a search engine failure — do NOT conclude that nothing exists. Tell the user the search returned no results and suggest rephrasing."
+                tool_result, _consecutive_search_fails = _subagent_web_search(
+                    config, tc_args, resolved_name,
+                    consecutive_fails=_consecutive_search_fails, max_fails=_MAX_SEARCH_FAILS,
+                )
             elif tc_name == "check_url":
                 _cu_r = tool_check_url(tc_args.get("url", ""))
                 _cu_parts = [f"reachable: {_cu_r.get('reachable', False)}", f"status_code: {_cu_r.get('status_code', '')}"]
@@ -2929,6 +2993,21 @@ def _run_subagent_google(
         if saved_paths:
             paths_str = ", ".join(f"`{p}`" for p in saved_paths)
             total_content += f"\n\nBild(er) gespeichert: {paths_str}"
+            _img_ctx = config.get("_chat_context") or {}
+            _img_platform = _img_ctx.get("platform")
+            _api_base = _img_ctx.get("_api_base_url", "")
+            for _sp in saved_paths:
+                _sp_p = _Path(_sp)
+                if _img_platform == "web":
+                    _img_url = f"/api/workspace/raw?path=images/{_sp_p.name}"
+                elif _api_base:
+                    _img_url = f"{_api_base}/api/img/{_sp_p.stem}"
+                else:
+                    _img_url = f"data:image/png;base64,{_b64.b64encode(_sp_p.read_bytes()).decode()}"
+                config.setdefault("_pending_images", []).append({
+                    "url": _img_url,
+                    "caption": "Generiertes Bild",
+                })
 
     result = _strip_tool_call_tags(total_content).strip()
     if not result:
@@ -3083,6 +3162,8 @@ def _run_subagent_openai(
     total_thinking = ""
     _ALLOWED_SUB_TOOLS = {"exec", "web_search", "check_url", "read_url"}
     rounds_used = 0
+    _consecutive_search_fails = 0
+    _MAX_SEARCH_FAILS = 2
     for _round in range(int(config.get("max_tool_rounds", 15))):
         # Proaktiv compacten bevor Context voll ist
         msgs = _compact_subagent_msgs(config, msgs, resolved_name, system, sub_tools, _sub_num_ctx)
@@ -3138,22 +3219,10 @@ def _run_subagent_openai(
                 _exec_r = run_exec(tc_args.get("command", ""), cwd=_ws, extra_env=_exec_env(config))
                 tool_result = f"returncode: {_exec_r['returncode']}\nstdout:\n{_exec_r['stdout']}\nstderr:\n{_exec_r['stderr']}"
             elif tc_name == "web_search":
-                from miniassistant.config import get_search_engine_url
-                _ws_url = get_search_engine_url(config, tc_args.get("engine"))
-                if not _ws_url:
-                    tool_result = "web_search not configured"
-                else:
-                    _ws_res = tool_web_search(_ws_url, tc_args.get("query", ""), categories=tc_args.get("categories"))
-                    if _ws_res.get("error"):
-                        tool_result = f"Error: {_ws_res['error']}"
-                    else:
-                        _ws_lines = []
-                        for _r in _ws_res.get("results") or []:
-                            _wl = f"- {_r.get('title', '')} | {_r.get('url', '')}\n  {_r.get('snippet', '')}"
-                            if _r.get("img_src"):
-                                _wl += f"\n  img_src: {_r['img_src']}"
-                            _ws_lines.append(_wl)
-                        tool_result = "\n".join(_ws_lines) if _ws_lines else "Search engine returned no results. This is a search engine failure — do NOT conclude that nothing exists. Tell the user the search returned no results and suggest rephrasing."
+                tool_result, _consecutive_search_fails = _subagent_web_search(
+                    config, tc_args, resolved_name,
+                    consecutive_fails=_consecutive_search_fails, max_fails=_MAX_SEARCH_FAILS,
+                )
             elif tc_name == "check_url":
                 _cu_r = tool_check_url(tc_args.get("url", ""))
                 _cu_parts = [f"reachable: {_cu_r.get('reachable', False)}", f"status_code: {_cu_r.get('status_code', '')}"]
@@ -3186,6 +3255,87 @@ def _run_subagent_openai(
     return result
 
 
+# ---------------------------------------------------------------------------
+# Shared subagent web_search helper (engine fallback + consecutive-fail counter)
+# ---------------------------------------------------------------------------
+
+def _subagent_web_search(
+    config: dict[str, Any],
+    tc_args: dict[str, Any],
+    resolved_name: str,
+    consecutive_fails: int = 0,
+    max_fails: int = 2,
+) -> tuple[str, int]:
+    """Shared web_search logic for ALL subagent types.
+
+    Returns (tool_result, updated_consecutive_fails).
+    Includes engine fallback and consecutive-fail counter.
+    """
+    if consecutive_fails >= max_fails:
+        _log.warning("Subagent %s: blocking web_search after %d consecutive failures", resolved_name, consecutive_fails)
+        return (
+            f"BLOCKED: {consecutive_fails} consecutive searches returned no results. "
+            "The search engine appears to be unavailable or these queries are too specific. "
+            "STOP searching. Summarize what you already know and give your answer now."
+        ), consecutive_fails
+
+    from miniassistant.config import get_search_engine_url
+    _ws_url = get_search_engine_url(config, tc_args.get("engine"))
+    if not _ws_url:
+        return "web_search not configured (no search_engines or invalid engine)", consecutive_fails
+
+    _ws_query = tc_args.get("query", "")
+    _ws_cats = tc_args.get("categories")
+    _ws_res = tool_web_search(_ws_url, _ws_query, categories=_ws_cats)
+    _ws_lines: list[str] = []
+    if not _ws_res.get("error"):
+        for _r in _ws_res.get("results") or []:
+            _wl = f"- {_r.get('title', '')} | {_r.get('url', '')}\n  {_r.get('snippet', '')}"
+            if _r.get("img_src"):
+                _wl += f"\n  img_src: {_r['img_src']}"
+            _ws_lines.append(_wl)
+
+    # Engine-Fallback wenn keine Ergebnisse
+    if not _ws_lines:
+        _strategy = (config.get("search_engine_strategy") or "first").strip().lower()
+        if _strategy != "specific":
+            import random as _rng
+            _others = [
+                eid for eid, ecfg in (config.get("search_engines") or {}).items()
+                if (ecfg.get("url") or "").strip() and (ecfg.get("url") or "").strip() != _ws_url
+            ]
+            _rng.shuffle(_others)
+            for _alt_eid in _others:
+                _alt_url = (config.get("search_engines") or {})[_alt_eid].get("url", "").strip()
+                if not _alt_url:
+                    continue
+                _alt_res = tool_web_search(_alt_url, _ws_query, categories=_ws_cats)
+                if _alt_res.get("error") or not _alt_res.get("results"):
+                    continue
+                for _r in _alt_res["results"]:
+                    _wl = f"- {_r.get('title', '')} | {_r.get('url', '')}\n  {_r.get('snippet', '')}"
+                    if _r.get("img_src"):
+                        _wl += f"\n  img_src: {_r['img_src']}"
+                    _ws_lines.append(_wl)
+                if _ws_lines:
+                    _log.info("Subagent %s: search fallback to engine '%s' succeeded", resolved_name, _alt_eid)
+                    break
+
+    if _ws_lines:
+        return "\n".join(_ws_lines), 0  # reset counter on success
+
+    consecutive_fails += 1
+    if consecutive_fails >= max_fails:
+        return (
+            f"BLOCKED: {consecutive_fails} consecutive searches returned no results. "
+            "STOP searching. Summarize what you already know and give your answer now."
+        ), consecutive_fails
+    return (
+        f"Search engine returned no results ({consecutive_fails}/{max_fails} consecutive failures). "
+        "Try a simpler/shorter query, or use read_url on a known URL instead."
+    ), consecutive_fails
+
+
 def _run_subagent_with_tools(
     config: dict[str, Any],
     base_url: str,
@@ -3212,7 +3362,7 @@ def _run_subagent_with_tools(
     _ALLOWED_SUB_TOOLS = {"exec", "web_search", "check_url", "read_url"}
     rounds_used = 0
     _consecutive_search_fails = 0
-    _MAX_SEARCH_FAILS = 3
+    _MAX_SEARCH_FAILS = 2
     for _round in range(max_rounds):
         # Proaktiv compacten bevor Context voll ist
         msgs = _compact_subagent_msgs(config, msgs, resolved_name, system, tools, num_ctx)
@@ -3287,42 +3437,10 @@ def _run_subagent_with_tools(
                 _exec_r = run_exec(tc_args.get("command", ""), cwd=_ws, extra_env=_exec_env(config))
                 tool_result = f"returncode: {_exec_r['returncode']}\nstdout:\n{_exec_r['stdout']}\nstderr:\n{_exec_r['stderr']}"
             elif tc_name == "web_search":
-                if _consecutive_search_fails >= _MAX_SEARCH_FAILS:
-                    tool_result = (
-                        f"BLOCKED: {_consecutive_search_fails} consecutive searches returned no results. "
-                        "The search engine appears to be unavailable or these queries are too specific. "
-                        "STOP searching. Summarize what you already know and give your answer now."
-                    )
-                    _log.warning("Subagent %s: blocking web_search after %d consecutive failures", resolved_name, _consecutive_search_fails)
-                else:
-                    from miniassistant.config import get_search_engine_url
-                    _ws_url = get_search_engine_url(config, tc_args.get("engine"))
-                    if not _ws_url:
-                        tool_result = "web_search not configured (no search_engines or invalid engine)"
-                    else:
-                        _ws_res = tool_web_search(_ws_url, tc_args.get("query", ""), categories=tc_args.get("categories"))
-                        if _ws_res.get("error"):
-                            tool_result = f"Error: {_ws_res['error']}"
-                            _consecutive_search_fails += 1
-                        else:
-                            _ws_lines = []
-                            for _r in _ws_res.get("results") or []:
-                                _wl = f"- {_r.get('title', '')} | {_r.get('url', '')}\n  {_r.get('snippet', '')}"
-                                if _r.get("img_src"):
-                                    _wl += f"\n  img_src: {_r['img_src']}"
-                                _ws_lines.append(_wl)
-                            if _ws_lines:
-                                tool_result = "\n".join(_ws_lines)
-                                _consecutive_search_fails = 0
-                            else:
-                                _consecutive_search_fails += 1
-                                tool_result = (
-                                    f"Search engine returned no results ({_consecutive_search_fails}/{_MAX_SEARCH_FAILS} consecutive failures). "
-                                    "Try a simpler/shorter query, or use read_url on a known URL instead."
-                                ) if _consecutive_search_fails < _MAX_SEARCH_FAILS else (
-                                    f"BLOCKED: {_consecutive_search_fails} consecutive searches returned no results. "
-                                    "STOP searching. Summarize what you already know and give your answer now."
-                                )
+                tool_result, _consecutive_search_fails = _subagent_web_search(
+                    config, tc_args, resolved_name,
+                    consecutive_fails=_consecutive_search_fails, max_fails=_MAX_SEARCH_FAILS,
+                )
             elif tc_name == "check_url":
                 _cu_r = tool_check_url(tc_args.get("url", ""))
                 _cu_parts = [f"reachable: {_cu_r.get('reachable', False)}", f"status_code: {_cu_r.get('status_code', '')}"]
@@ -3369,19 +3487,10 @@ def _run_subagent_with_tools(
                             _exec_r = run_exec(tc_args.get("command", ""), cwd=_ws, extra_env=_exec_env(config))
                             tool_result = f"returncode: {_exec_r['returncode']}\nstdout:\n{_exec_r['stdout']}\nstderr:\n{_exec_r['stderr']}"
                         elif tc_name == "web_search":
-                            from miniassistant.config import get_search_engine_url
-                            _ws_url = get_search_engine_url(config, tc_args.get("engine"))
-                            _ws_res = tool_web_search(_ws_url, tc_args.get("query", ""), categories=tc_args.get("categories")) if _ws_url else {"error": "not configured"}
-                            if not _ws_res.get("error"):
-                                _nws_lines = []
-                                for _r in (_ws_res.get("results") or []):
-                                    _nwl = f"- {_r.get('title','')} | {_r.get('url','')}\n  {_r.get('snippet','')}"
-                                    if _r.get("img_src"):
-                                        _nwl += f"\n  img_src: {_r['img_src']}"
-                                    _nws_lines.append(_nwl)
-                                tool_result = "\n".join(_nws_lines)
-                            else:
-                                tool_result = f"Error: {_ws_res.get('error')}"
+                            tool_result, _consecutive_search_fails = _subagent_web_search(
+                                config, tc_args, resolved_name,
+                                consecutive_fails=_consecutive_search_fails, max_fails=_MAX_SEARCH_FAILS,
+                            )
                         elif tc_name == "read_url":
                             _ru_r = tool_read_url(tc_args.get("url", ""), config=config, proxy=tc_args.get("proxy"), js=bool(tc_args.get("js", False)))
                             tool_result = _ru_r.get("content", "") if _ru_r.get("ok") else f"Error: {_ru_r.get('error', 'unknown')}"
@@ -3883,10 +3992,14 @@ def chat_round(
                         _subagent_failed = False
                         rounds += 1
                         continue
-                    _subagent_failed = False
+                    if any(n == "invoke_model" for n, _ in tool_calls):
+                        _subagent_failed = False
+
+                tool_calls, _wait_blocked = _filter_wait_after_sync(tool_calls, msgs)
+                for _wb_name, _wb_args, _wb_result in _wait_blocked:
+                    msgs.append({"role": "tool", "tool_name": _wb_name, "content": _wb_result})
 
                 tool_results = _run_tools_maybe_concurrent(tool_calls, config, project_dir)
-                _subagent_failed = False
                 for name, args, result in tool_results:
                     msgs.append({"role": "tool", "tool_name": name, "content": result})
                     if name == "invoke_model" and _is_subagent_failure(result):
@@ -4564,7 +4677,14 @@ def chat_round_stream(
                 _subagent_failed = False
                 rounds += 1
                 continue
-            _subagent_failed = False
+            if any(n == "invoke_model" for n, _ in tool_calls):
+                _subagent_failed = False
+
+        # Guard: wait nach synchronen Tools blocken
+        tool_calls, _wait_blocked = _filter_wait_after_sync(tool_calls, msgs)
+        for _wb_name, _wb_args, _wb_result in _wait_blocked:
+            msgs.append({"role": "tool", "tool_name": _wb_name, "content": _wb_result})
+            yield {"type": "status", "message": f"⛔ wait blockiert (synchrone Tools im Vorrunde)"}
 
         # Client-Tool-Routing: Tools die der Client lokal ausführen soll
         _tool_hook = config.get("_tool_request_hook")
@@ -4787,6 +4907,18 @@ def create_session(config: dict[str, Any] | None = None, project_dir: str | None
     }
 
 
+def _should_append_exchange_to_memory(session: dict[str, Any], config: dict[str, Any]) -> bool:
+    """Nur bei Web/API-Chat in Memory + mempalace schreiben, wenn der Nutzer explizit speichert.
+
+    Matrix, Discord, CLI, Scheduler: weiterhin immer persistieren (kein track-Flag).
+    """
+    _ctx = (config.get("_chat_context") or session.get("chat_context") or {})
+    _p = str(_ctx.get("platform") or "").strip().lower()
+    if _p in ("web", "api"):
+        return bool(session.get("_track_chat"))
+    return True
+
+
 def handle_user_input(
     session: dict[str, Any],
     user_input: str,
@@ -4991,14 +5123,15 @@ def handle_user_input(
                 _msg["content"] = "[Bild angehängt] " + (_msg.get("content") or "")
     session["messages"] = new_messages
 
-    # Memory: nur Inhalt speichern (kein Thinking), täglich, für späteren Auszug
-    try:
-        # Extract user_id from chat_context if available (for Discord/Matrix user tracking)
-        chat_ctx = session.get("chat_context") or {}
-        user_id = chat_ctx.get("user_id")
-        append_exchange(rest, content or "", project_dir=project_dir, user_id=user_id)
-    except Exception:
-        pass
+    # Memory + mempalace: Web/API nur mit explizitem Speichern (_track_chat), sonst nichts persistieren
+    if _should_append_exchange_to_memory(session, config):
+        try:
+            # Extract user_id from chat_context if available (for Discord/Matrix user tracking)
+            chat_ctx = session.get("chat_context") or {}
+            user_id = chat_ctx.get("user_id")
+            append_exchange(rest, content or "", project_dir=project_dir, user_id=user_id)
+        except Exception:
+            pass
 
     response_text = f"[Thinking]\n{thinking}\n\n{content}" if (thinking and content) else (thinking if thinking else (content or "(Keine Antwort)"))
     if did_compact:
