@@ -612,20 +612,14 @@ def _merge_with_defaults(data: dict[str, Any]) -> dict[str, Any]:
             "palace_path": (data.get("mempalace") or {}).get("palace_path", ""),
             "identity_path": (data.get("mempalace") or {}).get("identity_path", ""),
         },
-        # Top-level Tuning-Keys: passthrough (None wenn nicht gesetzt → Caller nutzt `or <default>`)
-        "api_timeout": data.get("api_timeout"),
-        "subagent_api_timeout": data.get("subagent_api_timeout"),
-        "invoke_model_timeout": data.get("invoke_model_timeout"),
-        "tool_execution_timeout": data.get("tool_execution_timeout"),
-        "schedule_timeout": data.get("schedule_timeout"),
-        "stream_stall_timeout": data.get("stream_stall_timeout"),
-        "stream_thinking_timeout": data.get("stream_thinking_timeout"),
-        "stream_round_timeout": data.get("stream_round_timeout"),
-        "max_tool_rounds": data.get("max_tool_rounds"),
-        "exec_max_output_chars": data.get("exec_max_output_chars"),
-        "search_engine_strategy": data.get("search_engine_strategy"),
-        "prefs_max_chars": data.get("prefs_max_chars"),
-        "prefs_max_chars_per_file": data.get("prefs_max_chars_per_file"),
+        # Top-level Tuning-Keys: nur einfügen wenn in YAML gesetzt (Key fehlt → Caller-Default greift)
+        **{k: data[k] for k in (
+            "api_timeout", "subagent_api_timeout", "invoke_model_timeout",
+            "tool_execution_timeout", "schedule_timeout",
+            "stream_stall_timeout", "stream_thinking_timeout", "stream_round_timeout",
+            "max_tool_rounds", "exec_max_output_chars",
+            "search_engine_strategy", "prefs_max_chars", "prefs_max_chars_per_file",
+        ) if k in data and data[k] is not None},
     }
 
 
