@@ -27,6 +27,9 @@ Scheduled tasks are managed by the **schedule** tool and stored in `schedules.js
 - `client`: `'matrix'` / `'discord'` (default: room/channel where schedule was created)
 - `model`: model alias to use (only set if user explicitly requests it)
 
+**Weekday numbering (5th field):** APScheduler, NOT UNIX cron. `0=Mon, 1=Tue, ..., 6=Sun`. 
+Use names to avoid confusion: `mon,tue,wed,thu,fri,sat,sun`. Ranges work: `mon-fri`. Classic cron `* * * * 0` (Sunday) fires on **Monday** here. 
+
 ## Prompt rules — critical
 - **Plain language only for simple tasks.** Write WHAT to do, not HOW: `'List open issues from GitHub repo OWNER/REPO via GitHub API'` ✅
 - **For API calls or exec tasks: be explicit.** The schedule runs in a new session with no memory of the current conversation. If you discovered the right endpoint, command, or approach in this session — encode it directly into the prompt. See "Prompt engineering for schedules" below.
