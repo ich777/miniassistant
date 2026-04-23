@@ -92,7 +92,7 @@ User says "prüf meine Mails alle 30 Minuten":
 schedule(
   action='create',
   when='*/30 * * * *',
-  prompt='Use read_email(filter="UNSEEN") to check for new emails. For each new message: send a summary (sender, subject, 2-sentence preview). If no new messages: do nothing, send no message.'
+  prompt='Use read_email(filter="UNSEEN") to check for new emails. For each new message: send a summary (sender, subject, 2-sentence preview). If no new messages: respond with EXACTLY [NO_MESSAGE] and nothing else — the scheduler suppresses that token so the user gets no notification.'
 )
 ```
 
@@ -101,7 +101,7 @@ User says "prüf mein Arbeit-Konto alle 15 Minuten":
 schedule(
   action='create',
   when='*/15 * * * *',
-  prompt='Use read_email(filter="UNSEEN", account="arbeit") to check for new emails on the "arbeit" account. Summarize each new message. If none: do nothing.'
+  prompt='Use read_email(filter="UNSEEN", account="arbeit") to check for new emails on the "arbeit" account. Summarize each new message. If none: respond with EXACTLY [NO_MESSAGE] (scheduler suppresses it).'
 )
 ```
 

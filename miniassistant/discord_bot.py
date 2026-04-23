@@ -309,6 +309,10 @@ async def run_discord_bot(config: dict[str, Any]) -> None:
 
         if not reply:
             return
+        from miniassistant.scheduler import _SILENT_SENTINELS
+        if reply.strip() in _SILENT_SENTINELS:
+            logger.info("Discord: Antwort ist Silent-Sentinel (%s) — kein Send", reply.strip())
+            return
         # Discord hat ein 2000-Zeichen-Limit pro Nachricht
         if len(reply) <= 2000:
             await message.reply(reply)

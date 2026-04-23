@@ -837,7 +837,11 @@ async def run_matrix_bot(config: dict[str, Any]) -> None:
                 except Exception:
                     pass
         if reply:
-            await _send_room_message(client, room_id, reply)
+            from miniassistant.scheduler import _SILENT_SENTINELS
+            if reply.strip() in _SILENT_SENTINELS:
+                logger.info("Matrix: Antwort ist Silent-Sentinel (%s) — kein Send", reply.strip())
+            else:
+                await _send_room_message(client, room_id, reply)
 
     async def on_encrypted_message(room_id: str, event: Any) -> None:
         """Wird nur aufgerufen, wenn nio den Event als MegolmEvent übergibt – also nach gescheitertem Entschlüsselungsversuch (Key fehlt). Raum bleibt verschlüsselt; wir markieren ihn nirgends als unverschlüsselt. Key-Request senden, dann Hinweis oder Auth-Code."""

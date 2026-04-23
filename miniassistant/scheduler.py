@@ -27,6 +27,11 @@ if not logger.handlers:
 
 _scheduler: Any = None
 
+# Responses the scheduler treats as "do not deliver to chat".
+# [WATCH:PENDING] → watch job condition not yet met.
+# [NO_MESSAGE]    → task explicitly decided to stay silent (e.g. no new mails).
+_SILENT_SENTINELS = frozenset({"[WATCH:PENDING]", "[NO_MESSAGE]"})
+
 
 def _schedules_path() -> Path:
     return Path(get_config_dir()) / "schedules.json"
@@ -81,7 +86,9 @@ def _run_scheduled_job(job_id: str, job_data: str) -> None:
         "- NEVER call Matrix/Discord APIs manually (curl to /_matrix/..., etc.). "
         "Your response text is automatically delivered to the chat — just return the formatted result.\n"
         "- Do NOT announce actions. Call tools IMMEDIATELY and return ONLY the final result.\n"
-        "- After completing the task: STOP. Do not process any other topic or question.\n\n"
+        "- After completing the task: STOP. Do not process any other topic or question.\n"
+        "- SILENT RESULT: Task says 'send nothing if condition X' and X is true → respond EXACTLY [NO_MESSAGE], nothing else. "
+        "Scheduler suppresses delivery. Never explain — just the token.\n\n"
         "THE TASK:\n"
     )
 
@@ -94,8 +101,9 @@ def _run_scheduled_job(job_id: str, job_data: str) -> None:
             logger.info("Job %s prompt (model=%s): %s", job_id[:8], model or "default", prompt[:80])
             response = _run_prompt(full_prompt, model=model, scheduled_prompt=prompt, client=client, room_id=room_id, channel_id=channel_id)
             logger.info("Job %s antwort: %d Zeichen", job_id[:8], len(response))
-            if response.strip() == "[WATCH:PENDING]":
-                logger.info("Job %s watch pending — keine Benachrichtigung", job_id[:8])
+            _stripped = response.strip()
+            if _stripped in _SILENT_SENTINELS:
+                logger.info("Job %s silent (%s) — keine Benachrichtigung", job_id[:8], _stripped)
             else:
                 _send_to_client(response, client, room_id=room_id, channel_id=channel_id)
             logger.info("Job %s -> %s gesendet", job_id[:8], client or "alle")
@@ -180,7 +188,7 @@ def _run_prompt(
     # Wenn nein aber Content vorhanden → wahrscheinlich Ankündigung statt Aktion.
     msgs = session.get("messages", [])
     tool_calls_made = any(m.get("role") == "tool" for m in msgs)
-    if not tool_calls_made and content and content.strip() not in ("[WATCH:PENDING]",):
+    if not tool_calls_made and content and content.strip() not in _SILENT_SENTINELS:
         logger.warning(
             "Schedule: Modell hat KEINE Tools aufgerufen aber Text produziert (%d Zeichen) — sende Nudge",
             len(content),

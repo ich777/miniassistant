@@ -646,6 +646,7 @@ def _merge_with_defaults(data: dict[str, Any]) -> dict[str, Any]:
             "stream_stall_timeout", "stream_thinking_timeout", "stream_round_timeout",
             "max_tool_rounds", "exec_max_output_chars",
             "search_engine_strategy", "prefs_max_chars", "prefs_max_chars_per_file",
+            "respond_in_input_language",
         ) if k in data and data[k] is not None},
     }
 
@@ -750,6 +751,7 @@ def save_config(config: dict[str, Any], project_dir: str | None = None) -> Path:
         "stream_stall_timeout", "stream_thinking_timeout", "stream_round_timeout",
         "max_tool_rounds", "exec_max_output_chars",
         "search_engine_strategy", "prefs_max_chars", "prefs_max_chars_per_file",
+        "respond_in_input_language",
     ):
         _v = config.get(_k)
         if _v is not None:

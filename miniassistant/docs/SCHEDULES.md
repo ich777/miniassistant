@@ -27,8 +27,7 @@ Scheduled tasks are managed by the **schedule** tool and stored in `schedules.js
 - `client`: `'matrix'` / `'discord'` (default: room/channel where schedule was created)
 - `model`: model alias to use (only set if user explicitly requests it)
 
-**Weekday numbering (5th field):** APScheduler, NOT UNIX cron. `0=Mon, 1=Tue, ..., 6=Sun`. 
-Use names to avoid confusion: `mon,tue,wed,thu,fri,sat,sun`. Ranges work: `mon-fri`. Classic cron `* * * * 0` (Sunday) fires on **Monday** here. 
+**Weekday numbering (5th field):** APScheduler, NOT UNIX cron. `0=Mon, 1=Tue, ..., 6=Sun`. Use names to avoid confusion: `mon,tue,wed,thu,fri,sat,sun`. Ranges work: `mon-fri`. Classic cron `* * * * 0` (Sunday) fires on **Monday** here.
 
 ## Prompt rules — critical
 - **Plain language only for simple tasks.** Write WHAT to do, not HOW: `'List open issues from GitHub repo OWNER/REPO via GitHub API'` ✅
@@ -75,6 +74,23 @@ Not: `"check if delivered"` — the agent may check the wrong field.
 
 For general prompt engineering principles (trigger clarity, examples, avoiding vague wording): read `PROMPT_ENGINEERING.md` (same docs directory).
 
+## Silent completion — the `[NO_MESSAGE]` sentinel
+
+Schedules run in a fresh session and every non-empty response is delivered to the chat.
+If a task should only notify *conditionally* (e.g. only on new mails, only on price drop,
+only on status change), the prompt MUST instruct the executing agent to return the literal
+token `[NO_MESSAGE]` (and nothing else) when no notification is warranted.
+
+The scheduler recognizes `[NO_MESSAGE]` and suppresses delivery. Without the sentinel the
+agent will produce text like "Keine neuen Mails" — which then gets sent to the user.
+
+**Write it into the prompt explicitly:**
+```
+... If no new items: respond with EXACTLY [NO_MESSAGE] and nothing else.
+```
+
+Works for any conditional schedule, not just email (price watches, GitHub issue polls, ...).
+
 ## List & Remove
 - List: `schedule(action='list')` — shows all jobs with ID, time, prompt
 - Remove by ID: `schedule(action='remove', id='<job_id_or_prefix>')`
@@ -114,7 +130,7 @@ Files that are typically protected:
 User says "prüf meine Mails alle 30 Minuten":
 ```
 schedule(action='create', when='*/30 * * * *',
-  prompt='Check email account "privat" for new messages. Read EMAIL.md for IMAP instructions. Track reported messages in WORKSPACE/email-track-privat.md. Send a summary for each new message (sender, subject, 2-sentence preview). If no new messages: do nothing, send nothing.')
+  prompt='Check email account "privat" for new messages. Read EMAIL.md for IMAP instructions. Track reported messages in WORKSPACE/email-track-privat.md. Send a summary for each new message (sender, subject, 2-sentence preview). If no new messages: respond with EXACTLY [NO_MESSAGE] — the scheduler recognizes this token and sends nothing to the chat.')
 ```
 
 User says "richte einen Auto-Responder ein für Mails von chef@firma.de":

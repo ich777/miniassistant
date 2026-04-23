@@ -212,7 +212,7 @@ Die LLM erfährt automatisch, auf welchem System sie läuft (OS, Distribution, P
 
 ## Sprache, Merken, Scheduler
 
-- **Sprache:** Die Antwortsprache kommt aus **IDENTITY.md** (z.B. „Response language: Deutsch“ oder „language: English“). Beim Onboarding wird sie abgefragt und dort eingetragen – es gibt keinen Config-Eintrag `language` mehr.
+- **Sprache:** Priorität: `respond_in_input_language: true` in der Config (antwortet automatisch in der Sprache des Nutzerprompts) → `Response language:` in IDENTITY.md → Default Deutsch. Beim Onboarding wird die Sprache abgefragt und in IDENTITY.md eingetragen. `respond_in_input_language` ist nützlich für Multi-User-Bots (Matrix/Discord) mit gemischten Sprachen.
 - **Merken:** Das Modell weiß, dass es mit **exec** Dateien lesen/schreiben kann. Wenn `workspace` oder `agent_dir` gesetzt sind, werden diese Pfade im System-Prompt genannt – der Assistent kann dort Notizen anlegen, wenn du ihn darum bittest.
 - **Geplante Jobs (ohne System-Cron):** Optional `scheduler.enabled: true` in der Config und `pip install miniassistant[scheduler]`. Dann steht das Tool **schedule** zur Verfügung (Cron z. B. `0 9 * * *` oder „in 30 minutes“). Jobs werden beim `serve` ausgeführt.
 - **Nutzungs-Tracking:** Optional `server.track_usage: true` – zeichnet jeden LLM-Aufruf (Modell, Typ, Dauer in Sekunden) als CSV in `$config_dir/usage/usage.csv` auf. In der Web-UI unter `/nutzung` mit Zeitfiltern (Stunde, Tag, Woche, Monat, Jahr) und Charts einsehbar.

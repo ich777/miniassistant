@@ -408,7 +408,7 @@ def _language_from_identity_md(identity_md: str) -> str:
     if not (identity_md or "").strip():
         return ""
     import re
-    for m in re.finditer(r"(?i)(?:response\s+language|language|sprache)\s*[:\-]\s*([A-Za-z\u00C0-\u024F]+)", identity_md):
+    for m in re.finditer(r"(?i)(?:response\s+language|language|sprache)\s*[:\-]\s*\*{0,2}([A-Za-z\u00C0-\u024F]+)", identity_md):
         return m.group(1).strip()
     return ""
 
@@ -429,7 +429,14 @@ def _filter_language_blocks(rule: str, lang: str) -> str:
 
 
 def _language_section(config: dict[str, Any], identity_md_content: str = "") -> str:
-    """Response language from IDENTITY.md only; default Deutsch."""
+    """Response language: config.respond_in_input_language > IDENTITY.md > default Deutsch."""
+    if config.get("respond_in_input_language"):
+        rule = _get_rule("language.md")
+        header = "## Language\nDetect the language of the user's message and always respond in that same language. Do not switch languages unless the user explicitly asks for it.\n\n"
+        if rule:
+            rule = _filter_language_blocks(rule, "")
+            return header + rule + "\n\n"
+        return header
     lang = _language_from_identity_md(identity_md_content) or "Deutsch"
     rule = _get_rule("language.md")
     if rule:
@@ -747,6 +754,10 @@ def _tools_section(config: dict[str, Any]) -> str:
             "- `status_update`: Send an **intermediate message** to the user during multi-step tasks.\n"
             "  Use it to report progress (e.g. 'Schritt 3/7 erledigt'), share interim findings, or ask for input when you are stuck.\n"
             "  Keep updates short (1-3 sentences). Do NOT use for the final answer — that goes in your normal response."
+        )
+        lines.append(
+            "- **Silent result:** Task says 'send nothing if condition X' and X is true → respond EXACTLY `[NO_MESSAGE]`, nothing else. "
+            "Client suppresses delivery. Never explain, never summarize — just the token."
         )
     else:
         lines.append("- No chat clients configured; notifications unavailable.")

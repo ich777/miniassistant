@@ -1818,7 +1818,11 @@ def _chat_stream_generator_locked(session_id: str, session: dict, message: str, 
             session["messages"] = _done_msgs
             _sessions[session_id] = session
             # Memory + Chat-History: nur bei gespeicherten Chats (track=1)
+            from miniassistant.scheduler import _SILENT_SENTINELS
             done_content = (ev.get("content") or "").strip()
+            if done_content in _SILENT_SENTINELS:
+                out["content"] = ""
+                done_content = ""
             if done_content and message.strip() and session.get("_track_chat"):
                 try:
                     from miniassistant.memory import append_exchange
@@ -1923,6 +1927,9 @@ async def api_chat_stream(request: Request):
         thinking = result[3] if len(result) > 3 else None
         # content (result[4]) ist bei Befehlen None – dann auf result[0] (Antworttext) zurückfallen
         content = (result[4] if len(result) > 4 else None) or result[0]
+        from miniassistant.scheduler import _SILENT_SENTINELS
+        if (content or "").strip() in _SILENT_SENTINELS:
+            content = ""
         import json as _json
         payload: dict = {
             "type": "done",

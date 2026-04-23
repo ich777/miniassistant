@@ -241,7 +241,7 @@ providers:
 
 Absoluter oder relativer Pfad; Tilde wird auf das Home-Verzeichnis aufgelöst.
 
-**Rollen der Dateien (OpenClaw-inspiriert, schlank):** AGENTS.md = optionaler Top-Level-Vertrag (Prioritäten, Grenzen, Qualitätsbarriere; wenige Zeilen). SOUL = Persönlichkeit, Ton, Werte. IDENTITY = Name, Rolle, Ziele, **Antwortsprache** (z. B. „Response language: Deutsch“ – die Sprache kommt nur aus IDENTITY.md, nicht aus der Config). TOOLS = Umgebung, Pfade, Hinweise. USER = Nutzer-Präferenzen, Format. AGENTS.md wird zuerst ins Prompt geladen; fehlt sie, erscheint ein Hinweis. Merken über workspace/exec bzw. Memory bei Modellwechsel.
+**Rollen der Dateien (OpenClaw-inspiriert, schlank):** AGENTS.md = optionaler Top-Level-Vertrag (Prioritäten, Grenzen, Qualitätsbarriere; wenige Zeilen). SOUL = Persönlichkeit, Ton, Werte. IDENTITY = Name, Rolle, Ziele, **Antwortsprache** (z. B. „Response language: Deutsch“). TOOLS = Umgebung, Pfade, Hinweise. USER = Nutzer-Präferenzen, Format. AGENTS.md wird zuerst ins Prompt geladen; fehlt sie, erscheint ein Hinweis. Merken über workspace/exec bzw. Memory bei Modellwechsel. **Antwortsprache-Priorität:** `respond_in_input_language: true` (Config) → `Response language:` in IDENTITY.md → Default Deutsch.
 
 ---
 
@@ -421,6 +421,7 @@ read_url:
 | `max_chars_per_file` | integer | nein | `500` | Maximale Zeichen pro Agent-Datei (SOUL.md, IDENTITY.md, TOOLS.md, USER.md, AGENTS.md) die in den System-Prompt geladen werden. Längere Dateien werden gekürzt. Kleiner = weniger Kontextverbrauch. |
 | `prefs_max_chars` | integer | nein | `2500` | Maximale Zeichen gesamt fuer Stored preferences (prefs/*, *.md im agent_dir). |
 | `prefs_max_chars_per_file` | integer | nein | `1000` | Maximale Zeichen pro Pref-Datei; jede Datei wird vor dem Einbau auf dieses Limit gekuerzt. |
+| `respond_in_input_language` | boolean | nein | `false` | Wenn `true`: Antwortet automatisch in der Sprache des eingehenden Nutzerprompts (Spracherkennung). Überschreibt die `Response language` in IDENTITY.md. Nützlich bei Multi-User-Bots (Matrix/Discord) mit gemischten Sprachen. Default bleibt Deutsch wenn nicht gesetzt und IDENTITY.md keine Sprache vorgibt. |
 | `scheduler` | Objekt | nein | (nicht gesetzt) | Wenn `enabled: true`: Tool **schedule** verfuegbar. |
 | `chat_clients` | Objekt | nein | (nicht gesetzt) | Chat-Client-Anbindungen (Matrix, Discord). Siehe unten. |
 
