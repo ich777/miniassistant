@@ -423,7 +423,9 @@ def _tools_schema(
                 "always try read_url with the FULL URL including the query/number FIRST. "
                 "CANNOT fill forms or click buttons. Only if the site truly REQUIRES filling a form: "
                 "escalate to exec+Playwright (read docs/WEB_FETCHING.md). "
-                "Never guess URLs from memory — verify with web_search first."
+                "Never guess URLs from memory — verify with web_search first. "
+                "Output is capped at max_chars (default 8000). If you see a '[... truncated: X of Y chars ...]' "
+                "marker and the missing content matters, re-call with max_chars set to the full Y value."
             ),
             "parameters": {
                 "type": "object",
@@ -431,6 +433,7 @@ def _tools_schema(
                     "url": {"type": "string", "description": "Full URL to read (e.g. https://en.wikipedia.org/wiki/Topic)"},
                     "proxy": {"type": "string", "description": "Proxy name to use (from configured proxies). Omit to use the default proxy or direct connection."},
                     "js": {"type": "boolean", "description": "Set true for JS-heavy pages (SPAs, React/Vue/Angular apps) that need browser rendering. Only use when plain fetch returns empty or minimal content. Requires Playwright to be installed."},
+                    "max_chars": {"type": "integer", "description": "Max characters to return (default 8000). Raise when the truncation marker indicates important content was cut — the marker states the full length; pass that value here to get everything."},
                 },
                 "required": ["url"],
             },
@@ -740,13 +743,16 @@ def get_subagent_tools_schema(config: dict[str, Any]) -> list[dict[str, Any]]:
             "description": (
                 "Read the content of a URL as clean text. "
                 "CANNOT fill forms or click buttons — use exec+Playwright for that. "
-                "Never guess or construct URLs from memory — verify with web_search first if unsure."
+                "Never guess or construct URLs from memory — verify with web_search first if unsure. "
+                "Output is capped at max_chars (default 8000); raise it when the truncation marker "
+                "shows important content was cut."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "Full URL to read"},
                     "proxy": {"type": "string", "description": "Proxy name to use (from configured proxies). Omit for default/direct."},
+                    "max_chars": {"type": "integer", "description": "Max characters to return (default 8000). Raise if the truncation marker shows important content was cut."},
                 },
                 "required": ["url"],
             },

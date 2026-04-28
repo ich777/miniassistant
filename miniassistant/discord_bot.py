@@ -84,25 +84,29 @@ def _get_chat_response(
     images: list[dict[str, Any]] | None = None,
     channel_id: str | None = None,
 ) -> str:
-    """Synchroner Aufruf: Session für discord_user_id, handle_user_input.
-    Gibt ausschließlich den sichtbaren Content zurück – KEIN Thinking."""
+    """Synchroner Aufruf: Session per (channel_id, discord_user_id), handle_user_input.
+    Gibt ausschließlich den sichtbaren Content zurück – KEIN Thinking.
+
+    Session-Key kombiniert Channel und User: gleicher User in zwei Channels → zwei separate Sessions.
+    """
     from miniassistant.chat_loop import create_session, handle_user_input
+    session_key = f"{channel_id or ''}|{discord_user_id}"
     # Set chat_context BEFORE creating session so user_id is included in system_prompt
     if channel_id:
         config["_chat_context"] = {"platform": "discord", "channel_id": channel_id, "user_id": discord_user_id}
-    if discord_user_id not in sessions:
+    if session_key not in sessions:
         session = create_session(config, None)
         session["system_prompt"] = (
             session.get("system_prompt", "") +
             "\n\nDiscord: Max 2000 Zeichen/Nachricht. Laengere Antworten mit `---` trennen, werden automatisch aufgeteilt."
         )
-        sessions[discord_user_id] = session
-    session = sessions[discord_user_id]
+        sessions[session_key] = session
+    session = sessions[session_key]
     # Chat-Kontext aktualisieren (Channel-ID kann sich ändern)
     if channel_id:
         session["chat_context"] = {"platform": "discord", "channel_id": channel_id, "user_id": discord_user_id}
     result = handle_user_input(session, user_message, allow_new_session=True, images=images)
-    sessions[discord_user_id] = result[1]
+    sessions[session_key] = result[1]
     ai_content = result[4] if len(result) > 4 else None
     thinking = result[3] if len(result) > 3 else None
     if ai_content:

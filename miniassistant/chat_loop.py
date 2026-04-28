@@ -226,6 +226,64 @@ def _strip_think_tags(content: str) -> tuple[str, str]:
     return content.strip(), "\n".join(t.strip() for t in thinking if t.strip())
 
 
+class _LoopDetector:
+    """Detects model output stuck in repetition loop (doom-loop).
+
+    Watches a rolling window of normalized lines; flags when same line
+    repeats N× consecutively, or short A/B blocks alternate, or a tail
+    segment recurs many times in the unflushed buffer (no-newline case)."""
+
+    def __init__(self, max_consecutive: int = 4, min_phrase_len: int = 15,
+                 buf_segment_repeats: int = 5, buf_segment_len: int = 40,
+                 buf_max_chars: int = 2000):
+        self._max_consecutive = max_consecutive
+        self._min_phrase_len = min_phrase_len
+        self._buf_segment_repeats = buf_segment_repeats
+        self._buf_segment_len = buf_segment_len
+        self._buf_max_chars = buf_max_chars
+        self._recent: list[str] = []
+        self._buf: str = ""
+        self.reason: str | None = None
+
+    @staticmethod
+    def _norm(s: str) -> str:
+        return " ".join(s.split()).strip().lower()
+
+    def feed(self, text: str) -> bool:
+        if not text or self.reason:
+            return bool(self.reason)
+        self._buf += text
+        if "\n" in self._buf:
+            parts = self._buf.split("\n")
+            self._buf = parts[-1]
+            for raw_line in parts[:-1]:
+                n = self._norm(raw_line)
+                if len(n) < self._min_phrase_len:
+                    continue
+                self._recent.append(n)
+                if len(self._recent) > 32:
+                    self._recent = self._recent[-32:]
+                if len(self._recent) >= self._max_consecutive:
+                    tail = self._recent[-self._max_consecutive:]
+                    if all(x == tail[0] for x in tail):
+                        self.reason = f"gleiche Zeile {self._max_consecutive}× hintereinander"
+                        return True
+                if len(self._recent) >= 8:
+                    t = self._recent[-8:]
+                    if t[0:2] == t[2:4] == t[4:6] == t[6:8]:
+                        self.reason = "2-Zeilen-Block 4× wiederholt"
+                        return True
+        if len(self._buf) > self._buf_segment_len * 4:
+            seg = self._buf[-self._buf_segment_len:]
+            if len(self._norm(seg)) >= self._buf_segment_len // 2:
+                if self._buf.lower().count(seg.lower()) >= self._buf_segment_repeats:
+                    self.reason = f"{self._buf_segment_len}-char Segment {self._buf_segment_repeats}× im Stream"
+                    return True
+        if len(self._buf) > self._buf_max_chars:
+            self._buf = self._buf[-self._buf_max_chars:]
+        return False
+
+
 def _clean_response(content: str, thinking: str) -> tuple[str, str]:
     """Strip Thinking-Tags und Tool-Call-XML aus Content und Thinking.
     Einziger Aufruf nötig am Ende jedes Response-Pfads."""
@@ -1935,7 +1993,12 @@ def _run_tool(
         url_arg = arguments.get("url", "").strip()
         if not url_arg:
             return "read_url requires url"
-        result = tool_read_url(url_arg, config=config, proxy=arguments.get("proxy"), js=bool(arguments.get("js", False)))
+        _mc_arg = arguments.get("max_chars")
+        try:
+            _mc = int(_mc_arg) if _mc_arg is not None else 8000
+        except (TypeError, ValueError):
+            _mc = 8000
+        result = tool_read_url(url_arg, max_chars=_mc, config=config, proxy=arguments.get("proxy"), js=bool(arguments.get("js", False)))
         conn = result.get("connection", "")
         if result.get("ok"):
             content = result.get("content", "")
@@ -2999,7 +3062,11 @@ def _run_subagent_anthropic(
                 if _cu_r.get("error"): _cu_parts.append(f"error: {_cu_r['error']}")
                 tool_result = "\n".join(_cu_parts)
             elif tc_name == "read_url":
-                _ru_r = tool_read_url(tc_args.get("url", ""), config=config, proxy=tc_args.get("proxy"), js=bool(tc_args.get("js", False)))
+                try:
+                    _ru_mc = int(tc_args.get("max_chars")) if tc_args.get("max_chars") is not None else 8000
+                except (TypeError, ValueError):
+                    _ru_mc = 8000
+                _ru_r = tool_read_url(tc_args.get("url", ""), max_chars=_ru_mc, config=config, proxy=tc_args.get("proxy"), js=bool(tc_args.get("js", False)))
                 _ru_conn = _ru_r.get("connection", "")
                 if _ru_r.get("ok"):
                     _ru_content = _ru_r.get("content", "")
@@ -3131,7 +3198,11 @@ def _run_subagent_google(
                 if _cu_r.get("error"): _cu_parts.append(f"error: {_cu_r['error']}")
                 tool_result = "\n".join(_cu_parts)
             elif tc_name == "read_url":
-                _ru_r = tool_read_url(tc_args.get("url", ""), config=config, proxy=tc_args.get("proxy"), js=bool(tc_args.get("js", False)))
+                try:
+                    _ru_mc = int(tc_args.get("max_chars")) if tc_args.get("max_chars") is not None else 8000
+                except (TypeError, ValueError):
+                    _ru_mc = 8000
+                _ru_r = tool_read_url(tc_args.get("url", ""), max_chars=_ru_mc, config=config, proxy=tc_args.get("proxy"), js=bool(tc_args.get("js", False)))
                 _ru_conn = _ru_r.get("connection", "")
                 if _ru_r.get("ok"):
                     _ru_content = _ru_r.get("content", "")
@@ -3853,7 +3924,11 @@ def _run_subagent_with_tools(
                                 consecutive_fails=_consecutive_search_fails, max_fails=_MAX_SEARCH_FAILS,
                             )
                         elif tc_name == "read_url":
-                            _ru_r = tool_read_url(tc_args.get("url", ""), config=config, proxy=tc_args.get("proxy"), js=bool(tc_args.get("js", False)))
+                            try:
+                                _ru_mc = int(tc_args.get("max_chars")) if tc_args.get("max_chars") is not None else 8000
+                            except (TypeError, ValueError):
+                                _ru_mc = 8000
+                            _ru_r = tool_read_url(tc_args.get("url", ""), max_chars=_ru_mc, config=config, proxy=tc_args.get("proxy"), js=bool(tc_args.get("js", False)))
                             tool_result = _ru_r.get("content", "") if _ru_r.get("ok") else f"Error: {_ru_r.get('error', 'unknown')}"
                         elif tc_name == "check_url":
                             _cu_r = tool_check_url(tc_args.get("url", ""))
@@ -4639,6 +4714,8 @@ def chat_round_stream(
     _ctx_max = _compact_num_ctx  # num_ctx für Kontext-Auslastungsanzeige (bereits berechnet)
     _last_real_ctx: int | None = None   # Exact prompt_eval_count from last Ollama response
     _msgs_len_at_call: int = len(msgs)  # msgs.length at last Ollama call (for delta estimation)
+    _loop_recovery_attempts = 0   # how many times the doom-loop guard fired this conversation
+    _loop_recovery_max = int(config.get("stream_loop_recovery_max") or 2)
 
     while rounds < max_tool_rounds:
         # Per-round smart compaction: after round 0, check if tool results grew context past budget.
@@ -4716,7 +4793,13 @@ def chat_round_stream(
                     _thinking_start = 0.0
                     _has_any_content = False
                     _thinking_timeout = float(config.get("stream_thinking_timeout") or 300)
+                    _thinking_hard_timeout = float(config.get("stream_thinking_hard_timeout") or 240)
                     _stall_warned = False
+                    _loop_detector = _LoopDetector(
+                        max_consecutive=int(config.get("stream_loop_max_consecutive") or 4),
+                    )
+                    _loop_detected = False
+                    _loop_reason = ""
                     for chunk in _iter_with_keepalive(_stream_gen, max_timeout=_round_wall_clock):
                         if chunk is None:
                             _now = time.monotonic()
@@ -4757,11 +4840,29 @@ def chat_round_stream(
                             if _think_display:
                                 _stream_log.thinking_delta(_think_display)
                                 yield {"type": "thinking", "delta": _think_display}
+                            if _loop_detector.feed(msg["thinking"]):
+                                _loop_detected = True
+                                _loop_reason = _loop_detector.reason or "Loop"
+                                _log.warning("Doom-loop detected in thinking: %s", _loop_reason)
+                                yield {"type": "status", "message": f"⚠️ Doom-Loop erkannt im Thinking: {_loop_reason} — breche ab"}
+                                break
+                            if _thinking_start and not _has_any_content and (time.monotonic() - _thinking_start) > _thinking_hard_timeout:
+                                _loop_detected = True
+                                _loop_reason = f"Thinking-Wall-Clock {int(_thinking_hard_timeout)}s ohne Content"
+                                _log.warning("Thinking hard wall-clock exceeded: %.0fs", time.monotonic() - _thinking_start)
+                                yield {"type": "status", "message": f"⚠️ Modell denkt seit {int(_thinking_hard_timeout)}s ohne Antwort — breche ab"}
+                                break
                         if msg.get("content"):
                             _has_any_content = True
                             _thinking_start = 0.0
                             _raw_stream_content += msg["content"]
                             _stream_log.content_delta(msg["content"])
+                            if _loop_detector.feed(msg["content"]):
+                                _loop_detected = True
+                                _loop_reason = _loop_detector.reason or "Loop"
+                                _log.warning("Doom-loop detected in content: %s", _loop_reason)
+                                yield {"type": "status", "message": f"⚠️ Doom-Loop erkannt im Content: {_loop_reason} — breche ab"}
+                                break
                             # <details type="reasoning"> aus Display-Buffer entfernen:
                             # llama-swap dupliziert thinking als <details>-Blöcke im content-Feld
                             # (zusätzlich zu reasoning_content). Für Display und History nicht nötig.
@@ -4853,6 +4954,43 @@ def chat_round_stream(
             _stream_log.finish()
             yield {"type": "done", "error": str(e), "thinking": total_thinking, "content": total_content, "new_messages": msgs, "debug_info": None, "switch_info": switch_info, "ctx": [_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs), _ctx_max]}
             return
+
+        # Doom-Loop-Recovery: Stream wurde wegen Repetition oder Wall-Clock abgebrochen.
+        # Verwirf korrupten Round-Output, sende Korrektur-Nudge, retry. Nach _loop_recovery_max
+        # erschöpften Versuchen → harter Abbruch mit User-Message.
+        if _loop_detected:
+            _loop_recovery_attempts += 1
+            _log.warning("Loop recovery attempt %d/%d (reason: %s, model: %s, round: %d)",
+                         _loop_recovery_attempts, _loop_recovery_max, _loop_reason, try_model, rounds)
+            if _loop_recovery_attempts > _loop_recovery_max:
+                _abort_msg = (f"⚠️ Modell ({try_model}) hängt in Endlos-Schleife fest "
+                              f"({_loop_reason}). {_loop_recovery_max} Recovery-Versuche fehlgeschlagen. "
+                              f"Bitte erneut fragen oder anderes Modell wählen.")
+                _log.error("Loop recovery exhausted — aborting conversation")
+                if total_content:
+                    total_content = total_content.rstrip() + "\n\n" + _abort_msg
+                    yield {"type": "content", "delta": "\n\n" + _abort_msg}
+                else:
+                    total_content = _abort_msg
+                    yield {"type": "content", "delta": _abort_msg}
+                msgs.append({"role": "assistant", "content": total_content.strip()})
+                _stream_log.finish()
+                _ctx_used = _last_real_ctx or (_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs))
+                yield {"type": "done", "thinking": total_thinking.strip(), "content": total_content.strip(),
+                       "new_messages": msgs, "debug_info": None, "switch_info": switch_info,
+                       "ctx": [_ctx_used, _ctx_max]}
+                return
+            # Verwirf korrupte Round-Daten — KEIN total_thinking += round_thinking
+            yield {"type": "status", "message": f"🔄 Recovery-Versuch {_loop_recovery_attempts}/{_loop_recovery_max} — sende Korrektur-Nudge"}
+            msgs.append({"role": "user", "content": (
+                f"SYSTEM: Du warst in einer Endlos-Schleife ({_loop_reason}). Dein vorheriger "
+                "Output wurde abgebrochen und verworfen. Versuche es JETZT nochmal — wenn du "
+                "ein Tool brauchst, emittiere den Tool-Call SOFORT (kein langes Thinking, "
+                "keine Wiederholung). Wenn kein Tool nötig ist, antworte direkt und kurz mit "
+                "dem Endergebnis. Halte Thinking minimal."
+            )})
+            rounds += 1
+            continue
 
         total_thinking += round_thinking
 

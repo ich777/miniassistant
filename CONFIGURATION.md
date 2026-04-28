@@ -251,6 +251,7 @@ Steuert den **Memory-Auszug** (tägliche Logs unter `agent_dir/memory/YYYY-MM-DD
 
 | Schlüssel | Typ | Pflicht? | Default | Beschreibung |
 |-----------|-----|----------|---------|--------------|
+| `enabled` | boolean | nein | `true` | **Master-Switch.** `false` = Memory komplett aus: keine Tagesdateien, kein `last_summary.json`, kein Memory-Block im System-Prompt — und mempalace wird zwangsweise deaktiviert (überschreibt `mempalace.enabled`). Tool `search_memory` verschwindet aus dem Tool-Schema. |
 | `max_chars_per_line` | integer | nein | `300` | Maximale Zeichen pro Zeile beim Lesen des Memory. Längere Zeilen werden mit „…“ gekürzt. `0` = keine Kürzung. |
 | `days` | integer | nein | `2` | Anzahl Tage Memory für den Auszug (heute + vergangene Tage). Z. B. `2` = heute und gestern. |
 
@@ -261,6 +262,13 @@ memory:
   max_chars_per_line: 400
   days: 2
   track_user_id: true
+```
+
+**Memory komplett deaktivieren** (Master-Switch — schaltet mempalace zwangsweise mit ab):
+
+```yaml
+memory:
+  enabled: false
 ```
 
 | `track_user_id` | boolean | nein | `false` | User-ID (Discord/Matrix) in Memory-Einträgen mitspeichern. Format: `User [discord_id]: ...` bzw. `User [@user:matrix.org]: ...`. Nützlich bei Multi-User-Umgebungen, um Gespräche einzelnen Nutzern zuzuordnen. |
@@ -323,6 +331,8 @@ mempalace:
 ```
 
 Wenn `mempalace.enabled: true`, werden `memory.days` / `memory.max_tokens` / `memory.max_chars_per_line` **nicht** mehr benutzt (nur Fallback wenn mempalace nicht verfügbar).
+
+> ⚠️ **Master-Switch:** `memory.enabled: false` deaktiviert mempalace zwangsweise — unabhängig von `mempalace.enabled`. Wer die gesamte Memory-Schicht (Tagesdateien + Palace + `search_memory`-Tool) abschalten will, setzt `memory.enabled: false`.
 
 ---
 
@@ -1388,12 +1398,15 @@ Automatische Gesprächs-Zusammenfassungen (letzte N Tage):
 
 ```yaml
 memory:
+  enabled: true           # Master-Switch (Default: true). false = komplett aus, mempalace zwangsweise mit deaktiviert.
   days: 2                # Tage im Prompt (Default: 2)
   max_chars_per_line: 300 # Zeilenlänge kürzen (Default: 300, 0 = kein Limit)
   max_tokens: 6000        # Token-Budget für Memory (Default: 6000)
 ```
 
 `max_tokens` verhindert, dass Memory zu viel Kontext verbraucht. Bei 32k num_ctx: ~8k System + ~6k Memory + ~1.3k Tools = ~15k, Rest für Konversation.
+
+**Memory komplett deaktivieren:** `memory.enabled: false` schaltet Tagesdateien, `last_summary.json`, den Memory-Block im System-Prompt sowie mempalace (inkl. `search_memory`-Tool) gemeinsam ab — unabhängig von `mempalace.enabled`.
 
 ---
 

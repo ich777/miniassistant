@@ -410,6 +410,14 @@ _GITHUB_RAW_FILE_RE = re.compile(
 )
 
 
+def _trunc_marker(raw: str, shown: int) -> str:
+    """Informativer Truncation-Marker mit Rest-Länge + Handlungsanweisung."""
+    total = len(raw)
+    remaining = total - shown
+    return (f"\n\n[... truncated: {shown:,} of {total:,} chars shown, {remaining:,} chars cut. "
+            f"Re-call read_url with max_chars={total} to get full content. ...]")
+
+
 def _try_github_api(url: str, gh_token: str | None, max_chars: int, timeout: float) -> dict[str, Any] | None:
     """Versucht GitHub-URLs über die API zu lesen. Gibt None zurück wenn keine GitHub-URL."""
     # Issues / Pull Requests
@@ -447,7 +455,7 @@ def _try_github_api(url: str, gh_token: str | None, max_chars: int, timeout: flo
                 parts.append(f"\n({comments_count} comments — showing first page only)")
             text = "\n".join(parts)
             if len(text) > max_chars:
-                text = text[:max_chars] + "\n\n[... truncated ...]"
+                text = text[:max_chars] + _trunc_marker(text, max_chars)
             return {"ok": True, "content": text}
         except Exception as e:
             _log.warning("GitHub API fallback failed for %s: %s", url, e)
@@ -466,7 +474,7 @@ def _try_github_api(url: str, gh_token: str | None, max_chars: int, timeout: flo
             r.raise_for_status()
             text = r.text
             if len(text) > max_chars:
-                text = text[:max_chars] + "\n\n[... truncated ...]"
+                text = text[:max_chars] + _trunc_marker(text, max_chars)
             return {"ok": True, "content": text}
         except Exception as e:
             _log.warning("GitHub raw fallback failed for %s: %s", url, e)
@@ -519,7 +527,7 @@ def read_url(url: str, max_chars: int | None = 8000, timeout: float = 15.0, conf
                 _log.info("read_url: cache hit for %s (%d tokens, %d entries total)", u, _hit.tokens, _cache.stats()["entries"])
                 _txt = _hit.raw
                 if max_chars is not None and len(_txt) > max_chars:
-                    _txt = _txt[:max_chars] + "\n\n[... truncated ...]"
+                    _txt = _txt[:max_chars] + _trunc_marker(_hit.raw, max_chars)
                 return {"ok": True, "content": _txt, "connection": "cache", "from_cache": True}
         except Exception as e:
             _log.debug("read_url: cache lookup failed for %s: %s", u, e)
@@ -538,7 +546,7 @@ def read_url(url: str, max_chars: int | None = 8000, timeout: float = 15.0, conf
             except Exception as _e:
                 _log.debug("read_url: cache put failed: %s", _e)
         if max_chars is not None and len(raw) > max_chars:
-            return raw[:max_chars] + "\n\n[... truncated ...]"
+            return raw[:max_chars] + _trunc_marker(raw, max_chars)
         return raw
 
     # In-flight dedup: if another thread already fetches this URL, wait for its cache put instead of re-fetching
@@ -553,7 +561,7 @@ def read_url(url: str, max_chars: int | None = 8000, timeout: float = 15.0, conf
                 _log.info("read_url: in-flight dedup hit for %s (%d tokens)", u, _hit2.tokens)
                 _txt = _hit2.raw
                 if max_chars is not None and len(_txt) > max_chars:
-                    _txt = _txt[:max_chars] + "\n\n[... truncated ...]"
+                    _txt = _txt[:max_chars] + _trunc_marker(_hit2.raw, max_chars)
                 return {"ok": True, "content": _txt, "connection": "cache", "from_cache": True, "deduped": True}
             # Waiter timed out OR leader finished without caching (fetch failed) → become leader ourselves
             _is_leader, _evt = _cache.begin_fetch(u)

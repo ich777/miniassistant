@@ -257,20 +257,24 @@ def _get_chat_response(
     images: list[dict[str, Any]] | None = None,
     room_id: str | None = None,
 ) -> str:
-    """Synchroner Aufruf: Session für matrix_user_id, handle_user_input.
-    Gibt **ausschließlich** den sichtbaren Content zurück – KEIN Thinking für Matrix."""
+    """Synchroner Aufruf: Session per (room_id, matrix_user_id), handle_user_input.
+    Gibt **ausschließlich** den sichtbaren Content zurück – KEIN Thinking für Matrix.
+
+    Session-Key kombiniert Room und User: gleicher User in zwei Räumen → zwei separate Sessions.
+    """
     from miniassistant.chat_loop import create_session, handle_user_input
+    session_key = f"{room_id or ''}|{matrix_user_id}"
     # Set chat_context BEFORE creating session so user_id is included in system_prompt
     if room_id:
         config["_chat_context"] = {"platform": "matrix", "room_id": room_id, "user_id": matrix_user_id}
-    if matrix_user_id not in sessions:
-        sessions[matrix_user_id] = create_session(config, None)
-    session = sessions[matrix_user_id]
+    if session_key not in sessions:
+        sessions[session_key] = create_session(config, None)
+    session = sessions[session_key]
     # Chat-Kontext aktualisieren (Room-ID kann sich ändern)
     if room_id:
         session["chat_context"] = {"platform": "matrix", "room_id": room_id, "user_id": matrix_user_id}
     result = handle_user_input(session, user_message, allow_new_session=True, images=images)
-    sessions[matrix_user_id] = result[1]
+    sessions[session_key] = result[1]
     # result[4] = reiner Content (ohne Thinking) für KI-Antworten.
     # result[3] = Thinking-Text (nur bei KI-Antworten gesetzt, bei Commands immer None).
     # Bei Commands ist result[4] None aber result[3] ebenfalls None → result[0] ist sicher.

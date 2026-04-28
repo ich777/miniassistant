@@ -356,6 +356,12 @@ def _memory_section(project_dir: str | None, config: dict[str, Any] | None = Non
     if config is None:
         config = load_config(project_dir)
 
+    # --- Master-Switch: memory.enabled=false → kompletter Memory-Block fällt weg ---
+    mem_cfg_top = config.get("memory") or {}
+    if not bool(mem_cfg_top.get("enabled", True)):
+        _log.info("memory_section: memory.enabled=false — section omitted")
+        return ""
+
     # --- mempalace (bevorzugt wenn aktiviert) ---
     mp_cfg = config.get("mempalace") or {}
     _mp_enabled = mp_cfg.get("enabled", False)

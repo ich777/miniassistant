@@ -30,6 +30,12 @@ _NOISE_PREFIXES: tuple[str, ...] = (
 )
 
 
+def _memory_enabled(project_dir: str | None = None) -> bool:
+    """Master-Switch. memory.enabled=false → komplett deaktiviert (auch mempalace)."""
+    config = load_config(project_dir)
+    return bool((config.get("memory") or {}).get("enabled", True))
+
+
 def _is_noise(user_content: str) -> bool:
     """True wenn der User-Text ein Auto-Task oder Schedule-Preamble ist."""
     text = (user_content or "").strip()
@@ -51,8 +57,10 @@ def memory_dir(project_dir: str | None = None) -> Path:
     return Path(agent).expanduser().resolve() / "memory"
 
 
-def save_summary(summary: str, model_used: str | None = None, project_dir: str | None = None) -> Path:
+def save_summary(summary: str, model_used: str | None = None, project_dir: str | None = None) -> Path | None:
     """Speichert eine kurze Zusammenfassung (z. B. bei Modellwechsel)."""
+    if not _memory_enabled(project_dir):
+        return None
     d = memory_dir(project_dir)
     d.mkdir(parents=True, exist_ok=True)
     meta: dict[str, Any] = {"summary": summary}
@@ -66,6 +74,8 @@ def save_summary(summary: str, model_used: str | None = None, project_dir: str |
 
 def load_summary(project_dir: str | None = None) -> tuple[str | None, str | None]:
     """Liest letzte Zusammenfassung und (falls gespeichert) last_model. (summary, last_model)."""
+    if not _memory_enabled(project_dir):
+        return None, None
     d = memory_dir(project_dir)
     path = d / "last_summary.json"
     if not path.exists():
@@ -95,6 +105,8 @@ def append_exchange(
     Optional: schreibt parallel in mempalace (wenn aktiviert).
     user_id: wenn gesetzt, wird die User-Zeile mit [user_id] getaggt.
     """
+    if not _memory_enabled(project_dir):
+        return None
     if not assistant_content and not user_content:
         return None
     # Noise-Filter: Auto-Tasks und Schedule-Boilerplate nicht speichern
@@ -303,6 +315,8 @@ def init_mempalace(project_dir: str | None = None) -> str:
 
     Returns: Palace-Pfad.
     """
+    if not _memory_enabled(project_dir):
+        raise RuntimeError("memory.enabled=false → mempalace deaktiviert")
     import os as _os
     _os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
     mp_cfg = _get_mempalace_config(project_dir)
@@ -653,6 +667,8 @@ def get_memory_for_prompt(
     Token-Budget: `max_tokens` (Config memory.max_tokens, Default 1500). Stoppt wenn Budget erschöpft.
     Returns None wenn kein Memory existiert.
     """
+    if not _memory_enabled(project_dir):
+        return None
     config = load_config(project_dir) if (max_chars_per_line is None or days is None or max_tokens is None) else None
     if max_chars_per_line is None:
         max_chars_per_line = int((config.get("memory") or {}).get("max_chars_per_line", 100) or 100)

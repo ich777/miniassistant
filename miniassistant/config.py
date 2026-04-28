@@ -607,6 +607,7 @@ def _merge_with_defaults(data: dict[str, Any]) -> dict[str, Any]:
         "matrix": _normalize_chat_clients(data).get("matrix"),  # Alias für Abwärtskompatibilität
         "onboarding_complete": bool(data.get("onboarding_complete", False)),  # erst true nach Speichern in UI oder CLI config
         "memory": {
+            "enabled": bool((data.get("memory") or {}).get("enabled", True)),
             "max_chars_per_line": int((data.get("memory") or {}).get("max_chars_per_line", 300) or 300),
             "days": int((data.get("memory") or {}).get("days", 2) or 2),
             "max_tokens": int((data.get("memory") or {}).get("max_tokens", 4000) or 4000),
@@ -631,7 +632,8 @@ def _merge_with_defaults(data: dict[str, Any]) -> dict[str, Any]:
             "allowed_models": list((data.get("raw_proxy") or {}).get("allowed_models") or []),
         },
         "mempalace": {
-            "enabled": bool((data.get("mempalace") or {}).get("enabled", False)),
+            # Memory-Master-Switch: wenn memory.enabled=false, ist mempalace zwangsweise aus.
+            "enabled": bool((data.get("memory") or {}).get("enabled", True)) and bool((data.get("mempalace") or {}).get("enabled", False)),
             "wing": (data.get("mempalace") or {}).get("wing", "miniassistant"),
             "default_room": (data.get("mempalace") or {}).get("default_room", "conversations"),
             "max_tokens": int((data.get("mempalace") or {}).get("max_tokens", 900) or 900),
@@ -643,7 +645,8 @@ def _merge_with_defaults(data: dict[str, Any]) -> dict[str, Any]:
         **{k: data[k] for k in (
             "api_timeout", "subagent_api_timeout", "invoke_model_timeout",
             "tool_execution_timeout", "schedule_timeout",
-            "stream_stall_timeout", "stream_thinking_timeout", "stream_round_timeout",
+            "stream_stall_timeout", "stream_thinking_timeout", "stream_thinking_hard_timeout",
+            "stream_round_timeout", "stream_loop_max_consecutive", "stream_loop_recovery_max",
             "max_tool_rounds", "exec_max_output_chars",
             "search_engine_strategy", "prefs_max_chars", "prefs_max_chars_per_file",
             "respond_in_input_language",
@@ -716,6 +719,7 @@ def save_config(config: dict[str, Any], project_dir: str | None = None) -> Path:
         "chat_clients": {k: v for k, v in _normalize_chat_clients(config).items() if v} or False,
         "onboarding_complete": bool(config.get("onboarding_complete", False)),
         "memory": {
+            "enabled": bool((config.get("memory") or {}).get("enabled", True)),
             "max_chars_per_line": (config.get("memory") or {}).get("max_chars_per_line", 300),
             "days": (config.get("memory") or {}).get("days", 2),
             "max_tokens": (config.get("memory") or {}).get("max_tokens", 4000),
