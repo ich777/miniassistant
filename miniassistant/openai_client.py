@@ -384,15 +384,29 @@ def api_chat(
             body["seed"] = options["seed"]
         if options.get("stop"):
             body["stop"] = options["stop"]
+        # max_tokens / num_predict aus options durchreichen (überschreibt Default)
+        _opt_mt = options.get("max_tokens") or options.get("num_predict")
+        if _opt_mt:
+            max_tokens = int(_opt_mt)
+            if _use_mct or thinking:
+                body.pop("max_tokens", None)
+                body["max_completion_tokens"] = max_tokens
+            else:
+                body["max_tokens"] = max_tokens
 
-    # Reasoning (o1/o3/o4-mini)
+    # Reasoning (o1/o3/o4-mini): Default max_tokens hochsetzen, weil Thinking selbst
+    # tausende Tokens verbraucht — sonst hängt das Modell im Reasoning ohne Content.
     if thinking:
+        if max_tokens <= 4096 and not (options and (options.get("max_tokens") or options.get("num_predict"))):
+            max_tokens = 32768
         # reasoning_effort: low/medium/high
         effort = thinking if isinstance(thinking, str) else "medium"
         body["reasoning_effort"] = effort
         # Sicherstellen dass max_completion_tokens gesetzt ist (auch für ältere Reasoning-Modelle)
         if not _use_mct:
             body.pop("max_tokens", None)
+            body["max_completion_tokens"] = max_tokens
+        else:
             body["max_completion_tokens"] = max_tokens
 
     # Tools
@@ -475,11 +489,25 @@ def api_chat_stream(
             val = options.get(key)
             if val is not None:
                 body[key] = val
+        # max_tokens / num_predict aus options durchreichen
+        _opt_mt = options.get("max_tokens") or options.get("num_predict")
+        if _opt_mt:
+            max_tokens = int(_opt_mt)
+            if _use_mct or thinking:
+                body.pop("max_tokens", None)
+                body["max_completion_tokens"] = max_tokens
+            else:
+                body["max_tokens"] = max_tokens
     if thinking:
+        # Reasoning models verbraten Thinking-Token — Default zu klein → kein Content
+        if max_tokens <= 4096 and not (options and (options.get("max_tokens") or options.get("num_predict"))):
+            max_tokens = 32768
         effort = thinking if isinstance(thinking, str) else "medium"
         body["reasoning_effort"] = effort
         if not _use_mct:
             body.pop("max_tokens", None)
+            body["max_completion_tokens"] = max_tokens
+        else:
             body["max_completion_tokens"] = max_tokens
 
     openai_tools = _convert_tools(tools or [])

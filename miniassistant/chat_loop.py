@@ -38,6 +38,7 @@ from miniassistant.memory import append_exchange
 import miniassistant.agent_actions_log as _aal
 import miniassistant.context_log as _ctx_log
 import re as _re
+import html as _html_ent
 from queue import Queue, Empty as _QueueEmpty
 from threading import Thread as _Thread
 
@@ -261,17 +262,29 @@ class _LoopDetector:
                 if len(n) < self._min_phrase_len:
                     continue
                 self._recent.append(n)
-                if len(self._recent) > 32:
-                    self._recent = self._recent[-32:]
+                if len(self._recent) > 64:
+                    self._recent = self._recent[-64:]
                 if len(self._recent) >= self._max_consecutive:
                     tail = self._recent[-self._max_consecutive:]
                     if all(x == tail[0] for x in tail):
                         self.reason = f"gleiche Zeile {self._max_consecutive}× hintereinander"
                         return True
-                if len(self._recent) >= 8:
-                    t = self._recent[-8:]
-                    if t[0:2] == t[2:4] == t[4:6] == t[6:8]:
-                        self.reason = "2-Zeilen-Block 4× wiederholt"
+                # k-Zeilen-Zyklus (k=2..12): ≥3 vollständige Wiederholungen.
+                # Fängt Doom-Loops mit langen Zyklen wie qwen "*Wait:* …"-Pattern.
+                for k in range(2, 13):
+                    total = 3 * k
+                    if len(self._recent) >= total:
+                        tail = self._recent[-total:]
+                        block = tail[:k]
+                        if all(tail[i*k:(i+1)*k] == block for i in range(1, 3)):
+                            self.reason = f"{k}-Zeilen-Block 3× wiederholt"
+                            return True
+                # Diversitäts-Check: wenig unterschiedliche Zeilen in großem Fenster
+                # (catches arbitrary k-cycles where exact alignment shifts)
+                if len(self._recent) >= 24:
+                    win = self._recent[-24:]
+                    if len(set(win)) <= 8:
+                        self.reason = f"nur {len(set(win))} unterschiedliche Zeilen in letzten 24"
                         return True
         if len(self._buf) > self._buf_segment_len * 4:
             seg = self._buf[-self._buf_segment_len:]
@@ -293,6 +306,10 @@ def _clean_response(content: str, thinking: str) -> tuple[str, str]:
     content = _strip_tool_call_tags(content)
     thinking = _strip_tool_call_tags(thinking)
     content = _strip_hallucinated_images(content)
+    # Qwen3 und andere Modelle schreiben manchmal HTML-Entities (&gt; &lt; &amp;)
+    # in Thinking und Content — hier unescapen, da Ausgabe als Markdown gerendert wird.
+    content = _html_ent.unescape(content)
+    thinking = _html_ent.unescape(thinking)
     return content, thinking
 
 
@@ -972,6 +989,36 @@ def _salvage_subagent_tool_results(msgs: list[dict[str, Any]], max_chars: int = 
         out_parts.append(e)
         total += len(e)
     return "\n\n---\n\n".join(reversed(out_parts))
+
+
+def _finalize_after_api_error(
+    total_content: str,
+    msgs: list[dict[str, Any]],
+    err_text: str,
+    log_label: str,
+) -> str:
+    """Build final subagent result after an API error: salvage tool results unconditionally
+    and append the error marker. Prior content (planning text etc.) is preserved before the salvage.
+    """
+    _sv = _salvage_subagent_tool_results(msgs)
+    err_marker = f"[API error: {err_text}]"
+    if _sv:
+        _log.info("%s: salvaged %d chars after API error", log_label, len(_sv))
+        body = total_content.strip()
+        prefix = (body + "\n\n") if body else ""
+        return (
+            f"{prefix}[Teilergebnis: Subagent wurde unterbrochen — Tool-Daten unten gerettet]\n\n"
+            f"{_sv}\n\n{err_marker}"
+        )
+    return (total_content + err_marker) if total_content else err_marker
+
+
+def _is_transient_api_error(err_str: str) -> bool:
+    """Detect transient/server-side errors that warrant a retry (vs hard 4xx client errors)."""
+    if any(c in err_str for c in ("(500)", "(502)", "(503)", "(504)")):
+        return True
+    low = err_str.lower()
+    return any(t in low for t in ("timeout", "timed out", "nicht erreichbar", "remote protocol"))
 
 
 _ROLLING_SUMMARY_THRESHOLD = 40_000  # tool-result tokens before proactive summarize
@@ -3415,20 +3462,41 @@ def _run_subagent_openai(
     for _round in range(int(config.get("max_tool_rounds", 15))):
         # Proaktiv compacten bevor Context voll ist
         msgs = _compact_subagent_msgs(config, msgs, resolved_name, system, sub_tools, _sub_num_ctx)
-        try:
-            r = openai_chat(
-                msgs, api_key=api_key, model=api_model,
-                system=system, thinking=think, tools=sub_tools,
-                base_url=base_url or OPENAI_API_URL,
-                timeout=int(_sub_timeout),
-            )
-        except Exception as e:
-            # Bei Context-Exceeded: escalating trim (quota 0.60 → 0.40 → 0.25) mit je 1 retry
-            _err_str = str(e).lower()
-            _is_ctx = "context" in _err_str and ("exceeded" in _err_str or "size" in _err_str or "length" in _err_str)
-            if _is_ctx:
-                r = None
+        r = None
+        _last_exc: Exception | None = None
+        # Phase 1: transient retries (server-side 500/502/503/504, timeout, connection drop)
+        for _attempt in range(3):
+            try:
+                r = openai_chat(
+                    msgs, api_key=api_key, model=api_model,
+                    system=system, thinking=think, tools=sub_tools,
+                    base_url=base_url or OPENAI_API_URL,
+                    timeout=int(_sub_timeout),
+                )
+                break
+            except Exception as e:
                 _last_exc = e
+                _err_str = str(e)
+                _err_low = _err_str.lower()
+                _is_ctx = "context" in _err_low and ("exceeded" in _err_low or "size" in _err_low or "length" in _err_low)
+                if _is_ctx:
+                    r = None
+                    break  # ctx-exceeded handled by phase 2 below
+                if _is_transient_api_error(_err_str) and _attempt < 2:
+                    _wait = 2 * (2 ** _attempt)  # 2s, 4s
+                    _log.warning("Subagent %s (openai): transient error attempt %d/3 (%s) — sleep %ds",
+                                 resolved_name, _attempt + 1, e, _wait)
+                    time.sleep(_wait)
+                    continue
+                r = None
+                break
+
+        if r is None:
+            e = _last_exc
+            _err_str_low = str(e).lower() if e else ""
+            _is_ctx = "context" in _err_str_low and ("exceeded" in _err_str_low or "size" in _err_str_low or "length" in _err_str_low)
+            if _is_ctx and e is not None:
+                # Phase 2: escalating trim (quota 0.60 → 0.40 → 0.25)
                 for _quota in (0.60, 0.40, 0.25):
                     _log.warning("Subagent %s: context exceeded — trim quota=%.2f and retry", resolved_name, _quota)
                     msgs = _trim_subagent_msgs(msgs, system, sub_tools, _sub_num_ctx, quota=_quota)
@@ -3445,31 +3513,17 @@ def _run_subagent_openai(
                         _last_exc = e2
                         _err2 = str(e2).lower()
                         if not ("context" in _err2 and ("exceeded" in _err2 or "size" in _err2 or "length" in _err2)):
-                            # Other error — don't keep shrinking
+                            r = None
                             break
                 if r is None:
-                    _pre = total_content
-                    total_content += f"[OpenAI API error: {_last_exc}]"
-                    if not _pre.strip():
-                        _sv = _salvage_subagent_tool_results(msgs)
-                        if _sv:
-                            total_content = (
-                                f"[Teilergebnis: Subagent wurde unterbrochen]\n\n{_sv}"
-                            )
-                            _log.info("Subagent %s (openai): salvaged %d chars after all ctx-retries failed",
-                                      resolved_name, len(_sv))
+                    total_content = _finalize_after_api_error(
+                        total_content, msgs, str(_last_exc), f"Subagent {resolved_name} (openai)"
+                    )
                     break
             else:
-                _pre = total_content
-                total_content += f"[OpenAI API error: {e}]"
-                if not _pre.strip():
-                    _sv = _salvage_subagent_tool_results(msgs)
-                    if _sv:
-                        total_content = (
-                            f"[Teilergebnis: Subagent wurde unterbrochen]\n\n{_sv}"
-                        )
-                        _log.info("Subagent %s (openai): salvaged %d chars after API error",
-                                  resolved_name, len(_sv))
+                total_content = _finalize_after_api_error(
+                    total_content, msgs, str(_last_exc), f"Subagent {resolved_name} (openai)"
+                )
                 break
         msg = r.get("message") or {}
         if msg.get("thinking"):
@@ -3739,7 +3793,9 @@ def _run_subagent_with_tools(
                         continue
                 raise
         if r is None:
-            total_content += "[API error: all retries failed]"
+            total_content = _finalize_after_api_error(
+                total_content, msgs, "all retries failed", f"Subagent {resolved_name}"
+            )
             break
         # API-Fehler abfangen (Ollama gibt {"error": "..."} bei Problemen)
         if r.get("error"):
@@ -3771,27 +3827,14 @@ def _run_subagent_with_tools(
                     # resume normal processing with new r
                     pass
                 else:
-                    _pre_err = total_content
-                    total_content += f"[API error: {_err_txt}]"
-                    if not _pre_err.strip():
-                        _sv = _salvage_subagent_tool_results(msgs)
-                        if _sv:
-                            total_content = (
-                                f"[Teilergebnis: Subagent wurde unterbrochen]\n\n{_sv}"
-                            )
-                            _log.info("Subagent %s: salvaged %d chars after all ctx-retries failed", resolved_name, len(_sv))
+                    total_content = _finalize_after_api_error(
+                        total_content, msgs, _err_txt, f"Subagent {resolved_name}"
+                    )
                     break
             else:
-                # Salvage: wenn noch kein brauchbarer content da ist, aus tool-results rekonstruieren
-                _pre_err = total_content
-                total_content += f"[API error: {_err_txt}]"
-                if not _pre_err.strip():
-                    _sv = _salvage_subagent_tool_results(msgs)
-                    if _sv:
-                        total_content = (
-                            f"[Teilergebnis: Subagent wurde unterbrochen]\n\n{_sv}"
-                        )
-                        _log.info("Subagent %s: salvaged %d chars from tool results after API error", resolved_name, len(_sv))
+                total_content = _finalize_after_api_error(
+                    total_content, msgs, _err_txt, f"Subagent {resolved_name}"
+                )
                 break
         msg = r.get("message") or {}
         if msg.get("thinking"):
@@ -4527,10 +4570,11 @@ def chat_round(
                         for n, a, r in nudge_results:
                             msgs.append({"role": "tool", "tool_name": n, "content": r})
                         # Nochmal Model aufrufen für finale Antwort (ohne tools → nur Text)
+                        # think=False erzwingen, damit Modell Content emittiert statt ins thinking-Feld
                         try:
                             final_resp = _dispatch_chat(
                                 config, try_model, msgs,
-                                system=system_effective, think=think,
+                                system=system_effective, think=False,
                                 options=options or None,
                                 timeout=_api_timeout,
                             )
@@ -4558,9 +4602,11 @@ def chat_round(
                 _aal.log_response(config, total_content.strip(), tps=_aal.extract_tps(last_response, time.monotonic() - _t0, total_content.strip(), total_thinking))
 
             # send_image war erfolgreich → Content unterdrücken (Bild IST die Antwort, kein Text nötig)
-            if _sent_image and total_content.strip():
-                _log.info("send_image erfolgreich – unterdrücke Text-Content: %.60s", total_content.strip())
-                total_content = ""
+            if _sent_image:
+                config["_response_handled_via_side_effect"] = True
+                if total_content.strip():
+                    _log.info("send_image erfolgreich – unterdrücke Text-Content: %.60s", total_content.strip())
+                    total_content = ""
 
             effective_model = try_model
             if try_model != model and last_error:
@@ -4716,6 +4762,7 @@ def chat_round_stream(
     _msgs_len_at_call: int = len(msgs)  # msgs.length at last Ollama call (for delta estimation)
     _loop_recovery_attempts = 0   # how many times the doom-loop guard fired this conversation
     _loop_recovery_max = int(config.get("stream_loop_recovery_max") or 2)
+    _announce_nudge_fired = False  # rate-limit announce-without-doing nudge to 1x per request
 
     while rounds < max_tool_rounds:
         # Per-round smart compaction: after round 0, check if tool results grew context past budget.
@@ -4838,6 +4885,7 @@ def chat_round_stream(
                                 any(tag in msg["thinking"] for tag in ("<tool_call>", "<tools>", "<function=", "<exec>", "<web_search>", "<read_url>", "<check_url>"))
                             ) else msg["thinking"]
                             if _think_display:
+                                _think_display = _html_ent.unescape(_think_display)
                                 _stream_log.thinking_delta(_think_display)
                                 yield {"type": "thinking", "delta": _think_display}
                             if _loop_detector.feed(msg["thinking"]):
@@ -4902,6 +4950,7 @@ def chat_round_stream(
                                     if _tc_stream_buf:
                                         break
                             if _emit:
+                                _emit = _html_ent.unescape(_emit)
                                 round_content += _emit
                                 yield {"type": "content", "delta": _emit}
                         # Tool-Calls aus JEDEM Chunk akkumulieren – Ollama streamt sie
@@ -5015,17 +5064,32 @@ def chat_round_stream(
         if not tool_calls:
             total_content += round_content
 
-        # Announce-without-doing nudge: model announced tool usage in text/thinking but emitted no tool call.
-        # Detects (a) short announcements (< 600 chars) where thinking mentioned tool names, or
-        # (b) thinking-only responses (no content at all) where thinking mentioned tool names → retry.
+        # Announce-without-doing nudge: model announced tool usage in thinking but emitted no tool call.
+        # Strict trigger to avoid false-positives on legit short answers, mid-stream cuts,
+        # or thinking that merely *references* past tool results.
         _TOOL_ANNOUNCE_KEYS = ("invoke_model", "web_search", "read_url", "check_url", "exec", "send_email", "schedule", "debate")
-        _thinking_mentions_tools = round_thinking and any(k in round_thinking for k in _TOOL_ANNOUNCE_KEYS)
+        _ANNOUNCE_PHRASES = (
+            "i will ", "i'll ", "let me ", "let's ", "i need to ", "i'm going to ", "going to call",
+            "ich werde ", "ich rufe ", "lass mich ", "lasst mich ", "ich muss ", "jetzt rufe ",
+        )
+        _rt_lower = (round_thinking or "").lower()
+        _thinking_announces_tool = (
+            any(k in _rt_lower for k in _TOOL_ANNOUNCE_KEYS)
+            and any(p in _rt_lower for p in _ANNOUNCE_PHRASES)
+        )
+        # Mid-stream cutoff: content present but ends without sentence terminator → likely truncated,
+        # not an announce-without-doing. Don't nudge.
+        _stripped_rc = round_content.strip()
+        _looks_truncated = bool(_stripped_rc) and _stripped_rc[-1] not in ".!?…\")`*_>}\n"
         if (not tool_calls
                 and not _sent_image
-                and _thinking_mentions_tools
-                and len(round_content.strip()) < 600
+                and not _announce_nudge_fired
+                and _thinking_announces_tool
+                and not _looks_truncated
+                and len(_stripped_rc) < 200
                 and rounds < max_tool_rounds - 1):
-            _log.info("Announce-without-doing nudge (rounds=%d): thinking mentioned tools but no tool call emitted", rounds)
+            _log.info("Announce-without-doing nudge (rounds=%d): thinking announced tool call but none emitted", rounds)
+            _announce_nudge_fired = True
             if round_content:
                 total_content = total_content[:-len(round_content)]  # revert premature accumulation
             msgs.append({"role": "user", "content": "STOP. You announced that you would call tools but did NOT emit any tool call. Call your tools RIGHT NOW — do not describe, just emit the tool call immediately."})
@@ -5081,11 +5145,12 @@ def chat_round_stream(
                         nudge_results = _run_tools_maybe_concurrent(nudge_tool_calls, config, project_dir)
                         for n, a, r in nudge_results:
                             msgs.append({"role": "tool", "tool_name": n, "content": r})
-                        # Finale Antwort nach Tool-Execution
+                        # Finale Antwort nach Tool-Execution — think=False erzwingen,
+                        # damit Modell nicht wieder alles ins thinking-Feld schreibt
                         try:
                             final_resp = _dispatch_chat(
                                 config, try_model, msgs,
-                                system=system_effective, think=think,
+                                system=system_effective, think=False,
                                 options=options or None, timeout=_stream_timeout,
                             )
                             final_msg = final_resp.get("message") or {}
@@ -5106,8 +5171,33 @@ def chat_round_stream(
                 except Exception as nudge_err:
                     _log.warning("Stream nudge failed: %s", nudge_err)
 
-            # Fallback: wenn Content nach Nudge noch immer leer, User informieren
-            # (sollte mit dem kontextsensitiven Nudge nie feuern — wenn doch, ist das ein Bug)
+            # Hail-Mary: Content immer noch leer nach Nudge → letzter Versuch mit
+            # think=False und expliziter "stop thinking"-Aufforderung. Fängt qwen-Pattern,
+            # bei dem Modell die fertige Antwort ins thinking-Feld schreibt.
+            if not total_content.strip() and not _sent_image:
+                _log.warning("Hail-mary: empty after nudge, forcing think=False with explicit prompt")
+                try:
+                    msgs.append({"role": "user", "content": (
+                        "Antworte JETZT mit deiner finalen Antwort als reinen Markdown-Text. "
+                        "Kein Denken, keine <think>-Tags, kein Tool-Call. Nur die Antwort."
+                    )})
+                    hm_resp = _dispatch_chat(
+                        config, try_model, msgs,
+                        system=system_effective, think=False,
+                        options=options or None, timeout=_stream_timeout,
+                    )
+                    hm_msg = hm_resp.get("message") or {}
+                    total_thinking += (hm_msg.get("thinking") or "")
+                    _hm_c = _strip_tool_call_tags((hm_msg.get("content") or "").strip())
+                    if _hm_c:
+                        total_content += _hm_c
+                        msgs.append({"role": "assistant", "content": _hm_c})
+                        yield {"type": "content", "delta": _hm_c}
+                        _log.info("Hail-mary recovered %d chars of content", len(_hm_c))
+                except Exception as hm_err:
+                    _log.warning("Hail-mary failed: %s", hm_err)
+
+            # Fallback: wenn Content nach Nudge + Hail-Mary noch immer leer, User informieren
             if not total_content.strip() and not _sent_image:
                 _log.error("Empty response after nudge — model produced nothing (rounds=%d, last_role=%s)",
                            rounds, (msgs[-1].get("role") if msgs else "?"))
@@ -5149,8 +5239,8 @@ def chat_round_stream(
                 _aud_html = "\n\n".join(f'<audio controls src="{aud["url"]}"></audio>' for aud in _pending_auds)
                 _done_content = f"{_done_content}\n\n{_aud_html}" if _done_content else _aud_html
             # TPS: letzte Runde (_t0_stream) verwenden — schließt Tool-Wartezeit aus
-            _stream_log.finish()
             _done_tps = _aal.extract_tps(last_response, time.monotonic() - _t0_stream, _done_content, _done_thinking)
+            _stream_log.finish(_done_tps)
             _ctx_used = _last_real_ctx or (_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs))
             yield {"type": "done", "thinking": _done_thinking, "content": _done_content, "images": _pending_imgs, "audio": _pending_auds, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info, "tps": _done_tps, "ctx": [_ctx_used, _ctx_max]}
             return
@@ -5184,8 +5274,8 @@ def chat_round_stream(
                 _final_content, _final_thinking = _clean_response(
                     "" if _sent_image else total_content.strip(), total_thinking.strip())
                 yield {"type": "content", "delta": "\n\n*(Verarbeitung abgebrochen)*"}
-                _stream_log.finish()
                 _cancel_tps = _aal.extract_tps(last_response, time.monotonic() - _t0_stream, _final_content, _final_thinking)
+                _stream_log.finish(_cancel_tps)
                 yield {"type": "done", "thinking": _final_thinking, "content": _final_content, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info, "tps": _cancel_tps, "ctx": [_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs), _ctx_max]}
                 return
         # Hard Guard: nach Subagent-Fehler keine Research-Tools erlauben
@@ -5348,6 +5438,8 @@ def chat_round_stream(
             _log.warning("Stream nudge (max rounds) failed: %s", nudge_err)
 
     # send_image war erfolgreich → Content unterdrücken (Bild IST die Antwort)
+    if _sent_image:
+        config["_response_handled_via_side_effect"] = True
     _final_content, _final_thinking = _clean_response(
         "" if _sent_image else total_content.strip(), total_thinking.strip())
 
@@ -5373,8 +5465,8 @@ def chat_round_stream(
         if _m.get("role") == "assistant" and _m.get("content") and "base64," in _m["content"]:
             _m["content"] = _strip_hallucinated_base64(_m["content"])
 
-    _stream_log.finish()
     _final_tps = _aal.extract_tps(last_response, time.monotonic() - _t0_stream, _final_content, _final_thinking)
+    _stream_log.finish(_final_tps)
     yield {"type": "done", "thinking": _final_thinking, "content": _final_content, "images": _pending_imgs, "audio": _pending_auds, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info, "tps": _final_tps, "ctx": [_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs), _ctx_max]}
 
 
@@ -5653,7 +5745,12 @@ def handle_user_input(
         except Exception:
             pass
 
-    response_text = f"[Thinking]\n{thinking}\n\n{content}" if (thinking and content) else (thinking if thinking else (content or "(Keine Antwort)"))
+    _silent_ok = config.pop("_response_handled_via_side_effect", False)
+    if _silent_ok and not (thinking or content):
+        # Bild/Audio wurde direkt an Matrix/Discord gesendet — kein Text-Reply nötig
+        response_text = ""
+    else:
+        response_text = f"[Thinking]\n{thinking}\n\n{content}" if (thinking and content) else (thinking if thinking else (content or "(Keine Antwort)"))
     if did_compact:
         response_text = f"*Chat-Verlauf wurde komprimiert.*\n\n{response_text}"
     if switch_info:

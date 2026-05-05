@@ -227,6 +227,7 @@ async def run_discord_bot(config: dict[str, Any]) -> None:
                 await message.reply("Konnte Sprachnachricht nicht erkennen.")
                 return
             logger.info("Discord Audio: Transkript von %s: %s", sender_id, transcript[:80])
+            # Typing über gesamten Flow: Agent → TTS → Upload (sonst „still" während TTS-Synthese)
             async with message.channel.typing():
                 try:
                     response = await asyncio.get_event_loop().run_in_executor(
@@ -237,27 +238,27 @@ async def run_discord_bot(config: dict[str, Any]) -> None:
                     logger.exception("Discord Audio: Agent fehlgeschlagen")
                     await message.reply(f"Fehler: {e}")
                     return
-            if not response:
-                return
-            from miniassistant.voice_format import format_for_voice
-            voice_text, visual_content = format_for_voice(response)
-            tts_url = get_voice_tts_url(config)
-            if tts_url and voice_text:
-                try:
-                    tts_voice = get_voice_tts_voice(config)
-                    wav_bytes = _wyoming.synthesize(voice_text, tts_url, voice=tts_voice)
-                    import io as _io
-                    await message.reply(file=discord.File(_io.BytesIO(wav_bytes), filename="response.wav"))
-                    from miniassistant import agent_actions_log as _aal
-                    _aal.log_voice_sent(config, chars=len(voice_text), voice=tts_voice or "", bytes_sent=len(wav_bytes))
-                except Exception as e:
-                    logger.exception("Discord Audio: TTS fehlgeschlagen")
+                if not response:
+                    return
+                from miniassistant.voice_format import format_for_voice
+                voice_text, visual_content = format_for_voice(response)
+                tts_url = get_voice_tts_url(config)
+                if tts_url and voice_text:
+                    try:
+                        tts_voice = get_voice_tts_voice(config)
+                        wav_bytes = _wyoming.synthesize(voice_text, tts_url, voice=tts_voice)
+                        import io as _io
+                        await message.reply(file=discord.File(_io.BytesIO(wav_bytes), filename="response.wav"))
+                        from miniassistant import agent_actions_log as _aal
+                        _aal.log_voice_sent(config, chars=len(voice_text), voice=tts_voice or "", bytes_sent=len(wav_bytes))
+                    except Exception as e:
+                        logger.exception("Discord Audio: TTS fehlgeschlagen")
+                        await message.reply(voice_text[:2000])
+                else:
                     await message.reply(voice_text[:2000])
-            else:
-                await message.reply(voice_text[:2000])
-            if visual_content:
-                for chunk in _split_message(visual_content, 2000):
-                    await message.channel.send(chunk)
+                if visual_content:
+                    for chunk in _split_message(visual_content, 2000):
+                        await message.channel.send(chunk)
             return
 
         # Bild ohne Text → Pending speichern, User fragen

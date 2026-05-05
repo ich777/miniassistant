@@ -121,10 +121,15 @@ class StreamLogger:
         self._content_buf += delta
         self._maybe_flush()
 
-    def finish(self) -> None:
+    def finish(self, tps: tuple[float, bool] | None = None) -> None:
         self._maybe_flush(force=True)
         if self._path and self._started:
-            _write(self._path, f"[{_ts()}] STREAM_END\n")
+            if tps is not None:
+                value, exact = tps
+                tps_str = f"  ({value:.1f} t/s)" if exact else f"  (~{value:.1f} t/s)"
+            else:
+                tps_str = ""
+            _write(self._path, f"[{_ts()}] STREAM_END{tps_str}\n")
 
 
 def extract_tps(response: dict[str, Any], elapsed_s: float, content: str = "", thinking: str = "") -> tuple[float, bool] | None:
