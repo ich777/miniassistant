@@ -630,6 +630,16 @@ def _merge_with_defaults(data: dict[str, Any]) -> dict[str, Any]:
             "token": (data.get("raw_proxy") or {}).get("token"),
             "rate_limit": int((data.get("raw_proxy") or {}).get("rate_limit", 100) or 100),
             "allowed_models": list((data.get("raw_proxy") or {}).get("allowed_models") or []),
+            # Slot-Cache am /raw/v1 default OFF (User-controlled prompts → wenig stabiler Prefix)
+            "slot_cache": bool((data.get("raw_proxy") or {}).get("slot_cache", False)),
+        },
+        "slot_cache": {
+            "enabled": bool((data.get("slot_cache") or {}).get("enabled", False)),
+            "ttl_days": int((data.get("slot_cache") or {}).get("ttl_days", 14) or 14),
+            "max_files": int((data.get("slot_cache") or {}).get("max_files", 40) or 40),
+            "min_tokens_to_cache": int((data.get("slot_cache") or {}).get("min_tokens_to_cache", 10000) or 10000),
+            "llama_swap_url": ((data.get("slot_cache") or {}).get("llama_swap_url") or "").strip(),
+            "remote_slot_path": ((data.get("slot_cache") or {}).get("remote_slot_path") or "/slots").strip() or "/slots",
         },
         "mempalace": {
             # Memory-Master-Switch: wenn memory.enabled=false, ist mempalace zwangsweise aus.
@@ -644,12 +654,13 @@ def _merge_with_defaults(data: dict[str, Any]) -> dict[str, Any]:
         # Top-level Tuning-Keys: nur einfügen wenn in YAML gesetzt (Key fehlt → Caller-Default greift)
         **{k: data[k] for k in (
             "api_timeout", "subagent_api_timeout", "invoke_model_timeout",
-            "tool_execution_timeout", "schedule_timeout",
+            "tool_execution_timeout", "subagent_execution_timeout", "schedule_timeout",
             "stream_stall_timeout", "stream_thinking_timeout", "stream_thinking_hard_timeout",
             "stream_round_timeout", "stream_loop_max_consecutive", "stream_loop_recovery_max",
             "max_tool_rounds", "exec_max_output_chars",
             "search_engine_strategy", "prefs_max_chars", "prefs_max_chars_per_file",
             "respond_in_input_language",
+            "doc_max_chars", "doc_max_pages_render",
         ) if k in data and data[k] is not None},
     }
 
@@ -751,11 +762,12 @@ def save_config(config: dict[str, Any], project_dir: str | None = None) -> Path:
     # Top-level Tuning-Keys: nur schreiben wenn gesetzt (kein Default-Spam in YAML)
     for _k in (
         "api_timeout", "subagent_api_timeout", "invoke_model_timeout",
-        "tool_execution_timeout", "schedule_timeout",
+        "tool_execution_timeout", "subagent_execution_timeout", "schedule_timeout",
         "stream_stall_timeout", "stream_thinking_timeout", "stream_round_timeout",
         "max_tool_rounds", "exec_max_output_chars",
         "search_engine_strategy", "prefs_max_chars", "prefs_max_chars_per_file",
         "respond_in_input_language",
+        "doc_max_chars", "doc_max_pages_render",
     ):
         _v = config.get(_k)
         if _v is not None:

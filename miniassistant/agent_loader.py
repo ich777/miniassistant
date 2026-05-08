@@ -120,7 +120,8 @@ def _system_and_runtime_section(is_root: bool) -> str:
     import datetime as _dt
     now = _dt.datetime.now()
     weekdays_de = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
-    date_str = f"{weekdays_de[now.weekday()]}, {now.strftime('%d.%m.%Y')} – {now.strftime('%H:%M')} Uhr"
+    # Tagesgranularität: KV-Cache hält 24h. Uhrzeit via `exec date` Tool wenn benötigt.
+    date_str = f"{weekdays_de[now.weekday()]}, {now.strftime('%d.%m.%Y')}"
     s = _detect_system()
     parts = [f"**{s['os']}** (Kernel: {s['release']}, {s['machine']})"]
     if s["distro"]:
@@ -153,7 +154,9 @@ def _units_section_from_prefs(config: dict[str, Any]) -> str:
         "## Units and Currency\n"
         "Use the measurement system, temperature unit, and currency that are standard "
         "in the user's country (see USER section above). Show only one unit system — "
-        "never show both or convert between them.\n"
+        "never show both or convert between them. "
+        "Exception: explicit conversion (e.g. translating a document with prices, "
+        "\"X in Y\") — `web_search` the current rate first, never use memorized rates.\n"
     )
 
 
@@ -317,7 +320,7 @@ def _docs_reference_section(config: dict[str, Any]) -> str:
         "Before configuring Matrix/Discord/Voice: read the matching doc first.\n\n"
         f"**Setup:** `CONFIG_REFERENCE.md` · `PROVIDERS.md` · `CONTEXT_SIZE.md` · `SEARCH_ENGINES.md`\n"
         f"**Chat:** `MATRIX.md` · `DISCORD.md` · `EMAIL.md` · `AVATARS.md` · `{_chat_history_doc(config)}`\n"
-        f"**Features:** `VOICE.md` (STT/TTS, send_audio rules) · `VISION.md` · `IMAGE_GENERATION.md` · `SCHEDULES.md` · `SUBAGENTS.md` · `DEBATE.md`\n"
+        f"**Features:** `VOICE.md` (STT/TTS, send_audio rules) · `VISION.md` · `IMAGE_GENERATION.md` · `DOCUMENTS.md` (PDF/DOCX/Text-Anhaenge) · `SCHEDULES.md` · `SUBAGENTS.md` · `DEBATE.md`\n"
         f"**Tools:** `GITHUB.md` (REST API, repo tracking) · `WEB_FETCHING.md` (Playwright) · `API_REFERENCE.md` · `DIRECTIONS.md`\n"
         f"**Guides:** `PLANNING.md` · `PROMPT_ENGINEERING.md` · `TRACKING.md` (calories, expenses, habits)\n\n"
         "## Directions (reusable task instructions)\n"
@@ -458,13 +461,12 @@ def _knowledge_verification_section() -> str:
     from datetime import datetime
     now = datetime.now().astimezone()
     today = now.strftime("%B %d, %Y")
-    current_time = now.strftime("%H:%M:%S")
-    tz_name = now.strftime("%Z") or now.strftime("%z")
     rule = _get_rule("knowledge_verification.md")
     if rule:
         # Inject current date into the rule (replaces {{current_date}} placeholder)
         rule = rule.replace("{{current_date}}", today)
-        return f"Today is **{today}**, current local time is **{current_time} {tz_name}**. Your training data (= everything you \"know\") has a cutoff date — anything after that is outdated.\n{rule}\n\n"
+        # Tagesgranularität (kein HH:MM:SS) → KV-Cache stabil über den Tag.
+        return f"Today is **{today}**. Your training data (= everything you \"know\") has a cutoff date — anything after that is outdated.\n{rule}\n\n"
     return ""
 
 
@@ -473,26 +475,27 @@ def refresh_datetime_in_prompt(system_prompt: str) -> str:
 
     Session-Prompt wird bei create_session gebaut und eingefroren — bei laufenden Sessions über
     Mitternacht bleibt das Datum sonst auf dem Erstellungstag. Dieser Helper wird pro chat_round
-    aufgerufen, damit Datum/Uhrzeit immer aktuell sind. No-op wenn Marker fehlen.
+    aufgerufen, damit das Datum aktuell ist. No-op wenn Marker fehlen.
+
+    Tagesgranularität (kein HH:MM:SS) — sonst kippt llama.cpp KV-Cache bei jeder Sekunde.
+    Wenn das Modell die exakte Uhrzeit braucht: `exec date` Tool nutzen.
     """
     import datetime as _dt
     import re
     now = _dt.datetime.now()
     weekdays_de = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
-    date_de = f"{weekdays_de[now.weekday()]}, {now.strftime('%d.%m.%Y')} – {now.strftime('%H:%M')} Uhr"
+    date_de = f"{weekdays_de[now.weekday()]}, {now.strftime('%d.%m.%Y')}"
     system_prompt = re.sub(
         r"\*\*Heute:\*\* [^\n]+",
         lambda _m: f"**Heute:** {date_de}",
         system_prompt,
         count=1,
     )
-    now_tz = now.astimezone()
-    today = now_tz.strftime("%B %d, %Y")
-    current_time = now_tz.strftime("%H:%M:%S")
-    tz_name = now_tz.strftime("%Z") or now_tz.strftime("%z")
+    today = now.astimezone().strftime("%B %d, %Y")
+    # Alte (mit Uhrzeit) und neue (nur Datum) Form beide ersetzen — Migration für laufende Sessions.
     system_prompt = re.sub(
-        r"Today is \*\*[^*]+\*\*, current local time is \*\*[^*]+\*\*\.",
-        lambda _m: f"Today is **{today}**, current local time is **{current_time} {tz_name}**.",
+        r"Today is \*\*[^*]+\*\*(?:, current local time is \*\*[^*]+\*\*)?\.",
+        lambda _m: f"Today is **{today}**.",
         system_prompt,
         count=1,
     )

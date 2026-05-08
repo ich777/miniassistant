@@ -230,6 +230,10 @@ try:
     except ImportError:
         RoomMessageAudio = None  # ältere matrix-nio
     try:
+        from nio.events import RoomMessageFile
+    except ImportError:
+        RoomMessageFile = None  # ältere matrix-nio
+    try:
         from nio.events.room_events import RoomMessage as _RoomMessageBase
     except ImportError:
         _RoomMessageBase = None
@@ -246,6 +250,7 @@ except ImportError as e:
     RoomMessageNotice = None  # type: ignore
     RoomMessageImage = None  # type: ignore
     RoomMessageAudio = None  # type: ignore
+    RoomMessageFile = None  # type: ignore
     MegolmEvent = None  # type: ignore
 
 
@@ -263,16 +268,26 @@ def _get_chat_response(
     Session-Key kombiniert Room und User: gleicher User in zwei Räumen → zwei separate Sessions.
     """
     from miniassistant.chat_loop import create_session, handle_user_input
+    from miniassistant.slot_cache import derive_conv_id as _sc_derive
     session_key = f"{room_id or ''}|{matrix_user_id}"
+    _sc_conv_id = _sc_derive("matrix", room_id=room_id, user_id=matrix_user_id) if room_id else None
     # Set chat_context BEFORE creating session so user_id is included in system_prompt
     if room_id:
-        config["_chat_context"] = {"platform": "matrix", "room_id": room_id, "user_id": matrix_user_id}
+        ctx = {"platform": "matrix", "room_id": room_id, "user_id": matrix_user_id}
+        if _sc_conv_id:
+            ctx["conv_id"] = _sc_conv_id
+            ctx["slot_cache_endpoint"] = "matrix"
+        config["_chat_context"] = ctx
     if session_key not in sessions:
         sessions[session_key] = create_session(config, None)
     session = sessions[session_key]
     # Chat-Kontext aktualisieren (Room-ID kann sich ändern)
     if room_id:
-        session["chat_context"] = {"platform": "matrix", "room_id": room_id, "user_id": matrix_user_id}
+        ctx = {"platform": "matrix", "room_id": room_id, "user_id": matrix_user_id}
+        if _sc_conv_id:
+            ctx["conv_id"] = _sc_conv_id
+            ctx["slot_cache_endpoint"] = "matrix"
+        session["chat_context"] = ctx
     result = handle_user_input(session, user_message, allow_new_session=True, images=images)
     sessions[session_key] = result[1]
     # result[4] = reiner Content (ohne Thinking) für KI-Antworten.
@@ -374,6 +389,8 @@ async def run_matrix_bot(config: dict[str, Any]) -> None:
     matrix_sessions: dict[str, Any] = {}
     # Pending Images: User hat Bild ohne Text geschickt → nächste Textnachricht bekommt das Bild
     _pending_images: dict[str, list[dict[str, Any]]] = {}
+    # Pending Documents: PDF/DOCX/Text-Anhang ohne Text → naechste Textnachricht bekommt das Dokument
+    _pending_docs: dict[str, list[dict[str, Any]]] = {}
 
     async def _send_room_message(cl: Any, room_id: str, body: str) -> None:
         """Sendet eine Textnachricht im Raum. Mit mistune: m.text + org.matrix.custom.html (formatted_body)."""
@@ -553,6 +570,92 @@ async def run_matrix_bot(config: dict[str, Any]) -> None:
         except Exception as e:
             logger.warning("Matrix: Bild-Download Fehler für %s: %s", mxc_url, e)
         return None
+
+    async def _download_mxc_file(mxc_url: str, file_info: dict[str, Any] | None = None) -> bytes | None:
+        """Generischer Datei-Download (PDF/DOCX/Text). Mit E2EE-Decrypt falls noetig.
+        Im Gegensatz zu _download_mxc_image keine Bild-Header-Validierung."""
+        try:
+            resp = await client.download(mxc_url)
+            if not (hasattr(resp, "body") and resp.body):
+                logger.warning("Matrix: Datei-Download fehlgeschlagen fuer %s", mxc_url)
+                return None
+            data = resp.body
+            if file_info and file_info.get("key") and file_info.get("iv"):
+                try:
+                    from nio.crypto.attachments import decrypt_attachment
+                    key_str = file_info["key"].get("k", "")
+                    iv_str = file_info.get("iv", "")
+                    hash_str = (file_info.get("hashes") or {}).get("sha256", "")
+                    data = decrypt_attachment(data, key_str, hash_str, iv_str)
+                except ImportError:
+                    logger.warning("Matrix: nio.crypto.attachments nicht verfuegbar – pip install matrix-nio[e2e]")
+                    return None
+                except Exception as e:
+                    logger.warning("Matrix: Datei-Entschluesselung fehlgeschlagen: %s", e)
+                    return None
+            return data
+        except Exception as e:
+            logger.warning("Matrix: Datei-Download Fehler fuer %s: %s", mxc_url, e)
+            return None
+
+    async def on_file(room_id: str, event: Any) -> None:
+        """m.file Events: Dokument (PDF/DOCX/Text) herunterladen, extrahieren, als Pending speichern."""
+        sender = getattr(event, "sender", None) or ""
+        if not sender or sender == user_id:
+            return
+        config_dir = config.get("_config_dir")
+        if not is_authorized("matrix", sender, config_dir):
+            code = get_or_generate_code("matrix", sender, config_dir)
+            await _send_room_message(client, room_id, f"Du bist noch nicht freigeschaltet. Dein Auth-Code: **{code}**\n\nGib in der Web-UI ein: `/auth matrix {code}`")
+            return
+        # URL und Datei-Info extrahieren (analog on_image)
+        mxc_url = getattr(event, "url", None) or ""
+        file_info: dict[str, Any] | None = None
+        source = getattr(event, "source", None) or {}
+        content = source.get("content") or {} if isinstance(source, dict) else {}
+        if isinstance(content, dict) and content.get("file"):
+            enc_file = content["file"]
+            if not mxc_url:
+                mxc_url = enc_file.get("url", "")
+            file_info = enc_file
+        if not file_info:
+            ev_key = getattr(event, "key", None)
+            ev_iv = getattr(event, "iv", None)
+            if ev_key and ev_iv:
+                file_info = {"key": ev_key, "iv": ev_iv, "hashes": getattr(event, "hashes", None) or {}}
+        if not mxc_url:
+            await _send_room_message(client, room_id, "Konnte Dateianhang nicht lesen (keine URL).")
+            return
+        # Filename + MIME aus Event
+        info = content.get("info") or {} if isinstance(content, dict) else {}
+        event_mime = (info.get("mimetype") if isinstance(info, dict) else "") or ""
+        filename = (content.get("body") if isinstance(content, dict) else "") or getattr(event, "body", "") or "anhang"
+        # Filter: nur unterstuetzte Typen verarbeiten
+        from miniassistant.documents import is_supported as _doc_supported, extract_document as _doc_extract
+        if not _doc_supported(event_mime, filename):
+            await _send_room_message(client, room_id, f"Dateityp `{event_mime or filename}` wird nicht unterstuetzt (PDF, DOCX, Text).")
+            return
+        logger.info("Matrix: Dokument-Anhang von %s in %s: %s (mime: %s)", sender, room_id, filename, event_mime or "?")
+        data = await _download_mxc_file(mxc_url, file_info=file_info)
+        if not data:
+            await _send_room_message(client, room_id, "Konnte das Dokument nicht herunterladen.")
+            return
+        max_chars = int(config.get("doc_max_chars") or 200000)
+        max_pages = int(config.get("doc_max_pages_render") or 10)
+        doc = _doc_extract(data, filename, event_mime, max_chars=max_chars, max_pages_render=max_pages)
+        if doc.get("error"):
+            await _send_room_message(client, room_id, f"Dokument konnte nicht gelesen werden: {doc['error']}")
+            return
+        _pending_docs.setdefault(sender, []).append(doc)
+        n_chars = len(doc.get("text") or "")
+        n_imgs = len(doc.get("images") or [])
+        info_msg = f"Dokument empfangen ({n_chars} Zeichen"
+        if n_imgs:
+            info_msg += f", {n_imgs} Seiten als Bild"
+        if doc.get("truncated"):
+            info_msg += ", gekuerzt"
+        info_msg += "). Was soll ich damit machen?"
+        await _send_room_message(client, room_id, info_msg)
 
     async def on_image(room_id: str, event: Any) -> None:
         """Wird bei m.image Events aufgerufen – Bild herunterladen und als Pending speichern.
@@ -747,6 +850,13 @@ async def run_matrix_bot(config: dict[str, Any]) -> None:
             await on_audio(room_id, event)
             return
 
+        # File-Events: RoomMessageFile, msgtype=m.file — VOR Bild-Fallback (sonst greift body+url Heuristik)
+        _is_file = (RoomMessageFile and isinstance(event, RoomMessageFile)) or _msgtype == "m.file"
+        if _is_file:
+            logger.info("Matrix: File-Event erkannt, delegiere an on_file")
+            await on_file(room_id, event)
+            return
+
         # Bild-Events abfangen: RoomMessageImage, msgtype=m.image, oder body+url Heuristik
         _is_image = (RoomMessageImage and isinstance(event, RoomMessageImage)) or _msgtype == "m.image"
         if not _is_image:
@@ -805,8 +915,22 @@ async def run_matrix_bot(config: dict[str, Any]) -> None:
                 f"Gib in der Web-UI ein: `/auth matrix {code}`"
             )
         else:
-            # Pending Images abholen (Bild wurde vorher ohne Text geschickt)
+            # Pending Images + Documents abholen
             msg_images = _pending_images.pop(sender, None) or None
+            msg_docs = _pending_docs.pop(sender, None) or None
+            # Dokument-PNGs (gescannte PDFs) zu Bilderliste hinzufuegen
+            if msg_docs:
+                for _d in msg_docs:
+                    if _d.get("images"):
+                        if msg_images is None:
+                            msg_images = []
+                        msg_images.extend(_d["images"])
+                # Doc-Bloecke an body anhaengen (chat_loop strippt sie beim History-Save)
+                from miniassistant.documents import format_document_block as _fmt_doc
+                _doc_blocks = [_fmt_doc(d) for d in msg_docs]
+                _doc_text = "\n\n".join(b for b in _doc_blocks if b)
+                if _doc_text:
+                    body = f"{_doc_text}\n\n{body}".strip()
             # Typing-Indikator: Bot „tippt", solange er denkt/schreibt
             room_typing = getattr(client, "room_typing", None)
             typing_task: asyncio.Task | None = None
@@ -959,7 +1083,7 @@ async def run_matrix_bot(config: dict[str, Any]) -> None:
         client.add_event_callback(_on_room_message, _RoomMessageBase)
         logger.info("Matrix: Callback für alle RoomMessage-Typen registriert (inkl. Bilder)")
     else:
-        _message_types = (RoomMessageText,) + ((RoomMessageNotice,) if RoomMessageNotice else ()) + ((RoomMessageImage,) if RoomMessageImage else ())
+        _message_types = (RoomMessageText,) + ((RoomMessageNotice,) if RoomMessageNotice else ()) + ((RoomMessageImage,) if RoomMessageImage else ()) + ((RoomMessageFile,) if RoomMessageFile else ())
         client.add_event_callback(_on_room_message, _message_types)
         logger.info("Matrix: Callback für %d Message-Typen registriert", len(_message_types))
     if MegolmEvent:

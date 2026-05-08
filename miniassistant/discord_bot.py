@@ -90,10 +90,16 @@ def _get_chat_response(
     Session-Key kombiniert Channel und User: gleicher User in zwei Channels → zwei separate Sessions.
     """
     from miniassistant.chat_loop import create_session, handle_user_input
+    from miniassistant.slot_cache import derive_conv_id as _sc_derive
     session_key = f"{channel_id or ''}|{discord_user_id}"
+    _sc_conv_id = _sc_derive("discord", channel_id=channel_id, user_id=discord_user_id) if channel_id else None
     # Set chat_context BEFORE creating session so user_id is included in system_prompt
     if channel_id:
-        config["_chat_context"] = {"platform": "discord", "channel_id": channel_id, "user_id": discord_user_id}
+        ctx = {"platform": "discord", "channel_id": channel_id, "user_id": discord_user_id}
+        if _sc_conv_id:
+            ctx["conv_id"] = _sc_conv_id
+            ctx["slot_cache_endpoint"] = "discord"
+        config["_chat_context"] = ctx
     if session_key not in sessions:
         session = create_session(config, None)
         session["system_prompt"] = (
@@ -104,7 +110,11 @@ def _get_chat_response(
     session = sessions[session_key]
     # Chat-Kontext aktualisieren (Channel-ID kann sich ändern)
     if channel_id:
-        session["chat_context"] = {"platform": "discord", "channel_id": channel_id, "user_id": discord_user_id}
+        ctx = {"platform": "discord", "channel_id": channel_id, "user_id": discord_user_id}
+        if _sc_conv_id:
+            ctx["conv_id"] = _sc_conv_id
+            ctx["slot_cache_endpoint"] = "discord"
+        session["chat_context"] = ctx
     result = handle_user_input(session, user_message, allow_new_session=True, images=images)
     sessions[session_key] = result[1]
     ai_content = result[4] if len(result) > 4 else None
@@ -181,27 +191,46 @@ async def run_discord_bot(config: dict[str, Any]) -> None:
         if is_mentioned and client.user is not None:
             body = body.replace(f"<@{client.user.id}>", "").replace(f"<@!{client.user.id}>", "").strip()
 
-        # Bild- und Audio-Attachments herunterladen
+        # Bild-, Audio- und Dokument-Attachments herunterladen
         msg_images: list[dict[str, Any]] = []
+        msg_docs: list[dict[str, Any]] = []
         audio_bytes: bytes | None = None
+        from miniassistant.documents import is_supported as _doc_supported, extract_document as _doc_extract
+        _doc_max_chars = int(config.get("doc_max_chars") or 200000)
+        _doc_max_pages = int(config.get("doc_max_pages_render") or 10)
         for att in message.attachments:
             ct = (att.content_type or "").lower()
-            if ct.startswith("image/") or att.filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+            fname = att.filename or ""
+            if ct.startswith("image/") or fname.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
                 try:
                     import base64 as _b64
                     img_bytes = await att.read()
                     mime = ct if ct.startswith("image/") else "image/png"
                     b64_data = _b64.b64encode(img_bytes).decode("ascii")
                     msg_images.append({"mime_type": mime, "data": b64_data})
-                    logger.info("Discord: Bild-Attachment von %s: %s (%s)", sender_id, att.filename, mime)
+                    logger.info("Discord: Bild-Attachment von %s: %s (%s)", sender_id, fname, mime)
                 except Exception as e:
-                    logger.warning("Discord: Bild-Download fehlgeschlagen für %s: %s", att.filename, e)
-            elif ct.startswith("audio/") or att.filename.lower().endswith((".ogg", ".mp3", ".wav", ".m4a", ".webm")):
+                    logger.warning("Discord: Bild-Download fehlgeschlagen für %s: %s", fname, e)
+            elif ct.startswith("audio/") or fname.lower().endswith((".ogg", ".mp3", ".wav", ".m4a", ".webm")):
                 try:
                     audio_bytes = await att.read()
-                    logger.info("Discord: Audio-Attachment von %s: %s (%d bytes)", sender_id, att.filename, len(audio_bytes))
+                    logger.info("Discord: Audio-Attachment von %s: %s (%d bytes)", sender_id, fname, len(audio_bytes))
                 except Exception as e:
-                    logger.warning("Discord: Audio-Download fehlgeschlagen für %s: %s", att.filename, e)
+                    logger.warning("Discord: Audio-Download fehlgeschlagen für %s: %s", fname, e)
+            elif _doc_supported(ct, fname):
+                try:
+                    doc_bytes = await att.read()
+                    doc = _doc_extract(doc_bytes, fname, ct, max_chars=_doc_max_chars, max_pages_render=_doc_max_pages)
+                    if doc.get("error"):
+                        logger.warning("Discord: Dokument-Extraktion fehlgeschlagen %s: %s", fname, doc["error"])
+                        await message.reply(f"Dokument `{fname}` konnte nicht gelesen werden: {doc['error']}")
+                        return
+                    msg_docs.append(doc)
+                    if doc.get("images"):
+                        msg_images.extend(doc["images"])
+                    logger.info("Discord: Dokument-Attachment %s: %d Zeichen, %d Seiten-PNGs", fname, len(doc.get("text") or ""), len(doc.get("images") or []))
+                except Exception as e:
+                    logger.warning("Discord: Dokument-Download fehlgeschlagen für %s: %s", fname, e)
 
         # Audio-Nachricht: STT → Agent → TTS → Antwort senden
         if audio_bytes is not None:
@@ -262,12 +291,13 @@ async def run_discord_bot(config: dict[str, Any]) -> None:
             return
 
         # Bild ohne Text → Pending speichern, User fragen
-        if msg_images and not body:
+        # (nur bei reinem Bild ohne Dokument; Dokument hat eigenen Text-Inhalt)
+        if msg_images and not body and not msg_docs:
             _pending_images.setdefault(sender_id, []).extend(msg_images)
             await message.reply("Bild empfangen. Was soll ich damit machen?")
             return
 
-        if not body and not msg_images:
+        if not body and not msg_images and not msg_docs:
             return
 
         # /stop, /abort, /abbruch: Cancellation-Befehle abfangen (auch mit : statt /)
@@ -300,6 +330,14 @@ async def run_discord_bot(config: dict[str, Any]) -> None:
             return
 
         images_param = msg_images if msg_images else None
+
+        # Dokument-Bloecke an User-Text anhaengen (chat_loop strippt sie beim History-Save)
+        if msg_docs:
+            from miniassistant.documents import format_document_block as _fmt_doc
+            doc_blocks = [_fmt_doc(d) for d in msg_docs]
+            doc_text = "\n\n".join(b for b in doc_blocks if b)
+            if doc_text:
+                body = f"{doc_text}\n\n{body}".strip() if body else f"{doc_text}\n\nBitte uebersetze oder fasse das Dokument zusammen."
 
         # Typing-Indicator + KI-Antwort
         async with message.channel.typing():

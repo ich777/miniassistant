@@ -241,6 +241,8 @@ def get_options_for_model(config: dict[str, Any], model_name: str) -> dict[str, 
             base = {**base, **overlay}
     # 'think' ist kein Ollama-Option sondern Top-Level-Parameter → nicht in options mitschicken
     base.pop("think", None)
+    # 'slot_cache' ist ein MA-internes Flag — nicht an Ollama/llama.cpp senden
+    base.pop("slot_cache", None)
     # num_ctx=0 bedeutet "nicht setzen, Server-Default nutzen"
     if "num_ctx" in base and not base["num_ctx"]:
         base.pop("num_ctx")
@@ -436,6 +438,33 @@ def _tools_schema(
                     "max_chars": {"type": "integer", "description": "Max characters to return (default 8000). Raise when the truncation marker indicates important content was cut — the marker states the full length; pass that value here to get everything."},
                 },
                 "required": ["url"],
+            },
+        },
+    })
+    schema.append({
+        "type": "function",
+        "function": {
+            "name": "download_file",
+            "description": (
+                "Download a binary file (image, PDF, archive, video etc.) from a URL and save it to disk. "
+                "Use this INSTEAD of `exec curl/wget` for binary downloads — sends Safari User-Agent + "
+                "Sec-Fetch headers + auto-Referer for known CDNs (Wikimedia Commons, Imgur, Reddit). "
+                "Bypasses bot-detection on 403/429 via curl_cffi Safari TLS impersonation. "
+                "For Wikimedia Commons images: first call read_url on the MediaWiki API "
+                "(commons.wikimedia.org/w/api.php?action=query&titles=File:NAME&prop=imageinfo&iiprop=url&format=json) "
+                "to get the real upload.wikimedia.org URL — never guess hash subdirs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Direct URL to the file (must end in the file's real path, not a viewer/gallery page)."},
+                    "path": {"type": "string", "description": "Save path. Relative paths land inside the workspace. Absolute paths must already be inside workspace. Include extension (.jpg/.pdf/etc)."},
+                    "referer": {"type": "string", "description": "Optional Referer header. Auto-set for upload.wikimedia.org/imgur.com/redditmedia.com — only set manually if a CDN demands a specific source page."},
+                    "max_bytes": {"type": "integer", "description": "Max bytes to accept (default 50 MB). Reject larger files."},
+                    "timeout": {"type": "number", "description": "Timeout seconds (default 60)."},
+                    "proxy": {"type": "string", "description": "Proxy name from configured proxies. Omit for default/direct."},
+                },
+                "required": ["url", "path"],
             },
         },
     })

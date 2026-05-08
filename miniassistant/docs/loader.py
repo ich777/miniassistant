@@ -39,6 +39,7 @@ DOC_FILES = [
     "TRACKING.md",
     "WEB_FETCHING.md",
     "DIRECTIONS.md",
+    "DOCUMENTS.md",
 ]
 
 

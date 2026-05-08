@@ -674,6 +674,167 @@ def read_url(url: str, max_chars: int | None = 8000, timeout: float = 15.0, conf
 
 
 # ---------------------------------------------------------------------------
+# download_file – Binaer-Download mit Safari-UA + Quirks. Fuer Bilder/PDFs/etc.
+# ---------------------------------------------------------------------------
+
+_DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024  # 50 MB Hard-Cap
+
+
+def _safari_image_headers(url: str, referer: str | None = None) -> dict[str, str]:
+    """Erzeugt Safari-typische Headers fuer Binary-Download.
+
+    Quirks die Safari real schickt (vs naivem curl):
+    - Accept: bildtyp-spezifisch fuer image/*-URLs, sonst */*
+    - Accept-Language: nutzersystem-aehnlich
+    - Sec-Fetch-Dest/Mode/Site: ab Safari 17 immer mitgeschickt
+    - Referer: viele CDNs (Wikimedia, getty, instagram) blocken ohne
+    - DNT: optional, nicht alle Safari-Setups senden
+    """
+    is_image = bool(re.search(r'\.(jpe?g|png|gif|webp|avif|svg|bmp|tiff?)(\?|$)', url, re.IGNORECASE))
+    h: dict[str, str] = {
+        "User-Agent": _USER_AGENT,
+        "Accept": (
+            "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5"
+            if is_image else "*/*"
+        ),
+        "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br" if _BROTLI_AVAILABLE else "gzip, deflate",
+        "Sec-Fetch-Dest": "image" if is_image else "document",
+        "Sec-Fetch-Mode": "no-cors" if is_image else "navigate",
+        "Sec-Fetch-Site": "cross-site",
+    }
+    if referer:
+        h["Referer"] = referer
+    else:
+        # Auto-Referer fuer bekannte CDNs (sonst 403)
+        if "upload.wikimedia.org" in url:
+            h["Referer"] = "https://commons.wikimedia.org/"
+        elif "imgur.com" in url:
+            h["Referer"] = "https://imgur.com/"
+        elif "redditmedia.com" in url or "i.redd.it" in url:
+            h["Referer"] = "https://www.reddit.com/"
+    return h
+
+
+def download_file(
+    url: str,
+    path: str,
+    *,
+    referer: str | None = None,
+    max_bytes: int = _DOWNLOAD_MAX_BYTES,
+    timeout: float = 60.0,
+    config: dict[str, Any] | None = None,
+    proxy: str | None = None,
+) -> dict[str, Any]:
+    """
+    Laedt eine Datei binaer von URL und speichert sie unter `path` (relativ → workspace/).
+
+    Headers Safari-konform (UA, Accept-image, Sec-Fetch-*, Auto-Referer fuer Wikimedia/Imgur/Reddit).
+    Bei 403/429 Fallback via curl_cffi mit Safari-TLS-Impersonation.
+
+    Returns: {ok, path?, bytes?, content_type?, error?}
+    """
+    u = (url or "").strip()
+    if not u:
+        return {"ok": False, "error": "URL is empty"}
+    if not u.startswith(("http://", "https://")):
+        u = "https://" + u
+    if _is_ssrf_target(u):
+        return {"ok": False, "error": "Access to internal/private networks is blocked"}
+
+    # Pfad: relativ → workspace/, absolut nur erlaubt wenn unter workspace
+    workspace = ""
+    if config:
+        workspace = (config.get("workspace") or "").strip()
+    from pathlib import Path as _P
+    p = _P(path).expanduser()
+    if not p.is_absolute():
+        if not workspace:
+            return {"ok": False, "error": "no workspace configured — provide an absolute path or set workspace in config"}
+        p = (_P(workspace).resolve() / p).resolve()
+    else:
+        p = p.resolve()
+    # Path-Traversal-Schutz: muss innerhalb workspace liegen
+    if workspace:
+        ws = _P(workspace).resolve()
+        try:
+            p.relative_to(ws)
+        except ValueError:
+            return {"ok": False, "error": f"path must be inside workspace ({ws})"}
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    headers = _safari_image_headers(u, referer=referer)
+    proxy_url = None
+    connection_name = "direct"
+    if config is not None:
+        try:
+            proxy_url, connection_name = _get_proxy_for_request(config, proxy_name=proxy)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+
+    def _save_stream(resp_iter, ctype: str) -> dict[str, Any]:
+        total = 0
+        with open(p, "wb") as f:
+            for chunk in resp_iter:
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > max_bytes:
+                    f.close()
+                    p.unlink(missing_ok=True)
+                    return {"ok": False, "error": f"file exceeds max_bytes ({max_bytes})"}
+                f.write(chunk)
+        return {"ok": True, "path": str(p), "bytes": total, "content_type": ctype, "connection": connection_name}
+
+    last_err: Exception | None = None
+    client_kwargs: dict[str, Any] = {"timeout": timeout, "follow_redirects": True, "headers": headers}
+    if proxy_url:
+        client_kwargs["proxy"] = proxy_url
+
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            with httpx.Client(**client_kwargs) as client:
+                with client.stream("GET", u) as r:
+                    if r.status_code in (403, 429) and _CURL_CFFI_AVAILABLE:
+                        _log.info("download_file: HTTP %d → curl_cffi Safari impersonation", r.status_code)
+                        break  # break to curl_cffi fallback below
+                    r.raise_for_status()
+                    ctype = r.headers.get("content-type", "application/octet-stream")
+                    return _save_stream(r.iter_bytes(64 * 1024), ctype)
+        except (httpx.TimeoutException, httpx.RemoteProtocolError) as e:
+            return {"ok": False, "error": str(e), "connection": connection_name}
+        except httpx.HTTPStatusError as e:
+            last_err = e
+            sc = e.response.status_code
+            if sc in (403, 429) and _CURL_CFFI_AVAILABLE:
+                break  # fallback below
+            if attempt < _RETRY_ATTEMPTS - 1 and sc in _RETRYABLE_STATUS_CODES:
+                _log.warning("download_file attempt %d/%d failed (HTTP %d), retry in %ds", attempt + 1, _RETRY_ATTEMPTS, sc, _RETRY_DELAY)
+                time.sleep(_RETRY_DELAY)
+                continue
+            return {"ok": False, "error": f"HTTP {sc}: {e}", "connection": connection_name}
+        except Exception as e:
+            return {"ok": False, "error": str(e), "connection": connection_name}
+
+    # curl_cffi Fallback (TLS-fingerprint = Safari)
+    if _CURL_CFFI_AVAILABLE:
+        try:
+            cr = _curl_requests.get(u, headers=headers, impersonate="safari17_0", timeout=timeout, allow_redirects=True)
+            if cr.status_code < 400:
+                ctype = cr.headers.get("content-type", "application/octet-stream")
+                content = cr.content or b""
+                if len(content) > max_bytes:
+                    return {"ok": False, "error": f"file exceeds max_bytes ({max_bytes})", "connection": connection_name}
+                with open(p, "wb") as f:
+                    f.write(content)
+                return {"ok": True, "path": str(p), "bytes": len(content), "content_type": ctype, "connection": f"{connection_name}+curl_cffi"}
+            return {"ok": False, "error": f"HTTP {cr.status_code} (curl_cffi)", "connection": connection_name}
+        except Exception as ce:
+            return {"ok": False, "error": f"curl_cffi failed: {ce}", "connection": connection_name}
+    return {"ok": False, "error": str(last_err) if last_err else "unknown error", "connection": connection_name}
+
+
+# ---------------------------------------------------------------------------
 # Email – send_email (SMTP) und read_email (IMAP)
 # ---------------------------------------------------------------------------
 

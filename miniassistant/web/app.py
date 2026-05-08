@@ -191,8 +191,9 @@ _discord_bot_task: asyncio.Task | None = None
 @app.on_event("startup")
 async def _startup() -> None:
     """Bei server.debug: Startup in debug/serve.log schreiben. Chat-Bots starten falls konfiguriert."""
-    global _matrix_bot_task, _discord_bot_task, _session_cleanup_task, _chat_executor
+    global _matrix_bot_task, _discord_bot_task, _session_cleanup_task, _chat_executor, _slot_cache_cleanup_task
     _session_cleanup_task = asyncio.create_task(_cleanup_expired_sessions())
+    _slot_cache_cleanup_task = asyncio.create_task(_slot_cache_cleanup_loop())
     _chat_executor = ThreadPoolExecutor(max_workers=_CHAT_EXECUTOR_MAX_WORKERS, thread_name_prefix="chat")
     try:
         project_dir = getattr(app.state, "project_dir", None)
@@ -250,12 +251,36 @@ async def _cleanup_expired_sessions() -> None:
             _log.info("Session-Cleanup: %d abgelaufene Session(s) entfernt", len(expired))
 
 
+_slot_cache_cleanup_task: asyncio.Task | None = None
+
+
+async def _slot_cache_cleanup_loop() -> None:
+    """Stündlich: TTL+LRU + unknown-models Sweep für Slot-Cache.
+    No-op wenn slot_cache.enabled=false."""
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            from miniassistant.config import load_config
+            from miniassistant import slot_cache
+            cfg = load_config()
+            if not slot_cache.is_globally_enabled(cfg):
+                continue
+            removed_lru = slot_cache.cleanup_lru_and_ttl(cfg)
+            removed_unk = slot_cache.cleanup_unknown_models(cfg)
+            if removed_lru or removed_unk:
+                _log.info("Slot-Cache-Cleanup: %d (TTL+LRU), %d (unknown models)", removed_lru, removed_unk)
+        except Exception as e:
+            _log.warning("Slot-Cache-Cleanup error: %s", e)
+
+
 @app.on_event("shutdown")
 async def _shutdown() -> None:
     """Chat-Executor cleanup und Bot-Tasks abbrechen."""
-    global _chat_executor, _matrix_bot_task, _discord_bot_task, _session_cleanup_task
+    global _chat_executor, _matrix_bot_task, _discord_bot_task, _session_cleanup_task, _slot_cache_cleanup_task
     if _chat_executor:
         _chat_executor.shutdown(wait=False)
+    if _slot_cache_cleanup_task:
+        _slot_cache_cleanup_task.cancel()
         _chat_executor = None
     if _session_cleanup_task and not _session_cleanup_task.done():
         _session_cleanup_task.cancel()
@@ -1010,8 +1035,8 @@ async def chat_page(request: Request):
     <form id="f" class="chat-input">
       <div id="img-preview"></div>
       <div class="chat-input-row">
-        <button type="button" class="btn-img-upload" id="btn-img" title="Bild hochladen zum Analysieren oder Bearbeiten (Drag&amp;Drop / Ctrl+V)">&#128247;</button>
-        <input type="file" id="img-input" accept="image/*" multiple style="display:none;">
+        <button type="button" class="btn-img-upload" id="btn-img" title="Bild oder Dokument hochladen (PDF, DOCX, Text). Drag&amp;Drop / Ctrl+V">&#128247;</button>
+        <input type="file" id="img-input" accept="image/*,.pdf,.docx,.txt,.md,.csv,.json,.xml,.log,.rst" multiple style="display:none;">
         <textarea id="msg" placeholder="Nachricht… (Enter = Senden, Shift+Enter = Zeile)" rows="2" autocomplete="off"></textarea>
         <button type="submit" class="btn btn-primary" id="btn-send">Senden</button>
         <button type="button" class="btn btn-outline" id="btn-cancel" style="display:none;">Abbrechen</button>
@@ -1047,27 +1072,43 @@ async def chat_page(request: Request):
     const imgPreview = document.getElementById("img-preview");
     const btnImg = document.getElementById("btn-img");
     let pendingImages = []; /* {{data: base64, mime_type: string, name: string}} */
+    let pendingDocuments = []; /* {{data: base64, mime_type: string, name: string}} */
     const MAX_IMG_SIZE = 20 * 1024 * 1024; /* 20MB */
-    const ALLOWED_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+    const MAX_DOC_SIZE = 25 * 1024 * 1024; /* 25MB */
+    const ALLOWED_IMG_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+    const DOC_EXTS = [".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".xml", ".log", ".rst"];
+    function isDocument(f) {{
+      if (f.type === "application/pdf") return true;
+      if (f.type && f.type.startsWith("text/")) return true;
+      if (f.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") return true;
+      if (f.type === "application/json" || f.type === "application/xml") return true;
+      const lower = (f.name || "").toLowerCase();
+      return DOC_EXTS.some(function(ext) {{ return lower.endsWith(ext); }});
+    }}
     btnImg.addEventListener("click", function() {{ imgInput.click(); }});
     imgInput.addEventListener("change", function() {{ handleFiles(this.files); this.value = ""; }});
     function handleFiles(files) {{
       for (const f of files) {{
-        if (!ALLOWED_TYPES.includes(f.type)) {{ alert("Nur JPEG, PNG, GIF und WebP werden unterstuetzt."); continue; }}
-        if (f.size > MAX_IMG_SIZE) {{ alert("Bild zu gross (max 20MB): " + f.name); continue; }}
+        const isImg = ALLOWED_IMG_TYPES.includes(f.type);
+        const isDoc = !isImg && isDocument(f);
+        if (!isImg && !isDoc) {{ alert("Dateityp nicht unterstuetzt: " + (f.type || f.name)); continue; }}
+        const limit = isImg ? MAX_IMG_SIZE : MAX_DOC_SIZE;
+        if (f.size > limit) {{ alert("Datei zu gross (max " + (limit / 1024 / 1024) + "MB): " + f.name); continue; }}
         const reader = new FileReader();
-        reader.onload = function(ev) {{
+        reader.onload = (function(file, asImg) {{ return function(ev) {{
           const dataUrl = ev.target.result;
           const base64 = dataUrl.split(",")[1];
-          pendingImages.push({{ data: base64, mime_type: f.type, name: f.name }});
+          const mime = file.type || (asImg ? "image/png" : "application/octet-stream");
+          if (asImg) pendingImages.push({{ data: base64, mime_type: mime, name: file.name }});
+          else pendingDocuments.push({{ data: base64, mime_type: mime, name: file.name }});
           renderPreview();
-        }};
+        }}; }})(f, isImg);
         reader.readAsDataURL(f);
       }}
     }}
     function renderPreview() {{
       imgPreview.innerHTML = "";
-      if (!pendingImages.length) {{ imgPreview.style.display = "none"; return; }}
+      if (!pendingImages.length && !pendingDocuments.length) {{ imgPreview.style.display = "none"; return; }}
       imgPreview.style.display = "flex";
       pendingImages.forEach(function(img, idx) {{
         const thumb = document.createElement("div");
@@ -1083,6 +1124,19 @@ async def chat_page(request: Request):
         rm.addEventListener("click", function() {{ pendingImages.splice(idx, 1); renderPreview(); }});
         thumb.appendChild(rm);
         imgPreview.appendChild(thumb);
+      }});
+      pendingDocuments.forEach(function(doc, idx) {{
+        const chip = document.createElement("div");
+        chip.className = "img-thumb";
+        chip.style.cssText = "display:flex;align-items:center;gap:0.4em;padding:0.4em 0.6em;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:0.85em";
+        chip.innerHTML = "&#128196; " + (doc.name || "doc");
+        const rm = document.createElement("button");
+        rm.type = "button";
+        rm.className = "img-remove";
+        rm.textContent = "x";
+        rm.addEventListener("click", function() {{ pendingDocuments.splice(idx, 1); renderPreview(); }});
+        chip.appendChild(rm);
+        imgPreview.appendChild(chip);
       }});
     }}
     /* Drag & Drop */
@@ -1319,7 +1373,7 @@ async def chat_page(request: Request):
     form.addEventListener("submit", async (e) => {{
       e.preventDefault();
       const content = msgEl.value.trim();
-      if (!content && !pendingImages.length) return;
+      if (!content && !pendingImages.length && !pendingDocuments.length) return;
       msgEl.value = "";
       msgEl.style.height = "auto";
       /* User-Message mit Bild-Thumbnails anzeigen */
@@ -1357,10 +1411,12 @@ async def chat_page(request: Request):
       showStreamContainer(content);
       btnSend.disabled = true; btnCancel.style.display = "";
       currentAbort = new AbortController();
+      const sentDocs = pendingDocuments.slice();
       const url = "/api/chat/stream" + (token ? "?token=" + encodeURIComponent(token) : "");
-      const body = {{ message: content || "(Bild analysieren / bearbeiten)" }};
+      const body = {{ message: content || (sentDocs.length ? "(Dokument verarbeiten)" : "(Bild analysieren / bearbeiten)") }};
       if (sentImages.length) body.images = sentImages.map(function(img) {{ return {{ data: img.data, mime_type: img.mime_type }}; }});
-      pendingImages = []; renderPreview();
+      if (sentDocs.length) body.documents = sentDocs.map(function(d) {{ return {{ data: d.data, mime_type: d.mime_type, name: d.name }}; }});
+      pendingImages = []; pendingDocuments = []; renderPreview();
       if (sessionId) body.session_id = sessionId;
       if (params.get("track") === "1") body.track = true;
       try {{
@@ -1810,11 +1866,14 @@ def _chat_stream_generator_locked(session_id: str, session: dict, message: str, 
         if ev.get("type") == "done":
             _done_msgs = ev.get("new_messages", session["messages"])
             # Bilder aus Messages entfernen (base64-Daten verschwenden Kontext-Platz)
+            from miniassistant.documents import strip_document_blocks as _strip_docs
             for _msg in _done_msgs:
                 if _msg.get("images"):
                     del _msg["images"]
                     if _msg.get("role") == "user" and "[Bild]" not in (_msg.get("content") or ""):
                         _msg["content"] = "[Bild angehängt] " + (_msg.get("content") or "")
+                if _msg.get("role") == "user" and "<doc " in (_msg.get("content") or ""):
+                    _msg["content"] = _strip_docs(_msg["content"])
             session["messages"] = _done_msgs
             _sessions[session_id] = session
             # Memory + Chat-History: nur bei gespeicherten Chats (track=1)
@@ -1842,7 +1901,8 @@ async def api_chat_stream(request: Request):
     _require_token(request)
     body = await request.json()
     message = (body.get("message") or "").strip()
-    if not message:
+    _has_attachments = bool(body.get("images")) or bool(body.get("documents"))
+    if not message and not _has_attachments:
         raise HTTPException(status_code=400, detail="message required")
     requested_sid = body.get("session_id") or ""
     if requested_sid and requested_sid in _sessions:
@@ -1876,6 +1936,15 @@ async def api_chat_stream(request: Request):
     session["chat_context"]["user_id"] = f"web:{session_id}"
     session["config"].setdefault("_chat_context", {})["user_id"] = f"web:{session_id}"
     session["config"]["_chat_context"]["platform"] = "web"
+    # Slot-Cache nur bei track=true (gespeicherte Chats) — sonst lohnt's nicht
+    if session.get("_track_chat"):
+        from miniassistant.slot_cache import derive_conv_id as _sc_derive
+        _conv = _sc_derive("web", session_id=session_id)
+        if _conv:
+            session["config"]["_chat_context"]["conv_id"] = _conv
+            session["config"]["_chat_context"]["slot_cache_endpoint"] = "web"
+    else:
+        session["config"]["_chat_context"].pop("conv_id", None)
 
     # Lokale Tools: Client übergibt Liste der Tools die er selbst ausführt
     _local_tools = body.get("local_tools")
@@ -1898,6 +1967,39 @@ async def api_chat_stream(request: Request):
                     _chat_images.append({"data": str(_img["data"]), "mime_type": _mime})
         if not _chat_images:
             _chat_images = None
+
+    # Dokumente aus Body extrahieren (PDF/DOCX/Text) → in message prependen + Seiten-PNGs zu Bildern
+    _raw_docs = body.get("documents")
+    if _raw_docs and isinstance(_raw_docs, list):
+        from miniassistant.documents import is_supported as _doc_supported, extract_document as _doc_extract, format_document_block as _fmt_doc
+        import base64 as _b64
+        _doc_max = int((session.get("config") or {}).get("doc_max_chars") or 200000)
+        _pages_max = int((session.get("config") or {}).get("doc_max_pages_render") or 10)
+        _doc_blocks: list[str] = []
+        for _d in _raw_docs[:5]:  # Max 5 Dokumente pro Nachricht
+            if not isinstance(_d, dict) or not _d.get("data"):
+                continue
+            _name = str(_d.get("name") or "anhang")
+            _mime = str(_d.get("mime_type") or "")
+            if not _doc_supported(_mime, _name):
+                continue
+            try:
+                _bytes = _b64.b64decode(_d["data"])
+            except Exception:
+                continue
+            _doc = _doc_extract(_bytes, _name, _mime, max_chars=_doc_max, max_pages_render=_pages_max)
+            if _doc.get("error"):
+                _log.warning("Web: Dokument-Extraktion fehlgeschlagen %s: %s", _name, _doc["error"])
+                continue
+            _block = _fmt_doc(_doc)
+            if _block:
+                _doc_blocks.append(_block)
+            if _doc.get("images"):
+                if _chat_images is None:
+                    _chat_images = []
+                _chat_images.extend(_doc["images"])
+        if _doc_blocks:
+            message = "\n\n".join(_doc_blocks) + "\n\n" + (message or "Bitte verarbeite das Dokument.")
 
     # Abbruch-Befehle VOR dem Session-Lock abfangen (funktionieren auch während Model läuft)
     _cmd_lower = message.strip().lower()
@@ -2040,6 +2142,14 @@ async def api_chat(request: Request):
     session["chat_context"]["user_id"] = f"web:{session_id}"
     session["config"].setdefault("_chat_context", {})["user_id"] = f"web:{session_id}"
     session["config"]["_chat_context"]["platform"] = "web"
+    if session.get("_track_chat"):
+        from miniassistant.slot_cache import derive_conv_id as _sc_derive
+        _conv = _sc_derive("web", session_id=session_id)
+        if _conv:
+            session["config"]["_chat_context"]["conv_id"] = _conv
+            session["config"]["_chat_context"]["slot_cache_endpoint"] = "web"
+    else:
+        session["config"]["_chat_context"].pop("conv_id", None)
 
     result = await loop.run_in_executor(executor, lambda: handle_user_input(session, message))
     response_text = result[0]
@@ -2724,6 +2834,43 @@ async def api_restart(request: Request):
         raise HTTPException(status_code=500, detail="Restart fehlgeschlagen")
 
 
+@app.get("/api/slot_cache/list")
+async def api_slot_cache_list(request: Request):
+    """Liste aller MA-bekannten Slot-Cache-Entries + Stats."""
+    _require_token(request)
+    from miniassistant.config import load_config
+    from miniassistant import slot_cache
+    cfg = load_config()
+    if not slot_cache.is_globally_enabled(cfg):
+        return JSONResponse({"enabled": False, "entries": [], "stats": {}})
+    entries = slot_cache.list_all(cfg)
+    stats = slot_cache.get_stats(cfg)
+    return JSONResponse({"enabled": True, "entries": entries, "stats": stats})
+
+
+@app.delete("/api/slot_cache/{conv_id:path}")
+async def api_slot_cache_delete(conv_id: str, request: Request):
+    """Forget Cache-Entry. File auf LLM-Server bleibt bis Server-Cron es löscht."""
+    _require_token(request)
+    from miniassistant.config import load_config
+    from miniassistant import slot_cache
+    cfg = load_config()
+    removed = slot_cache.invalidate(cfg, conv_id)
+    return JSONResponse({"ok": True, "removed": removed})
+
+
+@app.post("/api/slot_cache/cleanup")
+async def api_slot_cache_cleanup(request: Request):
+    """Manueller Trigger: TTL+LRU + unknown-models cleanup."""
+    _require_token(request)
+    from miniassistant.config import load_config
+    from miniassistant import slot_cache
+    cfg = load_config()
+    r1 = slot_cache.cleanup_lru_and_ttl(cfg)
+    r2 = slot_cache.cleanup_unknown_models(cfg)
+    return JSONResponse({"ok": True, "removed_lru_ttl": r1, "removed_unknown_models": r2})
+
+
 @app.get("/api/usage")
 async def api_usage(request: Request):
     """GET /api/usage?period=hour|day|3days|week|month|year|all -> aggregierte Nutzungsdaten.
@@ -2831,6 +2978,18 @@ async def nutzung_page(request: Request):
         <div class="usage-table">
           <h3>Nach Typ</h3>
           <div id="table-type"><div class="empty-hint">Lade…</div></div>
+        </div>
+      </div>
+      <div id="slot-cache-section" style="display:none;margin-top:1.5em;">
+        <div class="usage-table">
+          <h3>Slot Cache <span id="sc-stats-summary" style="float:right;font-weight:normal;font-size:0.85em;color:var(--muted)"></span></h3>
+          <div id="sc-list-wrap" style="padding:0.6em 0.8em;">
+            <div style="margin-bottom:0.8em;">
+              <button id="sc-cleanup-btn" class="btn">Cleanup ausführen</button>
+              <span id="sc-cleanup-msg" style="margin-left:0.6em;color:var(--muted);font-size:0.85em;"></span>
+            </div>
+            <div id="sc-table"><div class="empty-hint">Lade…</div></div>
+          </div>
         </div>
       </div>
     </div>
@@ -2987,6 +3146,74 @@ async def nutzung_page(request: Request):
       }});
 
       loadData("day");
+
+      // Slot-Cache Section
+      function fmtTs(ts) {{
+        if (!ts) return "—";
+        try {{ return new Date(ts*1000).toLocaleString(); }} catch (e) {{ return ts; }}
+      }}
+      function loadSlotCache() {{
+        fetch("/api/slot_cache/list", {{credentials: "same-origin"}})
+          .then(function(r) {{ return r.json(); }})
+          .then(function(data) {{
+            var section = document.getElementById("slot-cache-section");
+            if (!data.enabled) {{ section.style.display = "none"; return; }}
+            section.style.display = "block";
+            var s = data.stats || {{}};
+            var summary = (
+              "Files: " + (s.total_files || 0) +
+              " · Hits 7d: " + (s.hits_7d || 0) +
+              " · Misses 7d: " + (s.misses_7d || 0) +
+              " · Saves 7d: " + (s.saves_7d || 0) +
+              " · Instance: " + (s.instance_id || "—")
+            );
+            document.getElementById("sc-stats-summary").textContent = summary;
+            var entries = data.entries || [];
+            if (!entries.length) {{
+              document.getElementById("sc-table").innerHTML = '<div class="empty-hint">Noch keine cached Conversations.</div>';
+              return;
+            }}
+            var html = '<table style="width:100%;border-collapse:collapse;font-size:0.85em;">';
+            html += '<tr><th style="text-align:left;padding:0.4em;">Conv-ID</th><th style="text-align:left;padding:0.4em;">Modell</th><th style="text-align:left;padding:0.4em;">Tokens</th><th style="text-align:left;padding:0.4em;">Erstellt</th><th style="text-align:left;padding:0.4em;">Zuletzt</th><th></th></tr>';
+            entries.sort(function(a,b) {{ return (b.last_used_ts||0) - (a.last_used_ts||0); }});
+            entries.forEach(function(e) {{
+              html += '<tr>';
+              html += '<td style="padding:0.4em;font-family:monospace;font-size:0.85em;">' + (e.conv_id||"") + '</td>';
+              html += '<td style="padding:0.4em;">' + (e.model||"") + '</td>';
+              html += '<td style="padding:0.4em;">' + (e.prompt_token_count||0) + '</td>';
+              html += '<td style="padding:0.4em;">' + fmtTs(e.created_ts) + '</td>';
+              html += '<td style="padding:0.4em;">' + fmtTs(e.last_used_ts) + '</td>';
+              html += '<td style="padding:0.4em;"><button class="btn sc-forget-btn" data-conv="' + encodeURIComponent(e.conv_id||"") + '" style="font-size:0.85em;padding:0.3em 0.6em;">Forget</button></td>';
+              html += '</tr>';
+            }});
+            html += '</table>';
+            document.getElementById("sc-table").innerHTML = html;
+            document.querySelectorAll(".sc-forget-btn").forEach(function(b) {{
+              b.addEventListener("click", function() {{
+                var conv = decodeURIComponent(b.getAttribute("data-conv"));
+                if (!confirm("Cache-Entry vergessen?\\n" + conv)) return;
+                fetch("/api/slot_cache/" + encodeURIComponent(conv), {{method:"DELETE", credentials:"same-origin"}})
+                  .then(function() {{ loadSlotCache(); }});
+              }});
+            }});
+          }})
+          .catch(function(e) {{ console.error("slot_cache fetch:", e); }});
+      }}
+      var scBtn = document.getElementById("sc-cleanup-btn");
+      if (scBtn) {{
+        scBtn.addEventListener("click", function() {{
+          var msg = document.getElementById("sc-cleanup-msg");
+          msg.textContent = "Läuft...";
+          fetch("/api/slot_cache/cleanup", {{method:"POST", credentials:"same-origin"}})
+            .then(function(r) {{ return r.json(); }})
+            .then(function(data) {{
+              msg.textContent = "Entfernt: " + (data.removed_lru_ttl||0) + " (LRU/TTL), " + (data.removed_unknown_models||0) + " (unknown).";
+              loadSlotCache();
+            }})
+            .catch(function() {{ msg.textContent = "Fehler"; }});
+        }});
+      }}
+      loadSlotCache();
     }})();
     </script>
     {_THEME_JS}

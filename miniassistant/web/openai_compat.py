@@ -319,9 +319,25 @@ async def chat_completions(request: Request):
     # zu bauen (statt base64, das OpenWebUI-Chunk-Limits sprengt).
     _base = str(request.base_url).rstrip("/")
     config["_chat_context"] = {"platform": "api", "_api_base_url": _base}
+    # Slot-Cache: conv_id aus History-Hash (deterministisch, Edits invalidieren)
+    try:
+        from miniassistant.slot_cache import derive_conv_id as _sc_derive
+        _conv = _sc_derive("api", messages=messages_raw)
+        if _conv:
+            config["_chat_context"]["conv_id"] = _conv
+            config["_chat_context"]["slot_cache_endpoint"] = "api"
+    except Exception:
+        pass
 
     # --- System-Prompt (Agent-Kontext) aufbauen ---
-    system_prompt = build_system_prompt(config, project_dir, current_model=resolved)
+    # In Threadpool: liest Files + ChromaDB (mempalace) — sonst blockiert Event-Loop
+    # und serialisiert parallele Requests bevor sie überhaupt zum Model kommen.
+    from miniassistant.web.app import _chat_executor as _bsp_executor
+    _bsp_loop = asyncio.get_event_loop()
+    system_prompt = await _bsp_loop.run_in_executor(
+        _bsp_executor,
+        lambda: build_system_prompt(config, project_dir, current_model=resolved),
+    )
     system_prompt += "\n\n## Current Chat Context\nPlatform: api"
 
     # Optionaler user system message an Agent-Prompt anhaengen
@@ -554,17 +570,24 @@ def _stream_generator(
                         yield _make_stream_chunk(completion_id, model_display, content=_emit)
                     _audio_buf = ""
                 # done-Event: finale Inhalte (bereinigt) übernehmen.
-                # Pending images als separate Chunks senden — jedes Bild einzeln
-                # damit OpenWebUI die vollständige Markdown-Syntax parsen kann.
-                # Wir lesen das "images"-Feld direkt (kein fragiler String-Slice mehr).
+                # Pending images/audio in mehrere SSE-Chunks splitten —
+                # data:-URLs koennen mehrere MB sein, viele Clients (OpenWebUI httpx)
+                # haben Zeilen-Limit von 64–128 KB pro SSE-Event. Markdown wird
+                # vom Client durch delta.content-Konkatenation wieder zusammengesetzt.
+                _SSE_CHUNK = 96 * 1024  # 96 KB pro Chunk: unter 128 KB-Limit (httpx default), 3x weniger Chunks fuer grosse Bilder
+
+                def _emit_chunked(text: str):
+                    for _i in range(0, len(text), _SSE_CHUNK):
+                        yield _make_stream_chunk(completion_id, model_display, content=text[_i:_i + _SSE_CHUNK])
+
                 final_content = ev.get("content") or total_content
                 final_thinking = ev.get("thinking") or total_thinking
                 for _img in (ev.get("images") or []):
                     _img_md = f"\n\n![{_img['caption']}]({_img['url']})\n\n"
-                    yield _make_stream_chunk(completion_id, model_display, content=_img_md)
+                    yield from _emit_chunked(_img_md)
                 for _aud in (ev.get("audio") or []):
                     _aud_md = f'\n\n[🔊 Sprachnachricht anhören]({_aud["url"]})\n\n'
-                    yield _make_stream_chunk(completion_id, model_display, content=_aud_md)
+                    yield from _emit_chunked(_aud_md)
                 total_content = final_content
                 total_thinking = final_thinking
                 break

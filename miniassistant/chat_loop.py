@@ -43,7 +43,7 @@ from queue import Queue, Empty as _QueueEmpty
 from threading import Thread as _Thread
 
 # Tools die sicher parallel ausgeführt werden können (kein shared state, kein Filesystem-Konflikt)
-_CONCURRENT_SAFE_TOOLS = frozenset({"invoke_model", "read_url", "check_url", "read_email", "search_memory"})
+_CONCURRENT_SAFE_TOOLS = frozenset({"invoke_model", "read_url", "check_url", "read_email", "search_memory", "download_file"})
 
 # ---------------------------------------------------------------------------
 #  Prompt-Injection Sanitization für Tool-Ergebnisse
@@ -315,8 +315,22 @@ def _clean_response(content: str, thinking: str) -> tuple[str, str]:
 
 _BASE64_IMG_RE = _re.compile(r'!\[[^\]]*\]\(data:image/[^;]+;base64,[A-Za-z0-9+/=\s]+\)')
 _NAKED_BASE64_RE = _re.compile(r'data:image/[^;]+;base64,[A-Za-z0-9+/=\s]{100,}')
-# Halluzinierte Bild-Markdown: ![...](/api/workspace/raw?path=...) oder ![...](images/...)
-_FAKE_IMG_MD_RE = _re.compile(r'!\[[^\]]*\]\(/(?:api/(?:workspace/raw|img)/?\??[^)]*)\)')
+# Halluzinierte Bild-Markdown:
+#   ![...](/api/workspace/raw?path=...)  — absolute URL
+#   ![...](/api/img/...)                  — absolute URL
+#   ![...](images/foo.png)                — relativer Workspace-Pfad (Model sieht den Pfad in tool-output und kopiert ihn als Markdown)
+#   ![...](workspace/images/foo.png)      — selbe Variante mit Workspace-Prefix
+#   ![...](/root/.config/miniassistant/workspace/images/foo.png)  — absoluter Disk-Pfad
+_FAKE_IMG_MD_RE = _re.compile(
+    r'!\[[^\]]*\]\('
+    r'(?:'
+    r'/api/(?:workspace/raw|img)/?\??[^)]*'           # /api/workspace/raw, /api/img/...
+    r'|(?:workspace/)?images/[^)\s]+\.(?:png|jpe?g|gif|webp)'  # images/x.png, workspace/images/x.png
+    r'|/[^)\s]+/workspace/images/[^)\s]+\.(?:png|jpe?g|gif|webp)'  # /abs/path/workspace/images/x.png
+    r')'
+    r'\)',
+    _re.IGNORECASE,
+)
 
 
 def _has_hallucinated_base64(content: str) -> bool:
@@ -610,11 +624,15 @@ def _dispatch_chat(
     if provider_type in ("openai", "deepseek", "openai-compat"):
         from miniassistant.openai_client import api_chat as openai_chat
         _default_urls = {"deepseek": "https://api.deepseek.com", "openai": "https://api.openai.com"}
+        # llama.cpp/llama-swap: cache_prompt=true → Slot mit längstem Prefix-Match
+        # gewählt, parallele Requests teilen KV-Cache → wesentlich schneller bei
+        # parallelen Calls mit gleichem System-Prompt.
+        _extra: dict[str, Any] | None = {"cache_prompt": True} if provider_type == "openai-compat" else None
         return openai_chat(
             messages, api_key=api_key, model=api_model,
             system=system, thinking=think, tools=tools,
             options=options, base_url=base_url or _default_urls.get(provider_type, "http://127.0.0.1:8000"),
-            timeout=int(timeout),
+            timeout=int(timeout), extra_body=_extra,
         )
     if provider_type == "anthropic":
         from miniassistant.claude_client import api_chat as anthropic_chat
@@ -677,10 +695,12 @@ def _dispatch_chat_stream(
     if provider_type in ("openai", "deepseek", "openai-compat"):
         from miniassistant.openai_client import api_chat_stream as openai_stream
         _default_urls = {"deepseek": "https://api.deepseek.com", "openai": "https://api.openai.com"}
+        _extra: dict[str, Any] | None = {"cache_prompt": True} if provider_type == "openai-compat" else None
         yield from openai_stream(
             messages, api_key=api_key, model=api_model,
             system=system, thinking=think, tools=tools,
             options=options, base_url=base_url or _default_urls.get(provider_type, "http://127.0.0.1:8000"),
+            extra_body=_extra,
         )
         return
     if provider_type == "anthropic":
@@ -1600,11 +1620,14 @@ _VALID_OLLAMA_OPTIONS = frozenset({
     "num_gpu", "num_thread", "numa",
     # think ist erlaubt in model_options (wird separat behandelt, nicht in options gesendet)
     "think",
+    # slot_cache: MA-Flag pro Modell, wird in get_options_for_model rausgefiltert
+    "slot_cache",
 })
 
 # Erlaubte Top-Level-Keys pro Provider
 _VALID_PROVIDER_KEYS = frozenset({
     "type", "base_url", "api_key", "num_ctx", "think", "options", "model_options", "models",
+    "slot_cache",  # MA-Flag: cached llama.cpp KV-Slots für diesen Provider/diese Modelle
 })
 
 # Erlaubte Keys unter providers.*.models
@@ -2052,6 +2075,31 @@ def _run_tool(
             return f"[connection: {conn}]\n{content}" if conn else content
         err = result.get("error", "unknown error")
         return f"[connection: {conn}] Error reading URL: {err}" if conn else f"Error reading URL: {err}"
+    if name == "download_file":
+        url_arg = (arguments.get("url") or "").strip()
+        path_arg = (arguments.get("path") or "").strip()
+        if not url_arg or not path_arg:
+            return "download_file requires url and path"
+        from miniassistant.tools import download_file as tool_download_file
+        try:
+            _mb = int(arguments.get("max_bytes") or 50 * 1024 * 1024)
+        except (TypeError, ValueError):
+            _mb = 50 * 1024 * 1024
+        try:
+            _to = float(arguments.get("timeout") or 60.0)
+        except (TypeError, ValueError):
+            _to = 60.0
+        result = tool_download_file(
+            url_arg, path_arg,
+            referer=arguments.get("referer") or None,
+            max_bytes=_mb, timeout=_to, config=config, proxy=arguments.get("proxy"),
+        )
+        if result.get("ok"):
+            return (
+                f"saved {result['bytes']} bytes to `{result['path']}` "
+                f"(content_type: {result.get('content_type','?')}, connection: {result.get('connection','direct')})"
+            )
+        return f"download_file failed: {result.get('error','unknown')} (connection: {result.get('connection','?')})"
     if name == "send_email":
         # Guardrail: In Scheduled Tasks nur erlauben wenn der Original-Prompt
         # explizit E-Mail/Mail erwaehnt — verhindert unsolicited E-Mails
@@ -2252,19 +2300,15 @@ def _run_tool(
                 else:
                     _img_url = f"/api/workspace/raw?path={_url_quote(str(_img_p))}"
             else:
-                # API: UUID-URL (kein Token in URL, kein Chunk-Limit), base64 nur als Fallback
-                _api_base = (config.get("_chat_context") or {}).get("_api_base_url", "")
-                if _api_base:
-                    # Stabiler URL aus Dateiname — kein Token, kein Verfall
-                    _img_url = f"{_api_base}/api/img/{_img_p.stem}"
-                else:
-                    import base64 as _b64_img
-                    _suffix = _img_p.suffix.lower()
-                    _mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-                                 ".gif": "image/gif", ".webp": "image/webp"}
-                    _mime = _mime_map.get(_suffix, "image/png")
-                    _data = _b64_img.b64encode(_img_p.read_bytes()).decode("ascii")
-                    _img_url = f"data:{_mime};base64,{_data}"
+                # API (z.B. OpenWebUI): immer als data:-URL (base64 inline) — funktioniert
+                # ohne Token, ohne Netzwerkpfad-Probleme. Browser sieht das Bild direkt.
+                import base64 as _b64_img
+                _suffix = _img_p.suffix.lower()
+                _mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                             ".gif": "image/gif", ".webp": "image/webp"}
+                _mime = _mime_map.get(_suffix, "image/png")
+                _data = _b64_img.b64encode(_img_p.read_bytes()).decode("ascii")
+                _img_url = f"data:{_mime};base64,{_data}"
             # Deduplizieren: gleichen Pfad nicht zweimal senden
             # (passiert wenn Agent erst invoke_model, dann send_image für dasselbe Bild aufruft)
             _img_stem = _img_p.stem
@@ -3046,6 +3090,9 @@ def _run_subagent_anthropic(
     rounds_used = 0
     _consecutive_search_fails = 0
     _MAX_SEARCH_FAILS = 2
+    _sub_seen_tool_keys: set[str] = set()
+    _sub_dedup_enabled = bool(config.get("tool_call_dedup", True))
+    _SUB_DEDUP_TOOLS = {"web_search", "read_url", "check_url"}
     for _round in range(int(config.get("max_tool_rounds", 15))):
         try:
             r = api_chat(
@@ -3091,6 +3138,25 @@ def _run_subagent_anthropic(
                     total_content = "(Subagent abgebrochen)"
                 break
         for tc_name, tc_args in tool_calls:
+            # Dedup-Block
+            if _sub_dedup_enabled and tc_name in _SUB_DEDUP_TOOLS:
+                try:
+                    _sub_dkey = f"{tc_name}::{json.dumps(tc_args, sort_keys=True, ensure_ascii=False).lower()}"
+                except Exception:
+                    _sub_dkey = ""
+                if _sub_dkey and _sub_dkey in _sub_seen_tool_keys:
+                    _hint = tc_args.get("query") or tc_args.get("url") or ""
+                    tool_result = (
+                        f"[DEDUP-BLOCK] You already called {tc_name} with the same arguments earlier "
+                        f"({_hint!r}). Use the previous result from history. Do NOT repeat — try different "
+                        f"arguments or finalize your answer."
+                    )
+                    _log.warning("Subagent %s (anthropic): dedup-block %s (%s)", resolved_name, tc_name, _hint)
+                    _aal.log_tool_call(config, f"subagent:{tc_name}", tc_args, tool_result)
+                    msgs.append({"role": "tool", "content": str(tool_result)})
+                    continue
+                if _sub_dkey:
+                    _sub_seen_tool_keys.add(_sub_dkey)
             if tc_name not in _ALLOWED_SUB_TOOLS:
                 tool_result = f"Tool '{tc_name}' is not available for subagents."
             elif tc_name == "exec":
@@ -3180,6 +3246,9 @@ def _run_subagent_google(
     rounds_used = 0
     _consecutive_search_fails = 0
     _MAX_SEARCH_FAILS = 2
+    _sub_seen_tool_keys: set[str] = set()
+    _sub_dedup_enabled = bool(config.get("tool_call_dedup", True))
+    _SUB_DEDUP_TOOLS = {"web_search", "read_url", "check_url"}
     for _round in range(int(config.get("max_tool_rounds", 15))):
         try:
             r = google_chat(
@@ -3227,6 +3296,25 @@ def _run_subagent_google(
                     total_content = "(Subagent abgebrochen)"
                 break
         for tc_name, tc_args in tool_calls:
+            # Dedup-Block
+            if _sub_dedup_enabled and tc_name in _SUB_DEDUP_TOOLS:
+                try:
+                    _sub_dkey = f"{tc_name}::{json.dumps(tc_args, sort_keys=True, ensure_ascii=False).lower()}"
+                except Exception:
+                    _sub_dkey = ""
+                if _sub_dkey and _sub_dkey in _sub_seen_tool_keys:
+                    _hint = tc_args.get("query") or tc_args.get("url") or ""
+                    tool_result = (
+                        f"[DEDUP-BLOCK] You already called {tc_name} with the same arguments earlier "
+                        f"({_hint!r}). Use the previous result from history. Do NOT repeat — try different "
+                        f"arguments or finalize your answer."
+                    )
+                    _log.warning("Subagent %s (google): dedup-block %s (%s)", resolved_name, tc_name, _hint)
+                    _aal.log_tool_call(config, f"subagent:{tc_name}", tc_args, tool_result)
+                    msgs.append({"role": "tool", "content": str(tool_result)})
+                    continue
+                if _sub_dkey:
+                    _sub_seen_tool_keys.add(_sub_dkey)
             if tc_name not in _ALLOWED_SUB_TOOLS:
                 tool_result = f"Tool '{tc_name}' is not available for subagents."
             elif tc_name == "exec":
@@ -3288,14 +3376,12 @@ def _run_subagent_google(
             total_content += f"\n\nBild(er) gespeichert: {paths_str}"
             _img_ctx = config.get("_chat_context") or {}
             _img_platform = _img_ctx.get("platform")
-            _api_base = _img_ctx.get("_api_base_url", "")
             for _sp in saved_paths:
                 _sp_p = _Path(_sp)
                 if _img_platform == "web":
                     _img_url = f"/api/workspace/raw?path=images/{_sp_p.name}"
-                elif _api_base:
-                    _img_url = f"{_api_base}/api/img/{_sp_p.stem}"
                 else:
+                    # API + Fallback: data:-URL inline (kein Token, kein Netzwerkpfad)
                     _img_url = f"data:image/png;base64,{_b64.b64encode(_sp_p.read_bytes()).decode()}"
                 config.setdefault("_pending_images", []).append({
                     "url": _img_url,
@@ -3421,13 +3507,11 @@ def _run_subagent_openai(
                 # base64 in der Tool-Response würde den LLM-Context sprengen → 500er.
                 _img_ctx = config.get("_chat_context") or {}
                 _img_platform = _img_ctx.get("platform")
-                _api_base = _img_ctx.get("_api_base_url", "")
                 if _img_platform == "web":
                     _img_url = f"/api/workspace/raw?path=images/{fpath.name}"
-                elif _api_base:
-                    # API (OpenWebUI): stabiler URL aus Dateiname — kein Token, kein Verfall
-                    _img_url = f"{_api_base}/api/img/{fpath.stem}"
                 else:
+                    # API (OpenWebUI) + Fallback: data:-URL inline. Browser rendert direkt,
+                    # kein Token-/Netzwerkpfad-Problem. b64_data haben wir schon im Speicher.
                     _img_url = f"data:image/png;base64,{b64_data}"
                 _caption = "Bearbeitetes Bild" if _edit_src else "Generiertes Bild"
                 config.setdefault("_pending_images", []).append({
@@ -3459,6 +3543,9 @@ def _run_subagent_openai(
     _consecutive_search_fails = 0
     _MAX_SEARCH_FAILS = 2
     _rolling_cooldown = [0]  # mutable for _maybe_rolling_summary
+    _sub_seen_tool_keys: set[str] = set()
+    _sub_dedup_enabled = bool(config.get("tool_call_dedup", True))
+    _SUB_DEDUP_TOOLS = {"web_search", "read_url", "check_url"}
     for _round in range(int(config.get("max_tool_rounds", 15))):
         # Proaktiv compacten bevor Context voll ist
         msgs = _compact_subagent_msgs(config, msgs, resolved_name, system, sub_tools, _sub_num_ctx)
@@ -3546,6 +3633,25 @@ def _run_subagent_openai(
                     total_content = "(Subagent abgebrochen)"
                 break
         for tc_name, tc_args in tool_calls:
+            # Dedup-Block
+            if _sub_dedup_enabled and tc_name in _SUB_DEDUP_TOOLS:
+                try:
+                    _sub_dkey = f"{tc_name}::{json.dumps(tc_args, sort_keys=True, ensure_ascii=False).lower()}"
+                except Exception:
+                    _sub_dkey = ""
+                if _sub_dkey and _sub_dkey in _sub_seen_tool_keys:
+                    _hint = tc_args.get("query") or tc_args.get("url") or ""
+                    tool_result = (
+                        f"[DEDUP-BLOCK] You already called {tc_name} with the same arguments earlier "
+                        f"({_hint!r}). Use the previous result from history. Do NOT repeat — try different "
+                        f"arguments or finalize your answer."
+                    )
+                    _log.warning("Subagent %s (openai): dedup-block %s (%s)", resolved_name, tc_name, _hint)
+                    _aal.log_tool_call(config, f"subagent:{tc_name}", tc_args, tool_result)
+                    msgs.append({"role": "tool", "content": str(tool_result)})
+                    continue
+                if _sub_dkey:
+                    _sub_seen_tool_keys.add(_sub_dkey)
             if tc_name not in _ALLOWED_SUB_TOOLS:
                 tool_result = f"Tool '{tc_name}' is not available for subagents."
             elif tc_name == "exec":
@@ -3753,6 +3859,9 @@ def _run_subagent_with_tools(
     _consecutive_search_fails = 0
     _MAX_SEARCH_FAILS = 2
     _rolling_cooldown = [0]
+    _sub_seen_tool_keys: set[str] = set()
+    _sub_dedup_enabled = bool(config.get("tool_call_dedup", True))
+    _SUB_DEDUP_TOOLS = {"web_search", "read_url", "check_url"}
     for _round in range(max_rounds):
         # Proaktiv compacten bevor Context voll ist
         msgs = _compact_subagent_msgs(config, msgs, resolved_name, system, tools, num_ctx)
@@ -3858,6 +3967,25 @@ def _run_subagent_with_tools(
                     total_content = "(Subagent abgebrochen)"
                 break
         for tc_name, tc_args in tool_calls:
+            # Dedup-Block: identischer Tool-Call zweimal → synthetic block.
+            if _sub_dedup_enabled and tc_name in _SUB_DEDUP_TOOLS:
+                try:
+                    _sub_dkey = f"{tc_name}::{json.dumps(tc_args, sort_keys=True, ensure_ascii=False).lower()}"
+                except Exception:
+                    _sub_dkey = ""
+                if _sub_dkey and _sub_dkey in _sub_seen_tool_keys:
+                    _hint = tc_args.get("query") or tc_args.get("url") or ""
+                    tool_result = (
+                        f"[DEDUP-BLOCK] You already called {tc_name} with the same arguments earlier "
+                        f"({_hint!r}). Use the previous result from history. Do NOT repeat this call — "
+                        f"either try different arguments or finalize your answer."
+                    )
+                    _log.warning("Subagent %s: dedup-block %s (%s)", resolved_name, tc_name, _hint)
+                    _aal.log_tool_call(config, f"subagent:{tc_name}", tc_args, tool_result)
+                    msgs.append({"role": "tool", "content": str(tool_result)})
+                    continue
+                if _sub_dkey:
+                    _sub_seen_tool_keys.add(_sub_dkey)
             if tc_name not in _ALLOWED_SUB_TOOLS:
                 tool_result = f"Tool '{tc_name}' is not available for subagents."
             elif tc_name == "exec":
@@ -4318,6 +4446,16 @@ def chat_round(
     switch_info = {"model": str, "reason": str} wenn auf Fallback gewechselt wurde.
     """
     system_prompt = refresh_datetime_in_prompt(system_prompt)
+    # Slot-Cache: Restore versuchen wenn conv_id im Context gesetzt
+    _ctx = config.get("_chat_context") or {}
+    _conv_id = _ctx.get("conv_id")
+    _endpoint = _ctx.get("slot_cache_endpoint", "api")
+    if _conv_id:
+        try:
+            from miniassistant import slot_cache as _slot_cache
+            _slot_cache.restore_before_round(config, _conv_id, model, endpoint=_endpoint)
+        except Exception as _e:
+            _log.debug("slot_cache restore skipped: %s", _e)
     tools_schema = get_tools_schema(config)
     debug = (config.get("server") or {}).get("debug", False)
     models_cfg = config.get("models") or {}
@@ -4344,6 +4482,16 @@ def chat_round(
     _compact_num_ctx = get_num_ctx_for_model(config, model)
     if _needs_compacting(config, system_prompt, compacted_messages, tools_schema, _compact_num_ctx):
         compacted_messages = _compact_history(config, compacted_messages, model, system_prompt, tools_schema, _compact_num_ctx)
+
+    # Dokument-Anhaenge dynamisch ans Modell-Kontext anpassen
+    if "<doc " in (user_content or ""):
+        from miniassistant.documents import fit_documents_to_budget as _fit_docs
+        _sys_tok = _estimate_tokens(system_prompt)
+        _hist_tok = _messages_token_estimate(compacted_messages)
+        _tools_tok = _estimate_tokens(json.dumps(tools_schema, ensure_ascii=False)) if tools_schema else 0
+        _reserve = int(config.get("doc_response_reserve") or 2000)
+        _avail_tok = max(500, _compact_num_ctx - _sys_tok - _hist_tok - _tools_tok - _reserve)
+        user_content = _fit_docs(user_content, _avail_tok * 3)
 
     for try_model in models_to_try:
         # Provider-Präfix auflösen: base_url + clean model name + api_key für API
@@ -4690,6 +4838,23 @@ def chat_round(
                 # Halluzinierte base64-Bilder entfernen (fressen Kontext)
                 if "base64," in _m["content"]:
                     _m["content"] = _strip_hallucinated_base64(_m["content"])
+    # Slot-Cache: Save async (fire-and-forget) wenn conv_id im Context
+    if _conv_id and _final_content:
+        try:
+            from miniassistant import slot_cache as _slot_cache
+            _prompt_tok = (
+                _estimate_tokens(system_prompt)
+                + _messages_token_estimate(msgs_final)
+            )
+            _prompt_prefix = system_prompt[:2000]
+            _Thread(
+                target=_slot_cache.save_after_round,
+                args=(config, _conv_id, effective_model, _prompt_tok, _prompt_prefix),
+                kwargs={"endpoint": _endpoint},
+                daemon=True,
+            ).start()
+        except Exception as _e:
+            _log.debug("slot_cache save spawn skipped: %s", _e)
     return _final_content, _final_thinking, msgs_final, debug_info, switch_info
 
 
@@ -4711,6 +4876,16 @@ def chat_round_stream(
     | {"type": "done", "thinking", "content", "new_messages", "debug_info", "switch_info"}.
     """
     system_prompt = refresh_datetime_in_prompt(system_prompt)
+    # Slot-Cache: Restore versuchen wenn conv_id im Context gesetzt
+    _ctx_s = config.get("_chat_context") or {}
+    _conv_id_s = _ctx_s.get("conv_id")
+    _endpoint_s = _ctx_s.get("slot_cache_endpoint", "api")
+    if _conv_id_s:
+        try:
+            from miniassistant import slot_cache as _slot_cache
+            _slot_cache.restore_before_round(config, _conv_id_s, model, endpoint=_endpoint_s)
+        except Exception as _e:
+            _log.debug("slot_cache restore (stream) skipped: %s", _e)
     tools_schema = get_tools_schema(config)
     models_cfg = config.get("models") or {}
     per_prov_fb = [resolve_model(config, fb) or fb for fb in (models_cfg.get("fallbacks") or []) if fb]
@@ -4732,6 +4907,19 @@ def chat_round_stream(
         yield {"type": "status", "message": "Chat-Verlauf wird komprimiert…"}
         msgs = _compact_history(config, msgs, model, system_prompt, tools_schema, _compact_num_ctx)
         yield {"type": "status", "message": "Verlauf komprimiert."}
+    # Dokument-Anhaenge dynamisch ans Modell-Kontext anpassen (NACH Compacting, damit freier Platz mitzaehlt)
+    if "<doc " in (user_content or ""):
+        from miniassistant.documents import fit_documents_to_budget as _fit_docs
+        _sys_tok = _estimate_tokens(system_prompt)
+        _hist_tok = _messages_token_estimate(msgs)
+        _tools_tok = _estimate_tokens(json.dumps(tools_schema, ensure_ascii=False)) if tools_schema else 0
+        _reserve = int(config.get("doc_response_reserve") or 2000)
+        _avail_tok = max(500, _compact_num_ctx - _sys_tok - _hist_tok - _tools_tok - _reserve)
+        _avail_chars = _avail_tok * 3  # ~3 chars/token (siehe _estimate_tokens)
+        _before = len(user_content)
+        user_content = _fit_docs(user_content, _avail_chars)
+        if len(user_content) < _before:
+            yield {"type": "status", "message": f"Dokument an Modell-Kontext angepasst ({_before}→{len(user_content)} Zeichen)."}
     # Vision: Bilder via VL-Modell beschreiben falls Hauptmodell keine Vision hat
     if images:
         vision_model = _resolve_vision_model(config, model)
@@ -4763,6 +4951,9 @@ def chat_round_stream(
     _loop_recovery_attempts = 0   # how many times the doom-loop guard fired this conversation
     _loop_recovery_max = int(config.get("stream_loop_recovery_max") or 2)
     _announce_nudge_fired = False  # rate-limit announce-without-doing nudge to 1x per request
+    _seen_tool_keys: dict[str, str] = {}  # dedup: tool-key → short result preview
+    _dedup_enabled = bool(config.get("tool_call_dedup", True))
+    _DEDUP_TOOLS = {"web_search", "read_url", "check_url"}
 
     while rounds < max_tool_rounds:
         # Per-round smart compaction: after round 0, check if tool results grew context past budget.
@@ -4841,6 +5032,8 @@ def chat_round_stream(
                     _has_any_content = False
                     _thinking_timeout = float(config.get("stream_thinking_timeout") or 300)
                     _thinking_hard_timeout = float(config.get("stream_thinking_hard_timeout") or 240)
+                    _thinking_token_budget = int(config.get("stream_thinking_token_budget") or 3000)
+                    _thinking_tokens_since_progress = 0
                     _stall_warned = False
                     _loop_detector = _LoopDetector(
                         max_consecutive=int(config.get("stream_loop_max_consecutive") or 4),
@@ -4877,6 +5070,7 @@ def chat_round_stream(
                         if msg.get("thinking"):
                             if not _thinking_start:
                                 _thinking_start = time.monotonic()
+                            _thinking_tokens_since_progress += _estimate_tokens(msg["thinking"])
                             round_thinking += msg["thinking"]
                             # Tool-Call-XML aus Thinking-Display entfernen (Modell schreibt manchmal
                             # <tool_call>-Blöcke in seinen Denkprozess; im History-Content belassen,
@@ -4894,6 +5088,12 @@ def chat_round_stream(
                                 _log.warning("Doom-loop detected in thinking: %s", _loop_reason)
                                 yield {"type": "status", "message": f"⚠️ Doom-Loop erkannt im Thinking: {_loop_reason} — breche ab"}
                                 break
+                            if _thinking_token_budget > 0 and _thinking_tokens_since_progress > _thinking_token_budget:
+                                _loop_detected = True
+                                _loop_reason = f"Thinking-Token-Budget überschritten ({_thinking_tokens_since_progress} > {_thinking_token_budget} Tokens ohne Content/Tool)"
+                                _log.warning("Thinking token budget exceeded: %d tokens (limit: %d)", _thinking_tokens_since_progress, _thinking_token_budget)
+                                yield {"type": "status", "message": f"⚠️ Modell hat {_thinking_tokens_since_progress} Thinking-Tokens ohne Fortschritt produziert — breche ab"}
+                                break
                             if _thinking_start and not _has_any_content and (time.monotonic() - _thinking_start) > _thinking_hard_timeout:
                                 _loop_detected = True
                                 _loop_reason = f"Thinking-Wall-Clock {int(_thinking_hard_timeout)}s ohne Content"
@@ -4903,6 +5103,7 @@ def chat_round_stream(
                         if msg.get("content"):
                             _has_any_content = True
                             _thinking_start = 0.0
+                            _thinking_tokens_since_progress = 0
                             _raw_stream_content += msg["content"]
                             _stream_log.content_delta(msg["content"])
                             if _loop_detector.feed(msg["content"]):
@@ -4957,6 +5158,7 @@ def chat_round_stream(
                         # in Zwischen-Chunks, der Done-Chunk hat sie oft NICHT mehr.
                         for tc in msg.get("tool_calls") or []:
                             round_tool_calls_raw.append(tc)
+                            _thinking_tokens_since_progress = 0
                         if chunk.get("done"):
                             last_response = chunk
                             if chunk.get("prompt_eval_count"):
@@ -5032,11 +5234,12 @@ def chat_round_stream(
             # Verwirf korrupte Round-Daten — KEIN total_thinking += round_thinking
             yield {"type": "status", "message": f"🔄 Recovery-Versuch {_loop_recovery_attempts}/{_loop_recovery_max} — sende Korrektur-Nudge"}
             msgs.append({"role": "user", "content": (
-                f"SYSTEM: Du warst in einer Endlos-Schleife ({_loop_reason}). Dein vorheriger "
-                "Output wurde abgebrochen und verworfen. Versuche es JETZT nochmal — wenn du "
-                "ein Tool brauchst, emittiere den Tool-Call SOFORT (kein langes Thinking, "
-                "keine Wiederholung). Wenn kein Tool nötig ist, antworte direkt und kurz mit "
-                "dem Endergebnis. Halte Thinking minimal."
+                f"SYSTEM: You were stuck in a loop ({_loop_reason}). Your previous "
+                "output was aborted and discarded. Try again NOW — if you need a tool, "
+                "emit the tool call IMMEDIATELY (no long thinking, no repetition). "
+                "If no tool is needed, answer directly and briefly with the final result. "
+                "Keep thinking minimal. Use what you already know — do not re-search "
+                "the same query you already ran."
             )})
             rounds += 1
             continue
@@ -5242,6 +5445,18 @@ def chat_round_stream(
             _done_tps = _aal.extract_tps(last_response, time.monotonic() - _t0_stream, _done_content, _done_thinking)
             _stream_log.finish(_done_tps)
             _ctx_used = _last_real_ctx or (_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs))
+            # Slot-Cache: Save async (fire-and-forget) wenn conv_id im Context
+            if _conv_id_s and _done_content:
+                try:
+                    from miniassistant import slot_cache as _slot_cache
+                    _Thread(
+                        target=_slot_cache.save_after_round,
+                        args=(config, _conv_id_s, model, _ctx_used, (system_effective or system_prompt)[:2000]),
+                        kwargs={"endpoint": _endpoint_s},
+                        daemon=True,
+                    ).start()
+                except Exception as _e:
+                    _log.debug("slot_cache save (stream) spawn skipped: %s", _e)
             yield {"type": "done", "thinking": _done_thinking, "content": _done_content, "images": _pending_imgs, "audio": _pending_auds, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info, "tps": _done_tps, "ctx": [_ctx_used, _ctx_max]}
             return
 
@@ -5329,29 +5544,83 @@ def chat_round_stream(
             _aal.log_tool_call(config, _ct_name, _ct_args, _ct_result)
             msgs.append({"role": "tool", "tool_name": _ct_name, "content": _ct_result})
 
+        # Tool-Call-Dedup: identische (name, args) zweimal in einer Conversation → block.
+        # Verhindert Cross-Round-Loops (z.B. gleicher web_search 50× hintereinander).
+        # Synthetisches Tool-Result statt echter Execution, plus Nudge ans Modell.
+        _dedup_synthetic: list[tuple[str, dict, str]] = []
+        if _dedup_enabled and _server_calls:
+            _fresh_calls: list[tuple[str, dict]] = []
+            for _dn, _da in _server_calls:
+                if _dn not in _DEDUP_TOOLS:
+                    _fresh_calls.append((_dn, _da))
+                    continue
+                try:
+                    _dkey = f"{_dn}::{json.dumps(_da, sort_keys=True, ensure_ascii=False).lower()}"
+                except Exception:
+                    _fresh_calls.append((_dn, _da))
+                    continue
+                if _dkey in _seen_tool_keys:
+                    _log.warning("Tool-Call-Dedup: %s mit identischen Args bereits ausgeführt — blockiere", _dn)
+                    _hint = _da.get("query") or _da.get("url") or ""
+                    _block_msg = (
+                        f"[DEDUP-BLOCK] You already called {_dn} with the same arguments earlier "
+                        f"in this conversation ({_hint!r}). The result is in the message history above. "
+                        f"DO NOT repeat the same call — use the prior result, or try a DIFFERENT query/URL, "
+                        f"or answer the user with what you already know."
+                    )
+                    _dedup_synthetic.append((_dn, _da, _block_msg))
+                    yield {"type": "status", "message": f"⛔ {_dn} dedup-blockiert (identischer Aufruf bereits erfolgt)"}
+                else:
+                    _fresh_calls.append((_dn, _da))
+                    _seen_tool_keys[_dkey] = ""  # mark as seen; result preview filled after execution
+            _server_calls = _fresh_calls
+
+        # Synthetic dedup-results in History anhängen (vor echter Tool-Execution)
+        for _sn, _sa, _sr in _dedup_synthetic:
+            msgs.append({"role": "tool", "tool_name": _sn, "content": _sr})
+
         if _server_calls:
             _stream_log._maybe_flush(force=True)
             # Status-Callback einrichten: wait-Tool kann Fortschrittsmeldungen einstellen
             _tool_status_q: Queue = Queue()
             config["_tool_status_callback"] = _tool_status_q.put_nowait
-            # Tool-Execution mit Keepalive (wait, Playwright etc. können Minuten dauern)
-            _tool_max_timeout = float(config.get("tool_execution_timeout") or 900)
+            # Tool-Execution mit Keepalive (wait, Playwright etc. können Minuten dauern).
+            # Subagent (invoke_model) bekommt eigenen, höheren Timeout — Deep-Research-Chains
+            # (web_search × N + read_url × M) brauchen leicht 30+ min.
+            _has_subagent = any(_n == "invoke_model" for _n, _ in _server_calls)
+            if _has_subagent:
+                _tool_max_timeout = float(config.get("subagent_execution_timeout") or 2700)
+            else:
+                _tool_max_timeout = float(config.get("tool_execution_timeout") or 2700)
             tool_results = None
-            for _item in _call_with_keepalive(
-                lambda: _run_tools_maybe_concurrent(_server_calls, config, project_dir),
-                max_timeout=_tool_max_timeout,
-            ):
-                if _item is None:
-                    # Neueste Status-Message vom wait-Tool abholen (falls vorhanden)
-                    _smsg = None
-                    try:
-                        while True:
-                            _smsg = _tool_status_q.get_nowait()
-                    except _QueueEmpty:
-                        pass
-                    yield {"type": "status", "message": _smsg if _smsg else "⏳ Tool wird ausgeführt…"}
-                else:
-                    tool_results = _item
+            _timed_out = False
+            try:
+                for _item in _call_with_keepalive(
+                    lambda: _run_tools_maybe_concurrent(_server_calls, config, project_dir),
+                    max_timeout=_tool_max_timeout,
+                ):
+                    if _item is None:
+                        # Neueste Status-Message vom wait-Tool abholen (falls vorhanden)
+                        _smsg = None
+                        try:
+                            while True:
+                                _smsg = _tool_status_q.get_nowait()
+                        except _QueueEmpty:
+                            pass
+                        yield {"type": "status", "message": _smsg if _smsg else "⏳ Tool wird ausgeführt…"}
+                    else:
+                        tool_results = _item
+            except TimeoutError as _te:
+                _timed_out = True
+                _log.warning("Tool-Batch Timeout nach %.0fs (%d Tool(s) abgebrochen): %s",
+                             _tool_max_timeout, len(_server_calls), _te)
+                yield {"type": "status", "message": f"⏱ Tool-Timeout nach {int(_tool_max_timeout)}s — bisherige Ergebnisse werden zurückgeliefert."}
+                # Partial-Result Marker als synthetisches Tool-Ergebnis: jeder Tool-Call kriegt einen Timeout-Hinweis,
+                # damit das Modell weiss WAS gelaufen ist und nicht denkt es muesste neu starten.
+                tool_results = [
+                    (_n, _a, f"[Tool-Timeout nach {int(_tool_max_timeout)}s — keine Ergebnisse von diesem Aufruf. Frühere Tool-Ergebnisse aus dieser Session bleiben in der History.]")
+                    for _n, _a in _server_calls
+                ]
             config.pop("_tool_status_callback", None)
             for name, args, result in (tool_results or []):
                 msgs.append({"role": "tool", "tool_name": name, "content": result})
@@ -5361,6 +5630,14 @@ def chat_round_stream(
                     _img_platform = (config.get("_chat_context") or {}).get("platform")
                     if _img_platform not in ("web", "api"):
                         _sent_image = True
+            # Bei Timeout: Modell explizit nudgen, mit dem zu arbeiten was da ist und KEIN neuer Subagent
+            if _timed_out:
+                msgs.append({"role": "user", "content": (
+                    "SYSTEM: Vorheriger Tool-Aufruf hat Timeout erreicht. Starte KEINE neue Recherche, "
+                    "KEINEN neuen invoke_model. Nutze die bereits in der History stehenden Tool-Ergebnisse "
+                    "aus früheren Runden und liefere dem User eine ehrliche Zwischenzusammenfassung: "
+                    "was wurde gefunden, was fehlt noch, was kann der User tun (z.B. 'mach weiter' / 'fokussiere auf X')."
+                )})
         rounds += 1
 
     # Max-Rounds-Exhaustion: Agent wollte noch weiterarbeiten aber hat keine Runden mehr
@@ -5609,6 +5886,14 @@ def handle_user_input(
     if raw.lower() in ("/new", "/neu") and not allow_new_session:
         return "", session, None, None, None, None
     if raw.lower() in ("/new", "/neu"):
+        # Slot-Cache invalidieren BEVOR neue Session erstellt wird
+        try:
+            _old_conv = (session.get("config") or {}).get("_chat_context", {}).get("conv_id")
+            if _old_conv:
+                from miniassistant import slot_cache as _slot_cache
+                _slot_cache.invalidate(session.get("config") or config, _old_conv)
+        except Exception as _e:
+            _log.debug("slot_cache invalidate on /new skipped: %s", _e)
         # Preserve chat_context (with user_id) when creating new session
         if session.get("chat_context"):
             config["_chat_context"] = session["chat_context"]
@@ -5726,11 +6011,15 @@ def handle_user_input(
         images=images,
     )
     # Bilder aus Messages entfernen (base64-Daten verschwenden Kontext-Platz)
+    from miniassistant.documents import strip_document_blocks as _strip_docs
     for _msg in new_messages:
         if _msg.get("images"):
             del _msg["images"]
             if _msg.get("role") == "user" and "[Bild]" not in (_msg.get("content") or ""):
                 _msg["content"] = "[Bild angehängt] " + (_msg.get("content") or "")
+        # Dokument-Anhaenge im History-Save durch Marker ersetzen (sparen Kontext)
+        if _msg.get("role") == "user" and "<doc " in (_msg.get("content") or ""):
+            _msg["content"] = _strip_docs(_msg["content"])
     session["messages"] = new_messages
 
     # Memory + mempalace: Web/API nur mit explizitem Speichern (_track_chat), sonst nichts persistieren

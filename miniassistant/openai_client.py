@@ -338,6 +338,7 @@ def api_chat(
     options: dict[str, Any] | None = None,
     base_url: str = OPENAI_API_URL,
     timeout: int = _TIMEOUT,
+    extra_body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     OpenAI Chat Completions API – POST /v1/chat/completions.
@@ -415,6 +416,10 @@ def api_chat(
         body["tools"] = openai_tools
         body["parallel_tool_calls"] = True  # llama.cpp/llama-swap benötigt dies explizit für mehrere Tool-Calls
 
+    if extra_body:
+        for _k, _v in extra_body.items():
+            body.setdefault(_k, _v)
+
     headers = _api_headers(api_key)
     _log.debug("OpenAI API: model=%s, msgs=%d, thinking=%s", model, len(api_msgs), thinking)
 
@@ -462,6 +467,7 @@ def api_chat_stream(
     options: dict[str, Any] | None = None,
     base_url: str = OPENAI_API_URL,
     timeout: int = _TIMEOUT,
+    extra_body: dict[str, Any] | None = None,
 ) -> Generator[dict[str, Any], None, None]:
     """
     OpenAI Chat Completions API mit Streaming (SSE).
@@ -514,6 +520,10 @@ def api_chat_stream(
     if openai_tools:
         body["tools"] = openai_tools
         body["parallel_tool_calls"] = True  # llama.cpp/llama-swap benötigt dies explizit für mehrere Tool-Calls
+
+    if extra_body:
+        for _k, _v in extra_body.items():
+            body.setdefault(_k, _v)
 
     headers = _api_headers(api_key)
 
