@@ -553,7 +553,7 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
         console.print(f"Scheduler: [red]Fehler[/red] ({e})")
     # Chat-Clients Status anzeigen
     cc = config.get("chat_clients") or {}
-    mc = cc.get("matrix") or config.get("matrix")
+    mc = cc.get("matrix")
     dc = cc.get("discord")
     if mc and mc.get("enabled", True) and mc.get("token") and mc.get("user_id"):
         console.print("Matrix-Bot: [green]aktiv[/green]")
@@ -582,7 +582,18 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
                 return False
             return True
     logging.getLogger("uvicorn.access").addFilter(_LogPollFilter())
-    uvicorn.run(app, host=h, port=p, log_level="info")
+    # proxy_headers default = True macht Uvicorn XFF/X-Real-IP vertrauen (default forwarded_allow_ips="127.0.0.1").
+    # Damit kann jeder Localhost-Client request.client.host spoofen → Rate-Limit-Bypass.
+    # Nur aktivieren wenn server.trust_forwarded explizit gesetzt ist.
+    try:
+        _trust_fwd = bool((config.get("server") or {}).get("trust_forwarded"))
+    except Exception:
+        _trust_fwd = False
+    uvicorn.run(
+        app, host=h, port=p, log_level="info",
+        proxy_headers=_trust_fwd,
+        forwarded_allow_ips=("*" if _trust_fwd else None),
+    )
 
 
 @main.command("token", help="Token anzeigen oder neu generieren")

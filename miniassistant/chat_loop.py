@@ -99,6 +99,29 @@ def _sanitize_tool_output(text: str, tool_name: str = "") -> str:
     return sanitized
 
 
+from collections import OrderedDict
+
+
+class SessionLRU(OrderedDict):
+    """OrderedDict with max-size cap + LRU eviction. Use for bot session caches that
+    would otherwise grow unbounded across reconnects."""
+
+    def __init__(self, max_size: int = 200) -> None:
+        super().__init__()
+        self._max = max_size
+
+    def __setitem__(self, key, value) -> None:
+        super().__setitem__(key, value)
+        super().move_to_end(key)
+        while len(self) > self._max:
+            self.popitem(last=False)
+
+    def __getitem__(self, key):
+        v = super().__getitem__(key)
+        super().move_to_end(key)
+        return v
+
+
 def _save_uploaded_images(config: dict[str, Any], images: list[dict[str, Any]]) -> list[str]:
     """Speichert hochgeladene Bilder (base64) auf Disk im Workspace/images/uploads/.
     Gibt Liste der gespeicherten Pfade zurück. Wird benötigt damit das LLM
@@ -1453,6 +1476,9 @@ def _format_help() -> str:
         "| `/new` · `/neu` · `:new` · `:neu` | Neue Session / Verlauf löschen |\n"
         "| `/schedules` · `:schedules` | Geplante Jobs anzeigen |\n"
         "| `/schedule remove ID` · `:schedule remove ID` | Job löschen |\n"
+        "| `/schedule <text>` · `:schedule <text>` | Folgefrage zum letzten Schedule des Raums |\n"
+        "| `/webhook <text>` · `:webhook <text>` | Folgefrage zum letzten nicht-stillen Webhook des Raums |\n"
+        "| `/dazu <text>` · `:dazu <text>` · `/last <text>` | Folgefrage — picks automatisch jüngste Schedule oder Webhook |\n"
         "| `/auth CODE` · `:auth CODE` | Web-UI freischalten |\n"
         "| `/help` · `/hilfe` · `:help` | Diese Hilfe |\n"
         "\n*Tipp: Auf Matrix-Mobile `:` statt `/` verwenden.*"
@@ -2483,6 +2509,97 @@ def _run_tool(
             sched_client = "none"
         ok, msg = add_scheduled_job(when, command=cmd, prompt=prompt, client=sched_client, once=bool(once), model=sched_model, room_id=sched_room_id, channel_id=sched_channel_id)
         return f"Scheduled: {msg}" if ok else f"Schedule failed: {msg}"
+    if name == "webhook":
+        from miniassistant import webhooks as _wh
+        if not _wh.is_enabled():
+            return "webhooks disabled — set webhooks.enabled: true in config"
+        action = (arguments.get("action") or "create").lower()
+        if action == "list":
+            items = _wh.list_webhooks()
+            if not items:
+                return "No webhooks."
+            lines = []
+            for w in items:
+                wid = (w.get("id") or "")[:8]
+                handle = w.get("name") or wid
+                cli = w.get("client") or "default"
+                last = w.get("last_fired") or "never"
+                err = " ERROR" if w.get("last_error") else ""
+                silent = " silent" if w.get("silent") else ""
+                lines.append(f"- {handle} ({wid}) | client={cli} | last={last}{silent}{err}")
+            return "\n".join(lines)
+        if action == "info":
+            ident = (arguments.get("id") or "").strip()
+            if not ident:
+                return "webhook(action='info') requires 'id' (id-prefix or name)"
+            item = _wh.find_by_id(ident) or next((w for w in _wh.list_webhooks() if w.get("name") == ident), None)
+            if not item:
+                return "not found"
+            outs = _wh.list_outputs(item)
+            lines = [
+                f"id: {item.get('id','')[:8]}",
+                f"name: {item.get('name') or '(none)'}",
+                f"prompt: {(item.get('prompt') or '')[:120]}",
+                f"client: {item.get('client') or 'default'}",
+                f"silent: {item.get('silent', False)}",
+                f"last_fired: {item.get('last_fired') or 'never'}",
+                f"last_error: {item.get('last_error') or 'none'}",
+                f"outputs: {len(outs)} files",
+            ]
+            for o in outs[:5]:
+                lines.append(f"  - {o['name']} ({o['bytes']} bytes)")
+            return "\n".join(lines)
+        if action == "last_output":
+            ident = (arguments.get("id") or "").strip()
+            if not ident:
+                return "webhook(action='last_output') requires 'id'"
+            item = _wh.find_by_id(ident) or next((w for w in _wh.list_webhooks() if w.get("name") == ident), None)
+            if not item:
+                return "not found"
+            res = _wh.read_output(item)
+            if not res:
+                return "no outputs"
+            path, content = res
+            try:
+                txt = content.decode("utf-8", errors="replace")
+            except Exception:
+                txt = f"<binary {len(content)} bytes>"
+            if len(txt) > 2000:
+                txt = txt[:2000] + "\n…[truncated]"
+            return f"{path.name}:\n{txt}"
+        if action == "remove":
+            ident = (arguments.get("id") or "").strip()
+            if not ident:
+                return "webhook(action='remove') requires 'id'"
+            ok, msg = _wh.remove_webhook(ident)
+            return f"Removed: {msg}" if ok else f"Remove failed: {msg}"
+        # create — prompt is optional (open webhook = caller supplies prompt per POST)
+        wh_prompt = (arguments.get("prompt") or "").strip()
+        wh_name = (arguments.get("name") or "").strip()
+        wh_client = arguments.get("client")
+        wh_model = (arguments.get("model") or "").strip() or None
+        wh_silent = bool(arguments.get("silent", False))
+        wh_save = bool(arguments.get("save_output", True))
+        # inherit room/channel from chat context (same logic as schedule)
+        chat_ctx = config.get("_chat_context") or {}
+        plat = chat_ctx.get("platform")
+        if plat == "matrix" and chat_ctx.get("room_id"):
+            wh_room = chat_ctx["room_id"]
+            wh_channel = None
+            wh_client = wh_client or "matrix"
+        elif plat == "discord" and chat_ctx.get("channel_id"):
+            wh_room = None
+            wh_channel = chat_ctx["channel_id"]
+            wh_client = wh_client or "discord"
+        else:
+            wh_room = None
+            wh_channel = None
+            wh_client = wh_client or "none"
+        ok, res = _wh.add_webhook(name=wh_name, prompt=wh_prompt, client=wh_client, room_id=wh_room, channel_id=wh_channel, model=wh_model, silent=wh_silent, save_output=wh_save)
+        if not ok:
+            return f"Create failed: {res}"
+        item = res  # type: ignore
+        return f"Created webhook id={item['id'][:8]} name={item.get('name') or '-'}\nToken: {item['token']}\nPOST URL: /webhook/{item['token']}"
     if name == "debate":
         topic = arguments.get("topic", "").strip()
         perspective_a = arguments.get("perspective_a", "").strip()
@@ -5935,12 +6052,157 @@ def handle_user_input(
             return f"Job `{msg}` entfernt.", session, None, None, None, None
         return f"Fehler: {msg}", session, None, None, None, None
 
+    # /dazu <text> · /last <text> — auto-pick the more recent of (last schedule, last non-silent webhook)
+    # in this room, then route to the corresponding /schedule or /webhook context handler below.
+    _dazu_prefixes = ("/dazu ", "/last ")
+    if any(raw.lower().startswith(p) for p in _dazu_prefixes):
+        _ctx_tmp = session.get("chat_context") or config.get("_chat_context") or {}
+        _rid = _ctx_tmp.get("room_id")
+        _cid = _ctx_tmp.get("channel_id")
+        _sched_ts = ""
+        _wh_ts = ""
+        try:
+            if list_scheduled_jobs:
+                _jobs = list_scheduled_jobs()
+                _cands = [j for j in _jobs if (_rid and j.get("room_id") == _rid) or (_cid and j.get("channel_id") == _cid)]
+                if not _cands and not (_rid or _cid):
+                    _cands = _jobs[:]
+                if _cands:
+                    _cands.sort(key=lambda j: j.get("last_fired") or j.get("added_at") or "", reverse=True)
+                    _sched_ts = _cands[0].get("last_fired") or _cands[0].get("added_at") or ""
+        except Exception:
+            pass
+        try:
+            from miniassistant import webhooks as _wh_mod
+            _items = _wh_mod.list_webhooks()
+            _cands = [w for w in _items
+                      if not w.get("silent")
+                      and ((_rid and w.get("room_id") == _rid) or (_cid and w.get("channel_id") == _cid))]
+            if not _cands and not (_rid or _cid):
+                _cands = [w for w in _items if not w.get("silent")]
+            if _cands:
+                _cands.sort(key=lambda w: (w.get("last_fired") or w.get("created_at") or ""), reverse=True)
+                _wh_ts = _cands[0].get("last_fired") or _cands[0].get("created_at") or ""
+        except Exception:
+            pass
+        if not _sched_ts and not _wh_ts:
+            return "Kein Schedule oder nicht-stiller Webhook für diesen Raum gefunden.", session, None, None, None, None
+        for _p in _dazu_prefixes:
+            if raw.lower().startswith(_p):
+                _follow = raw[len(_p):].strip()
+                break
+        if not _follow:
+            return "Nutzung: `/dazu <Frage>` — picks automatisch jüngste Schedule oder Webhook.", session, None, None, None, None
+        # Compare timestamps directly. Tie is practically impossible (ISO + µs from independent events).
+        # Note: schedule has only added_at (no last_fired tracked), webhook has last_fired — asymmetric
+        # but matches user intent ("the most recent thing in this room").
+        _route = "/webhook " if (_wh_ts > _sched_ts) else "/schedule "
+        raw = _route + _follow
+        user_input = raw
+
+    # /schedule <text> and /webhook <text> — drop last schedule/webhook context for follow-up
+    _sched_prefixes = ("/schedule ", "/aufgabe ", "/job ")
+    _wh_prefixes = ("/webhook ", "/webhooks ")
+    _is_sched_ctx = any(raw.lower().startswith(p) for p in _sched_prefixes) and not raw.lower().startswith(("/schedule remove ", "/schedules"))
+    _is_wh_ctx = any(raw.lower().startswith(p) for p in _wh_prefixes) and not raw.lower().startswith("/webhooks")
+    if _is_sched_ctx or _is_wh_ctx:
+        chat_ctx = session.get("chat_context") or config.get("_chat_context") or {}
+        room_id = chat_ctx.get("room_id")
+        channel_id = chat_ctx.get("channel_id")
+        # Strip prefix to get user's follow-up text
+        if _is_sched_ctx:
+            for p in _sched_prefixes:
+                if raw.lower().startswith(p):
+                    follow = raw[len(p):].strip()
+                    break
+        else:
+            for p in _wh_prefixes:
+                if raw.lower().startswith(p):
+                    follow = raw[len(p):].strip()
+                    break
+        if not follow:
+            cmd = "schedule" if _is_sched_ctx else "webhook"
+            return f"Nutzung: `/{cmd} <Frage oder Anweisung>` — lädt letzten {cmd} dieses Raums als Kontext.", session, None, None, None, None
+        # Find most recent matching item per room
+        ctx_block = ""
+        if _is_sched_ctx:
+            try:
+                if list_scheduled_jobs:
+                    jobs = list_scheduled_jobs()
+                    candidates = [j for j in jobs if (room_id and j.get("room_id") == room_id) or (channel_id and j.get("channel_id") == channel_id)]
+                    if not candidates and not (room_id or channel_id):
+                        candidates = jobs[:]
+                    if not candidates:
+                        return "Kein Schedule für diesen Raum gefunden.", session, None, None, None, None
+                    candidates.sort(key=lambda j: j.get("last_fired") or j.get("added_at") or "", reverse=True)
+                    j = candidates[0]
+                    a = j.get("trigger_args") or {}
+                    when_str = f'{a.get("minute","*")} {a.get("hour","*")} {a.get("day","*")} {a.get("month","*")} {a.get("day_of_week","*")}' if j.get("trigger") == "cron" else (a.get("run_date", "?") or "")[:16]
+                    ctx_block = (
+                        f"[CONTEXT — last schedule in this room]\n"
+                        f"id: {j.get('id','')[:8]}\n"
+                        f"when: {when_str}\n"
+                        f"prompt: {j.get('prompt') or '(no prompt)'}\n"
+                        f"model: {j.get('model') or 'default'}\n"
+                        f"once: {j.get('once', False)}\n"
+                        f"last_fired: {j.get('last_fired') or 'never'}\n\n"
+                        f"User question/instruction follows. Use the schedule tool to modify if needed.\n\n"
+                    )
+            except Exception as e:
+                _log.warning("/schedule context failed: %s", e)
+                return f"Fehler beim Laden des Schedules: {e}", session, None, None, None, None
+        else:
+            try:
+                from miniassistant import webhooks as _wh
+                items = _wh.list_webhooks()
+                candidates = [w for w in items
+                              if not w.get("silent")
+                              and ((room_id and w.get("room_id") == room_id) or (channel_id and w.get("channel_id") == channel_id))]
+                if not candidates and not (room_id or channel_id):
+                    candidates = [w for w in items if not w.get("silent")]
+                if not candidates:
+                    return ("Kein nicht-stiller Webhook für diesen Raum vorhanden. "
+                            "Stille Outputs unter `workspace/webhooks/<name>/` oder via GET `/webhook/<token>/last`."), session, None, None, None, None
+                candidates.sort(key=lambda w: (w.get("last_fired") or w.get("created_at") or ""), reverse=True)
+                w = candidates[0]
+                last_out = ""
+                try:
+                    res = _wh.read_output(w)
+                    if res:
+                        _, content = res
+                        try:
+                            last_out = content.decode("utf-8", errors="replace")
+                        except Exception:
+                            last_out = "<binary>"
+                        if len(last_out) > 2000:
+                            last_out = last_out[:2000] + "\n…[truncated]"
+                except Exception:
+                    pass
+                ctx_block = (
+                    f"[CONTEXT — last non-silent webhook in this room]\n"
+                    f"id: {w.get('id','')[:8]}\n"
+                    f"name: {w.get('name') or '-'}\n"
+                    f"prompt: {w.get('prompt') or '(no prompt)'}\n"
+                    f"last_fired: {w.get('last_fired') or 'never'}\n"
+                    f"last_output:\n{last_out or '(no output)'}\n\n"
+                    f"User question/instruction follows. Use the webhook tool to inspect/modify if needed.\n\n"
+                )
+            except Exception as e:
+                _log.warning("/webhook context failed: %s", e)
+                return f"Fehler beim Laden des Webhooks: {e}", session, None, None, None, None
+        # Inject context: rewrite user_input/rest so chat continues naturally
+        user_input = ctx_block + follow
+        rest = user_input
+        raw = user_input
+
     if raw.startswith("/auth ") and len(raw) > 6:
         auth_rest = raw[6:].strip()
         try:
             from miniassistant.chat_auth import consume_code
             config_dir = (config.get("_config_dir") or "").strip() or None
-            result = consume_code(auth_rest, config_dir)
+            # Rate-Limit pro Web-Session, damit Brute-Force eines Users andere nicht aussperrt.
+            _rk = ((config.get("_chat_context") or {}).get("user_id") or "web")
+            result = consume_code(auth_rest, config_dir=config_dir, rate_key=_rk)
             if result:
                 platform, user_id = result
                 return f"{platform.capitalize()} freigeschaltet fuer `{user_id}`.", session, None, None, None, None

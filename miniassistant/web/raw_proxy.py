@@ -315,14 +315,17 @@ async def completions(request: Request):
     
     body = await request.json()
     model = body.get("model", "")
-    
+
     if not model:
         raise HTTPException(status_code=400, detail="model parameter required")
-    
+
+    if not _is_model_allowed(raw_cfg, model):
+        raise HTTPException(status_code=403, detail=f"Model not allowed via raw proxy: {model}")
+
     prov_name, prov_cfg = _get_provider_for_model(config, model)
     if not prov_cfg:
         raise HTTPException(status_code=400, detail=f"No provider found for model: {model}")
-    
+
     base_url, api_key = _get_provider_url_and_key(prov_cfg)
     _b = base_url.rstrip("/")
     url = f"{_b}/completions" if _b.endswith("/v1") else f"{_b}/v1/completions"

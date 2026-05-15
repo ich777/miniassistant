@@ -318,7 +318,7 @@ async def run_matrix_bot(config: dict[str, Any]) -> None:
             detail,
         )
         return
-    matrix_cfg = (config.get("chat_clients") or {}).get("matrix") or config.get("matrix")
+    matrix_cfg = (config.get("chat_clients") or {}).get("matrix")
     if not matrix_cfg or not matrix_cfg.get("homeserver") or not matrix_cfg.get("token"):
         return
     if not matrix_cfg.get("enabled", True):
@@ -385,8 +385,9 @@ async def run_matrix_bot(config: dict[str, Any]) -> None:
             ENCRYPTION_ENABLED, store_path or "(leer)",
         )
 
-    # Sessions pro Matrix-User (für Chat-Verlauf)
-    matrix_sessions: dict[str, Any] = {}
+    # Sessions pro (room, matrix_user) — LRU mit Cap, sonst wachsen sie unbegrenzt
+    from miniassistant.chat_loop import SessionLRU
+    matrix_sessions: Any = SessionLRU(max_size=200)
     # Pending Images: User hat Bild ohne Text geschickt → nächste Textnachricht bekommt das Bild
     _pending_images: dict[str, list[dict[str, Any]]] = {}
     # Pending Documents: PDF/DOCX/Text-Anhang ohne Text → naechste Textnachricht bekommt das Dokument
@@ -909,7 +910,7 @@ async def run_matrix_bot(config: dict[str, Any]) -> None:
         config_dir = config.get("_config_dir")
         if not is_authorized("matrix", sender, config_dir):
             code = get_or_generate_code("matrix", sender, config_dir)
-            logger.info("Matrix: Auth-Code an %s gesendet: %s", sender, code)
+            logger.info("Matrix: Auth-Code an %s gesendet (Code redacted)", sender)
             reply = (
                 f"Du bist noch nicht freigeschaltet. Dein Auth-Code: **{code}**\n\n"
                 f"Gib in der Web-UI ein: `/auth matrix {code}`"
@@ -1005,7 +1006,7 @@ async def run_matrix_bot(config: dict[str, Any]) -> None:
             )
         else:
             code = get_or_generate_code("matrix", sender, config.get("_config_dir"))
-            logger.info("Matrix: Auth-Code an %s gesendet: %s", sender, code)
+            logger.info("Matrix: Auth-Code an %s gesendet (Code redacted)", sender)
             reply = (
                 "Bei dieser Nachricht fehlte mir der Raumschlüssel – ich konnte sie nicht lesen und habe den Absender um den Schlüssel gebeten. "
                 "Für die erste Freischaltung am besten einen **unverschlüsselten** Raum nutzen (oder hier nochmal schreiben, falls der Schlüssel nachkommt).\n\n"

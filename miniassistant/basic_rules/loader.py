@@ -22,6 +22,7 @@ RULE_FILES = [
     "knowledge_verification.md",
     "language.md",
     "subagent.md",
+    "webhook.md",
 ]
 
 # RAM-Cache: {dateiname: inhalt}

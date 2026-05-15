@@ -490,6 +490,41 @@ def _tools_schema(
                 },
             },
         })
+    wh_cfg = config.get("webhooks")
+    if isinstance(wh_cfg, dict) and wh_cfg.get("enabled"):
+        schema.append({
+            "type": "function",
+            "function": {
+                "name": "webhook",
+                "description": (
+                    "Manage HTTP-triggered autonomous tasks. "
+                    "Actions: 'create' (new webhook+token), 'list', 'remove' (by id/name), 'info' (config + recent runs), 'last_output' (read latest file). "
+                    "The optional default 'prompt' runs on each fire; callers may also send 'prompt' or prepend 'extra_context' per HTTP request. "
+                    "If default prompt is empty: webhook is 'open' — every POST must supply its own prompt. "
+                    "BEFORE creating, if anything is unclear from the user request — ASK the user instead of guessing: "
+                    "(1) default prompt or open (caller-supplied each call)? "
+                    "(2) target — which Matrix room / Discord channel should receive the result, or silent (file-only)? "
+                    "(3) name (slug) — used for URL/output dir, optional. "
+                    "PROMPT WORDING: never write 'send it', 'post it', 'reply via matrix' etc. — the bot's response text is AUTOMATICALLY delivered to the configured chat (no send_email/send_image needed). Just describe WHAT to produce: e.g. 'Summarize as bullets', 'Format as table', 'Return JSON with fields x,y'. "
+                    "Confirm what was created and show the token + POST URL exactly once. After remove/edit also confirm. "
+                    "Read WEBHOOKS.md for body schema and examples."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["create", "list", "remove", "info", "last_output"], "description": "create (default), list, remove, info, last_output"},
+                        "name": {"type": "string", "description": "Optional slug ^[a-z0-9][a-z0-9_-]{0,63}$ — used as directory and human handle"},
+                        "prompt": {"type": "string", "description": "Optional default prompt executed on each fire. Empty = open webhook (caller must supply prompt per POST). Plain language WHAT to produce — never 'send it'/'post it'/'reply via X' since the response is auto-delivered."},
+                        "client": {"type": "string", "description": "Default delivery target: 'matrix', 'discord', or 'none'. If omitted: inherits current chat context."},
+                        "model": {"type": "string", "description": "Model name/alias for the webhook task. Default: server default."},
+                        "silent": {"type": "boolean", "description": "true = no chat push, output only saved to file. false = push to chat."},
+                        "save_output": {"type": "boolean", "description": "true = also save output to file (default true)"},
+                        "id": {"type": "string", "description": "Webhook id (or name) for action='remove'/'info'/'last_output'"},
+                    },
+                    "required": [],
+                },
+            },
+        })
     if scheduler_cfg in (None, False) or scheduler_cfg is True or (isinstance(scheduler_cfg, dict) and scheduler_cfg.get("enabled", True)):
         schema.append({
             "type": "function",

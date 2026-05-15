@@ -131,10 +131,10 @@ if ! "$VENV_DIR/bin/python3" -m pip --version >/dev/null 2>&1; then
   "$VENV_DIR/bin/python3" -m ensurepip --upgrade 2>/dev/null || true
 fi
 
-# Abhängigkeiten (aus pyproject.toml inkl. optionale Extras: matrix, discord, scheduler)
+# Abhängigkeiten (aus pyproject.toml inkl. optionale Extras: matrix, discord, scheduler, mempalace, docs)
 echo "Installiere Abhängigkeiten..."
 "$VENV_DIR/bin/python3" -m pip install -q --upgrade pip
-"$VENV_DIR/bin/python3" -m pip install -q -e '.[matrix,discord,scheduler,mempalace]'
+"$VENV_DIR/bin/python3" -m pip install -q -e '.[matrix,discord,scheduler,mempalace,docs]'
 
 # Kurz prüfen, ob matrix-nio im selben venv importierbar ist (für Matrix-Bot)
 if ! "$VENV_DIR/bin/python3" -c "import nio" 2>/dev/null; then
@@ -144,6 +144,12 @@ fi
 # Discord prüfen
 if ! "$VENV_DIR/bin/python3" -c "import discord" 2>/dev/null; then
   echo "Hinweis: discord.py konnte nicht geladen werden. Erneut: $VENV_DIR/bin/python3 -m pip install -e '.[discord]'"
+fi
+# Dokument-Anhaenge (PDF/DOCX): pypdf + pypdfium2 + python-docx
+if "$VENV_DIR/bin/python3" -c "import pypdf, pypdfium2, docx" 2>/dev/null; then
+  echo "  Dokument-Extraktion (PDF/DOCX) verfuegbar."
+else
+  echo "Hinweis: Dokument-Extraktion nicht voll verfuegbar. Erneut: $VENV_DIR/bin/python3 -m pip install -e '.[docs]'"
 fi
 # mempalace + ChromaDB prüfen (semantisches Gedächtnis)
 if "$VENV_DIR/bin/python3" -c "import mempalace; import chromadb" 2>/dev/null; then

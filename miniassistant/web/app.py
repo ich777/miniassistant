@@ -101,7 +101,23 @@ def _get_session_lock(session_id: str) -> threading.Lock:
 _rate_buckets: dict[str, list[float]] = {}   # ip -> liste von Request-Timestamps
 _rate_lock = threading.Lock()
 _rate_config_cache: tuple[float, int, int] = (0.0, 100, 100)  # (cached_at, server_limit, raw_proxy_limit)
+_trust_forwarded_cache: tuple[float, bool] = (0.0, False)  # (cached_at, value)
 _RATE_WINDOW = 60.0  # Sekunden
+
+
+def _get_trust_forwarded() -> bool:
+    """Cached server.trust_forwarded — vermeidet load_config()-YAML-Parse pro Request."""
+    global _trust_forwarded_cache
+    now = time.monotonic()
+    cached_at, val = _trust_forwarded_cache
+    if now - cached_at < 30.0:
+        return val
+    try:
+        val = bool((load_config().get("server") or {}).get("trust_forwarded"))
+    except Exception:
+        val = False
+    _trust_forwarded_cache = (now, val)
+    return val
 
 # Auth Brute-Force Protection: separate Buckets für fehlgeschlagene Auth-Versuche (401)
 _auth_fail_buckets: dict[str, list[float]] = {}
@@ -195,6 +211,13 @@ async def _startup() -> None:
     _session_cleanup_task = asyncio.create_task(_cleanup_expired_sessions())
     _slot_cache_cleanup_task = asyncio.create_task(_slot_cache_cleanup_loop())
     _chat_executor = ThreadPoolExecutor(max_workers=_CHAT_EXECUTOR_MAX_WORKERS, thread_name_prefix="chat")
+    # Webhook output retention sweep (config-gated)
+    try:
+        from miniassistant import webhooks as _wh_mod
+        if _wh_mod.is_enabled():
+            _wh_mod.sweep_all_outputs()
+    except Exception:
+        pass
     try:
         project_dir = getattr(app.state, "project_dir", None)
         config = load_config(project_dir)
@@ -203,7 +226,7 @@ async def _startup() -> None:
             log_serve("Application startup", config)
         cc = config.get("chat_clients") or {}
         # Matrix-Bot
-        mc = cc.get("matrix") or config.get("matrix")
+        mc = cc.get("matrix")
         if mc:
             if mc.get("enabled", True) and mc.get("token") and mc.get("user_id"):
                 try:
@@ -295,6 +318,55 @@ async def _shutdown() -> None:
     _discord_bot_task = None
 
 
+# Body-size limits per route prefix (bytes). First match wins; default applies otherwise.
+# Large endpoints accept base64-encoded images/audio/documents — generous cap.
+# Config/API endpoints accept small payloads — tight cap.
+_BODY_LIMIT_DEFAULT = 1 * 1024 * 1024          # 1 MB
+_BODY_LIMIT_LARGE = 35 * 1024 * 1024            # 35 MB (chat with big images, long voice messages, etc.)
+_BODY_LIMIT_BY_PREFIX: list[tuple[str, int]] = [
+    ("/api/chat/stream", _BODY_LIMIT_LARGE),
+    ("/api/chat", _BODY_LIMIT_LARGE),
+    ("/api/onboarding", _BODY_LIMIT_LARGE),
+    ("/v1/chat/completions", _BODY_LIMIT_LARGE),
+    ("/v1/completions", _BODY_LIMIT_LARGE),
+    ("/raw/v1/chat/completions", _BODY_LIMIT_LARGE),
+    ("/raw/v1/completions", _BODY_LIMIT_LARGE),
+    ("/webhook/", _BODY_LIMIT_LARGE),
+]
+
+
+def _body_limit_for_path(path: str) -> int:
+    for prefix, limit in _BODY_LIMIT_BY_PREFIX:
+        if path.startswith(prefix):
+            return limit
+    return _BODY_LIMIT_DEFAULT
+
+
+@app.middleware("http")
+async def _body_size_limit_middleware(request: Request, call_next):
+    """Enforce per-path body-size cap via Content-Length header.
+    Chunked uploads without Content-Length: enforced post-hoc when first read."""
+    method = request.method.upper()
+    if method in ("GET", "HEAD", "DELETE", "OPTIONS"):
+        return await call_next(request)
+    path = request.url.path
+    if path.startswith("/static/"):
+        return await call_next(request)
+    limit = _body_limit_for_path(path)
+    cl_raw = request.headers.get("content-length")
+    if cl_raw:
+        try:
+            cl = int(cl_raw)
+        except ValueError:
+            return JSONResponse(status_code=400, content={"detail": "invalid Content-Length"})
+        if cl > limit:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": f"request body too large ({cl} bytes; limit {limit})"},
+            )
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def _rate_limit_middleware(request: Request, call_next):
     """Sliding-Window Rate-Limiter pro IP + Auth-Brute-Force-Schutz (401-Tracking)."""
@@ -302,12 +374,17 @@ async def _rate_limit_middleware(request: Request, call_next):
     path = request.url.path
     if path.startswith("/static/") or path == "/favicon.ico":
         return await call_next(request)
-    ip = (
-        request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-        or request.headers.get("x-real-ip", "").strip()
-        or (request.client.host if request.client else None)
-        or "unknown"
-    )
+    # x-forwarded-for / x-real-ip nur trusten wenn server.trust_forwarded=true (Reverse-Proxy-Setup).
+    # Sonst kann jeder Client den Header spoofen und Rate-Limit/Brute-Force-Schutz umgehen.
+    if _get_trust_forwarded():
+        ip = (
+            request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+            or request.headers.get("x-real-ip", "").strip()
+            or (request.client.host if request.client else None)
+            or "unknown"
+        )
+    else:
+        ip = (request.client.host if request.client else None) or "unknown"
     if not _check_rate_limit(ip, path):
         return JSONResponse(
             status_code=429,
@@ -364,29 +441,35 @@ def _require_token(request: Request) -> str:
     raise HTTPException(status_code=401, detail="Invalid or missing token")
 
 
-_TOKEN_COOKIE_PAGES = {"/", "/chat", "/chats", "/config", "/schedules", "/onboarding", "/logs", "/nutzung", "/workspace"}
+_TOKEN_COOKIE_PAGES = {"/", "/chat", "/chats", "/config", "/schedules", "/webhooks", "/onboarding", "/logs", "/nutzung", "/workspace"}
 
 
 @app.middleware("http")
 async def _token_cookie_middleware(request: Request, call_next):
-    """Wenn Token als URL-Param kommt und Seite ein HTML-Page ist: Cookie setzen, redirect ohne Token in URL."""
+    """Wenn Token als URL-Param kommt und Seite ein HTML-Page ist: Cookie setzen, redirect ohne Token in URL.
+    Cookie wird nur gesetzt wenn der URL-Token tatsächlich gegen die Server-Konfiguration validiert."""
     if request.method == "GET" and request.url.path in _TOKEN_COOKIE_PAGES:
         url_token = request.query_params.get("token", "").strip()
         cookie_token = request.cookies.get("ma_token", "").strip()
         if url_token and url_token != cookie_token:
-            # Token in Cookie speichern und redirect ohne ?token= in der URL
-            from starlette.responses import RedirectResponse as _Redirect
-            clean_url = str(request.url).split("?")[0]
-            # Andere Query-Params beibehalten (falls vorhanden)
-            from urllib.parse import urlencode, parse_qs
-            params = dict(request.query_params)
-            params.pop("token", None)
-            if params:
-                clean_url += "?" + urlencode(params)
-            resp = _Redirect(url=clean_url, status_code=302)
-            is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
-            resp.set_cookie("ma_token", url_token, httponly=True, samesite="strict", secure=is_https, max_age=365 * 24 * 3600)
-            return resp
+            import secrets as _secrets
+            try:
+                expected = (load_config().get("server") or {}).get("token") or ""
+            except Exception:
+                expected = ""
+            # Nur bei gültigem Token Cookie setzen; sonst durchlassen damit /chat etc. einen sauberen 401 wirft.
+            if expected and _secrets.compare_digest(url_token, expected):
+                from starlette.responses import RedirectResponse as _Redirect
+                clean_url = str(request.url).split("?")[0]
+                from urllib.parse import urlencode
+                params = dict(request.query_params)
+                params.pop("token", None)
+                if params:
+                    clean_url += "?" + urlencode(params)
+                resp = _Redirect(url=clean_url, status_code=302)
+                is_https = request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
+                resp.set_cookie("ma_token", url_token, httponly=True, samesite="strict", secure=is_https, max_age=365 * 24 * 3600)
+                return resp
     response = await call_next(request)
     return response
 
@@ -510,7 +593,9 @@ async def index(request: Request):
     token_esc = _escape(effective_token) if effective_token else ""
     config_links = ""
     if has_token:
-        config_links = '<li><a href="/config' + tq + '">Konfiguration</a></li><li><a href="/nutzung' + tq + '">Nutzung</a></li><li><a href="/schedules' + tq + '">Geplante Jobs</a></li><li><a href="/workspace' + tq + '">Workspace Explorer</a></li><li><a href="/logs' + tq + '">Logs</a></li>'
+        wh_cfg = cfg.get("webhooks") or {}
+        wh_link = ('<li><a href="/webhooks' + tq + '">Webhooks</a></li>') if (isinstance(wh_cfg, dict) and wh_cfg.get("enabled")) else ""
+        config_links = '<li><a href="/config' + tq + '">Konfiguration</a></li><li><a href="/nutzung' + tq + '">Nutzung</a></li><li><a href="/schedules' + tq + '">Geplante Jobs</a></li>' + wh_link + '<li><a href="/workspace' + tq + '">Workspace Explorer</a></li><li><a href="/logs' + tq + '">Logs</a></li>'
     logout_btn = '<button type="button" class="btn btn-outline" id="logout-btn" style="margin-left:0.5em;">Logout</button>' if is_authed else ""
     html = f"""
     <!DOCTYPE html>
@@ -936,7 +1021,8 @@ async def schedules_page(request: Request):
 
 
 def _escape(s: str) -> str:
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    import html as _html
+    return _html.escape(s, quote=True)
 
 
 def _js_escape(s: str) -> str:
@@ -1028,7 +1114,7 @@ async def chat_page(request: Request):
       <img src="/static/miniassistant.png" alt="MiniAssistant">
       <h1>Chat</h1>
       <span id="track-badge" style="display:none;font-size:0.72em;background:var(--primary);color:#fff;padding:0.15em 0.5em;border-radius:10px;margin-left:0.2em">💾 wird gespeichert</span>
-      <span class="cmds">/model, /models, /new, /abort, /stop, /schedules, /schedule remove &lt;ID&gt;, /auth — oder mit : statt /</span>
+      <span class="cmds">/help · /model · /models · /new · /abort · /stop · /schedules · /schedule &lt;text&gt; · /webhook &lt;text&gt; · /dazu &lt;text&gt; · /auth — oder mit : statt /</span>
     </div>
     {"<div class=\"onboarding-notice\">Setup noch nicht abgeschlossen. <a href=\"/onboarding" + token_q + "\">Onboarding / Setup</a></div>" if show_onboarding else ""}
     <div id="log"></div>
@@ -1680,7 +1766,9 @@ async def api_auth_platform(request: Request, platform: str):
         project_dir = getattr(request.app.state, "project_dir", None)
         cfg = load_config(project_dir)
         config_dir = (cfg.get("_config_dir") or "").strip() or None
-        result = consume_code(code, config_dir)
+        # Rate-Limit pro Aufrufer-IP, sonst sperrt 5 Fehlversuche alle Web-Auth-Versuche.
+        _rk_ip = (request.client.host if request.client else "unknown")
+        result = consume_code(code, config_dir=config_dir, rate_key=_rk_ip)
         if result:
             plat, uid = result
             return JSONResponse({"ok": True, "platform": plat, "user_id": uid})
@@ -1918,7 +2006,21 @@ async def api_chat_stream(request: Request):
         project_dir = getattr(request.app.state, "project_dir", None)
         session = create_session(None, project_dir)
         if restore_msgs and isinstance(restore_msgs, list):
-            session["messages"] = [m for m in restore_msgs if isinstance(m, dict)]
+            # Schema-Whitelist: nur user/assistant-Turns mit string content. Verhindert
+            # injizierte tool_call/tool-Felder die falsche Tool-Outputs in die Historie schmuggeln.
+            _MAX_RESTORE = 200
+            _MAX_CONTENT = 50_000
+            _allowed = {"user", "assistant"}
+            cleaned: list[dict] = []
+            for m in restore_msgs[:_MAX_RESTORE]:
+                if not isinstance(m, dict):
+                    continue
+                role = m.get("role")
+                content = m.get("content")
+                if role not in _allowed or not isinstance(content, str):
+                    continue
+                cleaned.append({"role": role, "content": content[:_MAX_CONTENT]})
+            session["messages"] = cleaned
         _sessions[session_id] = session
     if body.get("track"):
         session["_track_chat"] = True
@@ -2100,12 +2202,14 @@ async def api_chat_tool_result(request: Request):
     caller_sid = (body.get("session_id") or "").strip()
     if not tool_id:
         raise HTTPException(status_code=400, detail="tool_id required")
+    if not caller_sid:
+        raise HTTPException(status_code=400, detail="session_id required")
     with _tool_requests_lock:
         entry = _pending_tool_requests.get(tool_id)
     if not entry:
         raise HTTPException(status_code=404, detail="tool_id not found or already expired")
     # Session-Binding: nur die Session darf antworten, die den Request ausgelöst hat
-    if caller_sid and entry.get("session_id") and caller_sid != entry["session_id"]:
+    if entry.get("session_id") and caller_sid != entry["session_id"]:
         raise HTTPException(status_code=403, detail="session_id mismatch")
     result_str = str(result) if result is not None else ""
     if len(result_str.encode("utf-8", errors="replace")) > _TOOL_RESULT_MAX_BYTES:
@@ -2812,10 +2916,11 @@ async def api_restart(request: Request):
     # Detect init system and service name
     service_name = "miniassistant"
     if shutil.which("systemctl"):
-        # systemd: restart in background subshell (so response can be sent before process dies)
-        cmd = f"(sleep 1 && systemctl restart {service_name}) &"
+        argv: list[str] = ["systemctl", "restart", service_name]
+        method = "systemd"
     elif Path(f"/etc/init.d/{service_name}").exists():
-        cmd = f"(sleep 1 && /etc/init.d/{service_name} restart) &"
+        argv = [f"/etc/init.d/{service_name}", "restart"]
+        method = "init.d"
     else:
         # Fallback: kill own process group, let supervisor restart
         import os, signal
@@ -2826,8 +2931,14 @@ async def api_restart(request: Request):
         asyncio.create_task(_delayed_kill())
         return JSONResponse({"ok": True, "method": "sigterm", "message": "Service wird beendet (Neustart durch Supervisor)."})
     try:
-        subprocess.Popen(cmd, shell=True, start_new_session=True)
-        method = "systemd" if "systemctl" in cmd else "init.d"
+        # Delay über asyncio statt shell-`sleep` — Response geht raus bevor Service stirbt.
+        async def _delayed_restart(_argv: list[str]) -> None:
+            await asyncio.sleep(1)
+            try:
+                subprocess.Popen(_argv, start_new_session=True)
+            except Exception as e:
+                _log.error("Delayed restart fehlgeschlagen: %s", e)
+        asyncio.create_task(_delayed_restart(argv))
         return JSONResponse({"ok": True, "method": method, "message": f"Restart via {method} ausgelöst."})
     except Exception as e:
         _log.error("Restart fehlgeschlagen: %s", e)
@@ -4086,3 +4197,490 @@ async def api_onboarding_save(request: Request):
     if result.get("error"):
         raise HTTPException(status_code=400, detail=result["error"])
     return JSONResponse({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Webhooks
+# ---------------------------------------------------------------------------
+
+def _wh_disabled_response():
+    """Identical 404 to a missing route so unknown tokens don't leak existence."""
+    raise HTTPException(status_code=404, detail="Not Found")
+
+
+def _wh_extract_token(request: Request, path_token: str) -> str:
+    """Use path token, but accept X-Webhook-Token header as override."""
+    hdr = request.headers.get("X-Webhook-Token") or ""
+    return (hdr or path_token or "").strip()
+
+
+@app.post("/webhook/{token}")
+async def webhook_fire(request: Request, token: str):
+    """Fire a webhook by token. Body: JSON with optional extra_context, prompt, client, room_id, channel_id, silent, save_output, output_name, model."""
+    from miniassistant import webhooks as _wh
+    if not _wh.is_enabled():
+        _wh_disabled_response()
+    real_token = _wh_extract_token(request, token)
+    item = _wh.find_by_token(real_token)
+    if not item:
+        _wh_disabled_response()
+    if not _wh.rate_check(item["id"]):
+        raise HTTPException(status_code=429, detail="rate limit exceeded")
+    try:
+        body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(_chat_executor, lambda: _wh.fire(
+        item,
+        extra_context=str(body.get("extra_context") or ""),
+        prompt_override=str(body.get("prompt") or ""),
+        client_override=body.get("client"),
+        room_id_override=body.get("room_id"),
+        channel_id_override=body.get("channel_id"),
+        silent_override=body.get("silent") if "silent" in body else None,
+        save_output_override=body.get("save_output") if "save_output" in body else None,
+        output_name=body.get("output_name"),
+        model_override=body.get("model"),
+    ))
+    if not result.get("ok"):
+        return JSONResponse(result, status_code=400 if "no prompt" in (result.get("error") or "") else 500)
+    return JSONResponse(result)
+
+
+@app.get("/webhook/{token}/runs")
+async def webhook_runs(request: Request, token: str):
+    from miniassistant import webhooks as _wh
+    if not _wh.is_enabled():
+        _wh_disabled_response()
+    real_token = _wh_extract_token(request, token)
+    item = _wh.find_by_token(real_token)
+    if not item:
+        _wh_disabled_response()
+    return JSONResponse({"runs": _wh.list_outputs(item)})
+
+
+@app.get("/webhook/{token}/last")
+async def webhook_last(request: Request, token: str):
+    from miniassistant import webhooks as _wh
+    import mimetypes
+    if not _wh.is_enabled():
+        _wh_disabled_response()
+    real_token = _wh_extract_token(request, token)
+    item = _wh.find_by_token(real_token)
+    if not item:
+        _wh_disabled_response()
+    res = _wh.read_output(item)
+    if not res:
+        raise HTTPException(status_code=404, detail="no outputs")
+    path, content = res
+    mt = mimetypes.guess_type(path.name)[0] or "text/plain; charset=utf-8"
+    from fastapi.responses import Response as _Resp
+    return _Resp(content=content, media_type=mt)
+
+
+@app.get("/webhook/{token}/output/{name}")
+async def webhook_output(request: Request, token: str, name: str):
+    from miniassistant import webhooks as _wh
+    import mimetypes
+    if not _wh.is_enabled():
+        _wh_disabled_response()
+    real_token = _wh_extract_token(request, token)
+    item = _wh.find_by_token(real_token)
+    if not item:
+        _wh_disabled_response()
+    res = _wh.read_output(item, name=name)
+    if not res:
+        raise HTTPException(status_code=404, detail="not found")
+    path, content = res
+    mt = mimetypes.guess_type(path.name)[0] or "text/plain; charset=utf-8"
+    from fastapi.responses import Response as _Resp
+    return _Resp(content=content, media_type=mt)
+
+
+# Cookie-auth UI/API
+
+
+@app.get("/api/webhook")
+async def api_webhook_list(request: Request):
+    _require_token(request)
+    from miniassistant import webhooks as _wh
+    if not _wh.is_enabled():
+        return JSONResponse({"enabled": False, "items": []})
+    return JSONResponse({"enabled": True, "items": _wh.list_webhooks()})
+
+
+@app.post("/api/webhook")
+async def api_webhook_create(request: Request):
+    _require_token(request)
+    from miniassistant import webhooks as _wh
+    if not _wh.is_enabled():
+        raise HTTPException(status_code=400, detail="webhooks disabled in config")
+    body = await request.json()
+    ok, res = _wh.add_webhook(
+        name=str(body.get("name") or ""),
+        prompt=str(body.get("prompt") or ""),
+        client=body.get("client"),
+        room_id=body.get("room_id"),
+        channel_id=body.get("channel_id"),
+        model=body.get("model"),
+        silent=bool(body.get("silent", False)),
+        save_output=bool(body.get("save_output", True)),
+    )
+    if not ok:
+        raise HTTPException(status_code=400, detail=res)
+    return JSONResponse({"ok": True, "item": res})
+
+
+@app.patch("/api/webhook/{wid}")
+async def api_webhook_update(request: Request, wid: str):
+    _require_token(request)
+    from miniassistant import webhooks as _wh
+    body = await request.json()
+    ok, msg = _wh.update_webhook(wid, body)
+    if not ok:
+        raise HTTPException(status_code=404 if msg == "not found" else 400, detail=msg)
+    return JSONResponse({"ok": True})
+
+
+@app.delete("/api/webhook/{wid}")
+async def api_webhook_delete(request: Request, wid: str):
+    _require_token(request)
+    from miniassistant import webhooks as _wh
+    purge = request.query_params.get("purge") in ("1", "true", "yes")
+    ok, msg = _wh.remove_webhook(wid, purge_outputs=purge)
+    if not ok:
+        raise HTTPException(status_code=404, detail=msg)
+    return JSONResponse({"ok": True, "removed": msg})
+
+
+@app.get("/api/webhook/{wid}/token")
+async def api_webhook_token(request: Request, wid: str):
+    """Reveal plaintext token for a single webhook on demand (server.token authed).
+    The /webhooks UI keeps tokens masked by default and fetches via this endpoint
+    so the token is not part of the rendered HTML."""
+    _require_token(request)
+    from miniassistant import webhooks as _wh
+    if not _wh.is_enabled():
+        raise HTTPException(status_code=404, detail="webhooks disabled")
+    item = _wh.find_by_id(wid)
+    if not item:
+        raise HTTPException(status_code=404, detail="not found")
+    return JSONResponse({"id": item.get("id", ""), "token": item.get("token", "")})
+
+
+@app.post("/api/webhook/{wid}/run")
+async def api_webhook_run(request: Request, wid: str):
+    """Manual fire from UI. Honors body fields like POST /webhook/{token}."""
+    _require_token(request)
+    from miniassistant import webhooks as _wh
+    item = _wh.find_by_id(wid)
+    if not item:
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(_chat_executor, lambda: _wh.fire(
+        item,
+        extra_context=str(body.get("extra_context") or ""),
+        prompt_override=str(body.get("prompt") or ""),
+        silent_override=body.get("silent") if "silent" in body else None,
+    ))
+    return JSONResponse({"ok": True, "message": f"webhook {wid[:8]} started"})
+
+
+@app.get("/webhooks", response_class=HTMLResponse)
+async def webhooks_page(request: Request):
+    """Webhook UI — mirrors /schedules layout."""
+    _require_token(request)
+    token = request.query_params.get("token", "")
+    tq = _token_query(token)
+    from miniassistant import webhooks as _wh
+    enabled = _wh.is_enabled()
+    items = _wh.list_webhooks() if enabled else []
+    rows = ""
+    if not enabled:
+        rows = '<tr><td colspan="6" style="text-align:center;color:var(--muted);font-style:italic;">Webhooks deaktiviert. Aktivieren in <a href="/config' + tq + '">Konfiguration</a>: webhooks.enabled: true</td></tr>'
+    elif not items:
+        rows = '<tr><td colspan="6" style="text-align:center;color:var(--muted);font-style:italic;">Keine Webhooks.</td></tr>'
+    else:
+        import html as _html
+        for w in items:
+            wid = (w.get("id") or "")[:8]
+            full_id = _escape(w.get("id", ""))
+            handle = _escape(w.get("name") or wid)
+            _raw_tok = w.get("token") or ""
+            # Mask: first 4 + last 4 chars; plaintext fetched on demand via /api/webhook/{id}/token
+            if len(_raw_tok) >= 12:
+                tok_masked = _escape(_raw_tok[:4] + "…" + _raw_tok[-4:])
+            elif _raw_tok:
+                tok_masked = _escape(_raw_tok[:2] + "…")
+            else:
+                tok_masked = ""
+            cli = _escape(w.get("client") or "default")
+            if w.get("room_id"):
+                cli += f' <span style="font-size:0.8em;color:var(--muted);" title="{_escape(w["room_id"])}">📍Raum</span>'
+            elif w.get("channel_id"):
+                cli += f' <span style="font-size:0.8em;color:var(--muted);" title="{_escape(w["channel_id"])}">📍Channel</span>'
+            silent = ' <span style="color:var(--muted);font-size:0.8em;">silent</span>' if w.get("silent") else ""
+            err = ' <span style="color:var(--danger);" title="last error">●</span>' if w.get("last_error") else ""
+            last = (w.get("last_fired") or "never")[:16].replace("T", " ")
+            prompt_full = _escape(w.get("prompt") or "")
+            prompt_show = _escape((w.get("prompt") or "")[:80])
+            if len(w.get("prompt") or "") > 80:
+                task = f'<details><summary>{prompt_show}…</summary><div class="prompt-full">{prompt_full}</div></details>'
+            else:
+                task = prompt_show or "(empty)"
+            edit_btn = (
+                f'<button class="btn-edit" data-id="{full_id}"'
+                f' data-name="{_html.escape(w.get("name") or "", quote=True)}"'
+                f' data-prompt="{_html.escape(w.get("prompt") or "", quote=True)}"'
+                f' data-model="{_html.escape(w.get("model") or "", quote=True)}"'
+                f' data-client="{_html.escape(w.get("client") or "", quote=True)}"'
+                f' data-room="{_html.escape(w.get("room_id") or "", quote=True)}"'
+                f' data-channel="{_html.escape(w.get("channel_id") or "", quote=True)}"'
+                f' data-silent="{"1" if w.get("silent") else "0"}"'
+                f' title="Bearbeiten">&#9998;</button>'
+            )
+            rows += (
+                f'<tr><td><strong>{handle}</strong>{silent}{err}</td>'
+                f'<td>{task}</td><td>{cli}</td>'
+                f'<td><code class="tok-masked">{tok_masked}</code> '
+                f'<button class="btn-reveal" data-id="{full_id}" title="Token anzeigen / kopieren">&#128065;</button></td>'
+                f'<td>{last}</td>'
+                f'<td><code>{wid}</code> <button class="btn-run" data-id="{full_id}" title="Jetzt ausführen">&#9654;</button>{edit_btn}<button class="btn-del" data-id="{full_id}" title="Loeschen">&#10005;</button></td></tr>'
+            )
+    enabled_form = "" if not enabled else (
+        '<details class="card wh-create" style="margin-bottom:1em;">'
+        '<summary style="font-size:1.05em;font-weight:600;cursor:pointer;">+ Neuer Webhook</summary>'
+        '<div class="wh-form">'
+        '<label for="newName">Name <span class="hint">(slug, optional)</span></label>'
+        '<input type="text" id="newName" placeholder="daily-report">'
+        '<label for="newPrompt">Default Prompt <span class="hint">(optional — leer = Caller muss prompt im POST mitschicken)</span></label>'
+        '<textarea id="newPrompt" rows="4" placeholder="z.B. Summarize the incoming data as a short bullet list. (Antwort wird automatisch zum Chat-Push — keine send_*-Tools nötig.)"></textarea>'
+        '<label for="newClient">Client</label>'
+        '<select id="newClient"><option value="">default (keiner)</option><option>matrix</option><option>discord</option><option>both</option><option>none</option></select>'
+        '<label for="newRoom">Room / Channel <span class="hint">(optional)</span></label>'
+        '<input type="text" id="newRoom" placeholder="!abc:server  oder  Discord-Channel-ID">'
+        '<label for="newModel">Modell <span class="hint">(optional)</span></label>'
+        '<input type="text" id="newModel" placeholder="alias oder name">'
+        '<label for="newSilent">Silent</label>'
+        '<div><label class="cb"><input type="checkbox" id="newSilent"> kein Chat-Push, Output nur in Datei</label></div>'
+        '<label for="newSaveOutput">Output</label>'
+        '<div><label class="cb"><input type="checkbox" id="newSaveOutput" checked> Output zusätzlich speichern</label></div>'
+        '<div></div>'
+        '<div style="text-align:right;"><button class="btn btn-primary" id="btnCreate">Anlegen</button></div>'
+        '</div>'
+        '</details>'
+    )
+    html = f"""
+    <!DOCTYPE html><html><head><meta charset="utf-8"><title>Webhooks – MiniAssistant</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" href="/favicon.ico">
+    <style>
+    {_COMMON_CSS}
+    .sched-wrap {{ max-width: 1000px; margin: 0 auto; padding: 1.2em 1em; }}
+    .sched-header {{ display: flex; align-items: center; gap: 0.6em; margin-bottom: 1em; }}
+    .sched-header img {{ width: 40px; height: 40px; border-radius: 8px; }}
+    .sched-header h1 {{ margin: 0; font-size: 1.4em; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 0.9em; }}
+    th {{ text-align: left; padding: 0.5em; border-bottom: 2px solid var(--border); color: var(--muted); font-weight: 600; }}
+    td {{ padding: 0.5em; border-bottom: 1px solid var(--border); vertical-align: top; }}
+    code {{ background: #f0f0f0; padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.85em; word-break: break-all; }}
+    [data-theme="dark"] code {{ background: #2a2a4a; }}
+    .btn-del {{ background: none; border: 1.5px solid var(--danger); color: var(--danger); border-radius: 4px;
+      cursor: pointer; padding: 0.15em 0.4em; font-size: 0.85em; line-height: 1; transition: background 0.15s; }}
+    .btn-del:hover {{ background: var(--danger); color: #fff; }}
+    .btn-edit {{ background: none; border: 1.5px solid #888; color: #555; border-radius: 4px;
+      cursor: pointer; padding: 0.15em 0.4em; font-size: 0.85em; line-height: 1; margin-right: 0.3em; transition: background 0.15s; }}
+    .btn-edit:hover {{ background: #eee; }}
+    .btn-run {{ background: none; border: 1.5px solid #2d8a4e; color: #2d8a4e; border-radius: 4px;
+      cursor: pointer; padding: 0.15em 0.4em; font-size: 0.85em; line-height: 1; margin-right: 0.3em; transition: background 0.15s; }}
+    .btn-run:hover {{ background: #2d8a4e; color: #fff; }}
+    .btn-run:disabled {{ opacity: 0.5; cursor: default; }}
+    .modal-overlay {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,0.45); z-index:1000; align-items:center; justify-content:center; }}
+    .modal-overlay.open {{ display:flex; }}
+    .modal-box {{ background:var(--card); border-radius:8px; padding:1.5em; max-width:600px; width:90%; box-shadow:0 4px 24px rgba(0,0,0,0.18); }}
+    .modal-box h2 {{ margin:0 0 0.8em; font-size:1.1em; }}
+    .modal-box textarea, .modal-box input[type=text], .modal-box select {{ width:100%; box-sizing:border-box; }}
+    .modal-box label {{ display:block; font-size:0.88em; color:var(--muted); margin-bottom:0.25em; margin-top:0.7em; }}
+    .modal-actions {{ display:flex; gap:0.6em; justify-content:flex-end; margin-top:0.8em; }}
+    details {{ cursor: pointer; }}
+    details summary {{ display: list-item; }}
+    details .prompt-full {{ margin-top: 0.4em; white-space: pre-wrap; word-break: break-word; padding: 0.4em; background: var(--bg); border-radius: 4px; font-size: 0.9em; }}
+    /* Form-Grid: Label links, Feld rechts, jede Zeile separat */
+    .wh-form {{ display: grid; grid-template-columns: 180px 1fr; gap: 0.7em 1em; align-items: center; margin-top: 1em; }}
+    .wh-form > label {{ font-size: 0.92em; color: var(--text); text-align: right; padding-right: 0.3em; margin: 0; font-weight: 500; }}
+    .wh-form > label .hint {{ display: block; color: var(--muted); font-size: 0.78em; font-weight: 400; margin-top: 0.1em; }}
+    .wh-form > input[type=text], .wh-form > select, .wh-form > textarea {{ width: 100%; box-sizing: border-box; }}
+    .wh-form > textarea {{ resize: vertical; font-family: inherit; }}
+    .wh-form > div {{ display: flex; align-items: center; }}
+    .wh-form .cb {{ display: inline-flex; align-items: center; gap: 0.4em; font-size: 0.92em; color: var(--text); cursor: pointer; }}
+    .wh-form .cb input {{ width: auto; }}
+    .wh-create > summary {{ list-style: none; }}
+    .wh-create > summary::-webkit-details-marker {{ display: none; }}
+    .wh-create[open] > summary {{ border-bottom: 1px solid var(--border); padding-bottom: 0.5em; }}
+    @media (max-width: 600px) {{
+      .wh-form {{ grid-template-columns: 1fr; gap: 0.4em; }}
+      .wh-form > label {{ text-align: left; padding-right: 0; }}
+    }}
+    /* Edit-Modal kriegt das gleiche Grid */
+    .modal-box .wh-form {{ margin-top: 0; }}
+    </style>
+    </head><body>
+    <div class="sched-wrap">
+      <div class="sched-header">
+        <img src="/static/miniassistant.png" alt="Logo">
+        <h1>Webhooks</h1>
+      </div>
+      {enabled_form}
+      <div class="card">
+        <table>
+          <thead><tr><th>Name</th><th>Default Prompt</th><th>Ziel</th><th>Token</th><th>Letzter Lauf</th><th>ID</th></tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>
+      <div style="margin-top:1em;">
+        <a href="/{tq}" class="btn btn-outline">Startseite</a>
+        <span class="text-muted" style="margin-left:1em;">▶ ausführen · ✎ bearbeiten · ✕ löschen · POST <code>/webhook/&lt;token&gt;</code> + JSON <code>{{"extra_context":"..."}}</code> · Chat: <code>/webhook &lt;text&gt;</code> für Folgefragen</span>
+      </div>
+    </div>
+    <div class="modal-overlay" id="editModal">
+      <div class="modal-box">
+        <h2>Webhook bearbeiten</h2>
+        <div class="wh-form">
+          <label for="editName">Name</label>
+          <input type="text" id="editName">
+          <label for="editPrompt">Default Prompt</label>
+          <textarea id="editPrompt" rows="5"></textarea>
+          <label for="editClient">Client</label>
+          <select id="editClient"><option value="">default</option><option>matrix</option><option>discord</option><option>both</option><option>none</option></select>
+          <label for="editRoom">Room / Channel</label>
+          <input type="text" id="editRoom" placeholder="!abc:server  oder  Discord-Channel-ID">
+          <label for="editModel">Modell</label>
+          <input type="text" id="editModel">
+          <label for="editSilent">Silent</label>
+          <div><label class="cb"><input type="checkbox" id="editSilent"> kein Chat-Push, Output nur in Datei</label></div>
+        </div>
+        <div class="modal-actions">
+          <button class="btn btn-outline" id="editCancel">Abbrechen</button>
+          <button class="btn btn-primary" id="editSave">Speichern</button>
+        </div>
+      </div>
+    </div>
+    <script>
+    var _editId = null;
+    var token = new URLSearchParams(window.location.search).get("token") || "";
+    function tq() {{ return token ? "?token=" + encodeURIComponent(token) : ""; }}
+    var btnCreate = document.getElementById("btnCreate");
+    if (btnCreate) btnCreate.addEventListener("click", function() {{
+      var body = {{
+        name: document.getElementById("newName").value.trim(),
+        prompt: document.getElementById("newPrompt").value.trim(),
+        client: document.getElementById("newClient").value || null,
+        model: document.getElementById("newModel").value.trim() || null,
+        silent: document.getElementById("newSilent").checked,
+        save_output: document.getElementById("newSaveOutput").checked,
+      }};
+      var room = document.getElementById("newRoom").value.trim();
+      if (room) {{
+        if (room.startsWith("!")) body.room_id = room; else body.channel_id = room;
+      }}
+      if (!body.prompt && !confirm("Kein Default Prompt gesetzt — der Caller muss dann bei jedem POST 'prompt' mitschicken. Trotzdem anlegen?")) return;
+      fetch("/api/webhook" + tq(), {{
+        method:"POST", headers:{{"Content-Type":"application/json"}}, body: JSON.stringify(body)
+      }}).then(function(r){{
+        return r.json().then(function(d){{
+          if (r.ok && d.item && d.item.token) {{
+            // Token nur EINMAL plaintext zeigen — danach im UI maskiert + on-demand via Reveal-Button
+            alert("Webhook angelegt.\\n\\nToken (jetzt kopieren — wird danach maskiert):\\n\\n" + d.item.token);
+          }}
+          if (r.ok) location.reload();
+          else alert(d.detail || d.error || "Fehler");
+        }});
+      }});
+    }});
+    document.querySelectorAll(".btn-reveal").forEach(function(btn) {{
+      btn.addEventListener("click", function() {{
+        var id = this.getAttribute("data-id");
+        fetch("/api/webhook/" + encodeURIComponent(id) + "/token" + tq(), {{credentials:"same-origin"}})
+          .then(function(r){{ return r.json().then(function(d){{ return {{ok: r.ok, data: d}}; }}); }})
+          .then(function(res) {{
+            if (!res.ok) {{ alert(res.data.detail || "Fehler"); return; }}
+            var t = res.data.token || "";
+            if (navigator.clipboard && navigator.clipboard.writeText) {{
+              navigator.clipboard.writeText(t).then(function() {{
+                alert("Token in Zwischenablage kopiert:\\n\\n" + t);
+              }}, function() {{ alert("Token:\\n\\n" + t); }});
+            }} else {{
+              alert("Token:\\n\\n" + t);
+            }}
+          }})
+          .catch(function(e){{ alert("Fehler: " + e); }});
+      }});
+    }});
+    document.querySelectorAll(".btn-edit").forEach(function(btn) {{
+      btn.addEventListener("click", function() {{
+        _editId = this.getAttribute("data-id");
+        document.getElementById("editName").value = this.getAttribute("data-name") || "";
+        document.getElementById("editPrompt").value = this.getAttribute("data-prompt") || "";
+        document.getElementById("editClient").value = this.getAttribute("data-client") || "";
+        var room = this.getAttribute("data-room") || "";
+        var channel = this.getAttribute("data-channel") || "";
+        document.getElementById("editRoom").value = room || channel;
+        document.getElementById("editModel").value = this.getAttribute("data-model") || "";
+        document.getElementById("editSilent").checked = this.getAttribute("data-silent") === "1";
+        document.getElementById("editModal").classList.add("open");
+      }});
+    }});
+    document.getElementById("editCancel").addEventListener("click", function() {{ document.getElementById("editModal").classList.remove("open"); }});
+    document.getElementById("editSave").addEventListener("click", function() {{
+      var body = {{
+        name: document.getElementById("editName").value.trim(),
+        prompt: document.getElementById("editPrompt").value.trim(),
+        client: document.getElementById("editClient").value || null,
+        model: document.getElementById("editModel").value.trim() || null,
+        silent: document.getElementById("editSilent").checked,
+      }};
+      var room = document.getElementById("editRoom").value.trim();
+      body.room_id = room.startsWith("!") ? room : null;
+      body.channel_id = (!room.startsWith("!") && room) ? room : null;
+      fetch("/api/webhook/" + encodeURIComponent(_editId) + tq(), {{
+        method:"PATCH", headers:{{"Content-Type":"application/json"}}, body: JSON.stringify(body)
+      }}).then(function(r){{
+        if (r.ok) location.reload();
+        else r.json().then(function(d){{ alert(d.detail || "Fehler"); }});
+      }});
+    }});
+    document.getElementById("editModal").addEventListener("click", function(e){{ if (e.target === this) this.classList.remove("open"); }});
+    document.querySelectorAll(".btn-run").forEach(function(btn) {{
+      btn.addEventListener("click", function() {{
+        var id = this.getAttribute("data-id");
+        var b = this; b.disabled = true; b.textContent = "…";
+        fetch("/api/webhook/" + encodeURIComponent(id) + "/run" + tq(), {{ method:"POST" }}).then(function(r){{
+          if (r.ok) {{ b.textContent = "✓"; setTimeout(function(){{ b.disabled = false; b.innerHTML = "&#9654;"; }}, 2000); }}
+          else r.json().then(function(d){{ alert(d.detail || "Fehler"); b.disabled = false; b.innerHTML = "&#9654;"; }});
+        }}).catch(function(){{ b.disabled = false; b.innerHTML = "&#9654;"; }});
+      }});
+    }});
+    document.querySelectorAll(".btn-del").forEach(function(btn) {{
+      btn.addEventListener("click", function() {{
+        var id = this.getAttribute("data-id");
+        if (!confirm("Webhook " + id.slice(0,8) + " loeschen? (Outputs bleiben erhalten)")) return;
+        fetch("/api/webhook/" + encodeURIComponent(id) + tq(), {{ method:"DELETE" }}).then(function(r){{
+          if (r.ok) location.reload();
+          else r.json().then(function(d){{ alert(d.detail || "Fehler"); }});
+        }});
+      }});
+    }});
+    </script>
+    {_THEME_JS}
+    </body></html>
+    """
+    return HTMLResponse(html)

@@ -47,6 +47,8 @@ browser = ["curl_cffi>=0.7"]
 js = ["playwright>=1.40"]
 # mempalace: AI memory system with semantic search (ChromaDB vector store, knowledge graph)
 mempalace = ["mempalace>=3.0"]
+# docs: Dokument-Anhaenge (PDF, DOCX) extrahieren. pypdfium2 rendert gescannte PDFs zu PNGs (Vision-Fallback).
+docs = ["pypdf>=4", "pypdfium2>=4", "python-docx>=1"]
 
 [project.scripts]
 miniassistant = "miniassistant.cli:main"

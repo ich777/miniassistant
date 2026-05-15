@@ -77,6 +77,7 @@ providers:
 - **CLI-Chat**: `miniassistant chat` (Modellwechsel: `/model MODELLNAME` oder `/model ALIAS`)
 - **Web-UI**: `miniassistant serve` – dann http://127.0.0.1:8765 (Host/Port in Config änderbar, z. B. `server.port: 8080` oder `--port 8080`)
 - **Token**: Beim ersten `serve` wird ein Token generiert (CLI-Ausgabe oder `miniassistant token`). **Im Browser:** Startseite öffnen, Token eingeben und „Zum Chat“ klicken – oder direkt z. B. `http://host:8765/chat?token=DEIN_TOKEN` aufrufen. API: `?token=...` in der URL oder Header `Authorization: Bearer <token>`.
+- **Anhänge** (Web-UI / Discord / Matrix): Bilder (PNG, JPG, GIF, WebP) gehen ans Vision-Modell. Dokumente (PDF, DOCX, `.txt`, `.md`, `.csv`, `.json`, `.xml`, `.log`, `.rst`) werden extrahiert und in die Nachricht eingebettet. Gescannte PDFs werden als Seitenbilder durchs Vision-Modell geschickt. Optional via `pip install -e '.[docs]'`. Details/Limits: siehe `CONFIGURATION.md` Abschnitt 21.
 
 ## OpenAI-kompatible API
 
@@ -227,6 +228,7 @@ Alle Einträge sind **optional**. Fehlt etwas in der Config, werden Defaults bzw
 Ausführlich und strukturiert: **[CONFIGURATION.md](CONFIGURATION.md)** (wo die Config liegt, alle Bereiche, Optionen, Beispiele). Die Doku wird mit dem Code mitgepflegt.
 
 - **Smart Compacting:** Wenn der Chatverlauf den Kontext füllt, werden ältere Messages automatisch zusammengefasst. Steuerbar via `chat.context_quota` (Default: 0.85 = 85% von `num_ctx`). Skaliert automatisch mit der Modellgröße.
+- **Slot Cache (llama.cpp):** Optional persistiert KV-Cache pro Conversation am LLM-Server für schnelle Resumes (10-30s gespart bei langen Conversations). Default OFF, opt-in via `slot_cache.enabled: true` in der Config. Funktioniert nicht mit `--mmproj`-Modellen. Details: [CONFIGURATION.md §22](CONFIGURATION.md#22-slot-cache-performance).
 
 ## Plan
 

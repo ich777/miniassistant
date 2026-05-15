@@ -159,6 +159,12 @@ Web-UI und API (Bind-Adresse, **Port**, Token). Port und Host sind einstellbar (
 | `track_usage` | boolean | nein | `false` | Wenn `true`: Jeder LLM-Aufruf wird mit Zeitstempel, Modell, Typ und Dauer (Sekunden) in `$config_dir/usage/usage.csv` aufgezeichnet. Typen: `chat`, `vision`, `subagent`, `image` (Erfolg) sowie `chat_error`, `vision_error`, `subagent_error`, `image_error` (Timeout/Fehler – inkl. Retry-Zeit). Die Daten können in der Web-UI unter **Nutzung** (`/nutzung`) mit Zeitfiltern und Charts eingesehen werden. |
 | `rate_limit` | integer | nein | `100` | Maximale Anzahl Anfragen pro IP-Adresse **pro Minute** (Sliding-Window). Gilt für alle Endpunkte außer statischen Dateien. Bei Überschreitung: HTTP 429 mit `Retry-After: 60`. Auf `0` setzen zum Deaktivieren. |
 
+**Body-Size-Limits (fix):** Chat-, Onboarding-, OpenAI-compat-, Raw-Proxy- und Webhook-Endpoints akzeptieren bis zu **35 MB** (Bilder/Audio/Dokumente als base64). Config + andere `/api/*` Endpoints: **1 MB**. Bei Überschreitung: HTTP 413.
+
+**SSRF-Schutz:** `read_url`, `check_url`, `download_file` lehnen Requests zu privaten/Loopback-/Link-Local-/Cloud-Metadata-Hosts ab — auch wenn ein öffentlicher Host per Redirect dorthin verweist. Pro Redirect-Hop wird neu geprüft.
+
+**Webhook-Token:** In der `/webhooks` UI wird der Token maskiert dargestellt (`xxxx…yyyy`). Plaintext nach Erstellung einmal per Alert, danach on-demand via Reveal-Button (Endpoint `GET /api/webhook/{wid}/token`, server.token-authed).
+
 Wenn `token` nicht gesetzt ist, wird beim ersten Start von `miniassistant serve` eines generiert und in der Config gespeichert.
 
 ### Reverse Proxy (Nginx)
@@ -434,8 +440,6 @@ read_url:
 | `respond_in_input_language` | boolean | nein | `false` | Wenn `true`: Antwortet automatisch in der Sprache des eingehenden Nutzerprompts (Spracherkennung). Überschreibt die `Response language` in IDENTITY.md. Nützlich bei Multi-User-Bots (Matrix/Discord) mit gemischten Sprachen. Default bleibt Deutsch wenn nicht gesetzt und IDENTITY.md keine Sprache vorgibt. |
 | `scheduler` | Objekt | nein | (nicht gesetzt) | Wenn `enabled: true`: Tool **schedule** verfuegbar. |
 | `chat_clients` | Objekt | nein | (nicht gesetzt) | Chat-Client-Anbindungen (Matrix, Discord). Siehe unten. |
-
-**Abwaertskompatibilitaet:** Top-level `matrix:` wird automatisch nach `chat_clients.matrix` migriert. Alte Configs funktionieren weiterhin.
 
 ---
 
@@ -1457,3 +1461,149 @@ image_generation: "stable-diffusion"
 
 - **Immer verfügbar** wenn konfiguriert — kein `enabled: true` nötig, nicht an Provider gebunden wie Subagents.
 - **Avatar ändern:** Der Assistent kann sein eigenes Profilbild auf Matrix/Discord setzen. Details in `docs/AVATARS.md`.
+
+## 21. Dokument-Anhänge (PDF, DOCX, Text)
+
+Anhänge werden in **Discord, Matrix und Web-UI** unterstützt: PDF, DOCX, sowie reine Textformate (`.txt`, `.md`, `.csv`, `.json`, `.xml`, `.log`, `.rst`).
+
+**Installation:**
+```bash
+pip install -e '.[docs]'
+```
+
+Bringt `pypdf` (Text-PDFs), `pypdfium2` (rendert gescannte PDFs als PNG → Vision-Pfad) und `python-docx` (Word).
+
+**Funktionsweise:**
+
+- **Text-PDF / DOCX / Plain text:** Inhalt wird extrahiert und an den User-Prompt angehängt.
+- **Gescanntes PDF:** Erkennt der Extractor wenig Text pro Seite, werden die ersten N Seiten als PNG gerendert und durchs Vision-Modell geschickt. Dafür muss `vision` konfiguriert sein.
+- **History:** Im Chat-Verlauf werden lange Anhang-Texte nach der Antwort durch einen Marker (`[Anhang: dateiname — N Zeichen]`) ersetzt, damit nachfolgende Turns nicht zugemüllt werden.
+
+**Adaptive Größenanpassung:** Vor dem LLM-Call wird der Anhang automatisch an die freie Kontextgröße des aktuellen Modells angepasst (nach evtl. History-Compacting). Die `<doc>`-Inhalte werden proportional gekürzt, wenn sie nicht reinpassen — sichtbar an `truncated="true"` und einem `[...gekuerzt um in Kontext zu passen...]`-Marker. Heißt konkret: bei kleinem Modell (z. B. 4k num_ctx) bekommt der Agent automatisch weniger Doku-Text, bei großem (128k) nahezu alles.
+
+**Limits (optional in der Config):**
+```yaml
+doc_max_chars: 200000         # Sicherheits-Decke bei der Extraktion (Default 200000)
+doc_max_pages_render: 10      # max. Seiten als PNG bei gescannten PDFs (Default 10)
+doc_response_reserve: 2000    # Tokens, die für die Antwort frei bleiben (Default 2000)
+```
+
+`doc_max_chars` ist nur die OOM-Bremse beim Einlesen — der Runtime-Fit kürzt darunter weiter. `doc_max_pages_render` limitiert direkt den Vision-Token-Verbrauch bei gescannten PDFs.
+
+
+## 22. Slot Cache (Performance)
+
+Persistiert llama.cpp KV-Cache pro Conversation **am LLM-Server** auf disk. Spart bei Resume
+einer alten Conversation 5-30s prompt-eval. Funktioniert **nur mit llama.cpp / llama-swap**
+Backend (Provider type `openai-compat`).
+
+### ⚠️ Inkompatibilitäten (llama.cpp-seitig — kein MA-Bug)
+
+llama.cpp lehnt slot save/restore mit **HTTP 501** ab wenn:
+
+- `--mmproj` (multimodale / Vision-Modelle) aktiv ist — KV-Cache-Layout inkompatibel
+- `--slot-save-path` nicht gesetzt ist — save/restore nicht aktiviert
+- `--draft-model` (speculative decoding) aktiv ist — meist 501
+- Bestimmte Backends (Vulkan, OpenCL) — teilweise 501
+
+**Was passiert wenn `slot_cache.enabled=true` und das Modell unterstützt es nicht?**
+
+→ **Kein Fehler, kein Crash, keine Auswirkung auf Chat-Funktion.** MA erkennt 501, loggt
+einmal eine Warning pro Session:
+
+```
+WARNING: slot_cache: model X does not support slot save (501) — disabling for this session
+```
+
+Markiert das Modell intern als unsupported, skippt alle weiteren save/restore-Versuche für
+diese Session. Chat läuft normal weiter, einfach ohne Slot-Cache-Win. Reset bei MA-Restart
+(falls llama-swap-Config geändert wurde, kann's beim nächsten Start wieder versuchen).
+
+→ Heißt: **safe to enable global**, auch wenn manche Modelle es nicht können — MA filtert
+automatisch. Per-Modell explizit ausschalten ist trotzdem sauberer (vermeidet die einmalige
+Warning + spart einen 501-Roundtrip pro Session-Start).
+
+### Voraussetzungen am llama-server
+
+`--slot-save-path /path/to/slots` muss in der llama.cpp-Argumentliste gesetzt sein.
+
+```
+${llama-docker} \
+  -m /models/Model.gguf \
+  --slot-save-path /mnt/nvme/llama-slots \
+  -np 6 \
+  --cache-reuse 256 \
+  ...
+```
+
+Ohne diesen Flag returnt llama.cpp 501 und MA skippt das Modell automatisch für die Session.
+
+### Globale Config
+
+```yaml
+slot_cache:
+  enabled: false              # Default OFF — opt-in
+  ttl_days: 14                # Auto-Invalidierung bei Inaktivität
+  max_files: 40               # LRU-Cap (MA-Tracking)
+  min_tokens_to_cache: 10000  # Cachen lohnt erst ab N Tokens
+  llama_swap_url: ""          # leer = aus providers ableiten
+  remote_slot_path: "/slots"  # informativ — wo's am LLM-Server liegt
+```
+
+### Per-Provider/Per-Modell
+
+Wie `num_ctx` direkt im providers/model_options Block:
+
+```yaml
+providers:
+  llama-swap:
+    type: openai-compat
+    base_url: http://10.0.0.2:8080
+    slot_cache: true                  # Default für alle Modelle dieses Providers
+    model_options:
+      qwen3.6-35b-a3b-uncensored:
+        num_ctx: 128000
+        slot_cache: false             # explizit aus (z.B. weil multimodal)
+      qwen3.5-9b:
+        slot_cache: false             # zu klein, lohnt nicht
+```
+
+Resolution: globale `slot_cache.enabled` muss `true` sein, sonst alles aus.
+Sonst: `model_options.{model}.slot_cache` > `provider.slot_cache` > implizit `true`.
+
+### Per-Endpoint
+
+| Endpoint | Verhalten |
+|----------|-----------|
+| `/api/chat/stream` und `/api/chat` (Web-Chat) | aktiv wenn `track=true` |
+| `/v1/chat/completions` (OpenAI-kompat) | aktiv wenn `slot_cache.enabled` |
+| `/raw/v1/chat/completions` | greift nicht durch chat_round → kein Cache (by design) |
+| Matrix / Discord | aktiv wenn `slot_cache.enabled` |
+
+Subagent-Calls, Image-Gen, STT/TTS, Compaction, Scheduler-Jobs werden **nicht** gecached.
+
+### Multi-Instance
+
+`{config_dir}/instance_id` enthält 8-Hex-UUID, beim ersten Start automatisch erzeugt. Slot-Files
+auf LLM-Server haben Filename-Prefix `{instance_id}_` — zwei MA-Instanzen kollidieren nicht.
+
+### Storage / Cleanup
+
+MA hat keinen Filesystem-Zugriff auf den LLM-Server (separate Maschine). Cleanup-Strategien:
+
+- **MA-Seite**: stündlicher async Job (TTL + LRU + unknown-models) — automatisch.
+- **LLM-Server-Seite**: cron einrichten, sonst wachsen orphan-Files:
+  ```bash
+  # /etc/cron.daily/cleanup-llama-slots
+  find /slots -type f -name '*.bin' -mtime +30 -delete
+  ```
+
+### Web-UI
+
+Auf `/nutzung` (Stats-Page) wird automatisch eine Sektion "Slot Cache" angezeigt wenn aktiv.
+Zeigt: total files, hit-rate, instance-id, Tabelle aller cached Conversations mit Forget-Buttons.
+
+API:
+- `GET /api/slot_cache/list` — Liste + Stats
+- `DELETE /api/slot_cache/{conv_id}` — Forget Entry (orphan-File bleibt bis cron)
+- `POST /api/slot_cache/cleanup` — manueller TTL+LRU Sweep

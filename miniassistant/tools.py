@@ -140,11 +140,16 @@ _RETRY_DELAY = 3  # seconds
 
 
 def _is_ssrf_target(url: str) -> bool:
-    """Check if URL targets private/internal networks or cloud metadata services (SSRF protection)."""
+    """Check if URL targets private/internal networks or cloud metadata services (SSRF protection).
+    Strict: blocks loopback, private, link-local, reserved, unspecified, multicast, cloud metadata.
+    Treats hostname "0", "0.0.0.0", "localhost" explicitly."""
     try:
         parsed = urlparse(url)
         hostname = (parsed.hostname or "").lower().strip()
         if not hostname:
+            return True
+        # Trivial hostnames that resolve to local/unspecified
+        if hostname in ("0", "0.0.0.0", "localhost", "ip6-localhost", "ip6-loopback", "::", "::1"):
             return True
         # Block cloud metadata services
         _BLOCKED_HOSTS = {
@@ -152,13 +157,14 @@ def _is_ssrf_target(url: str) -> bool:
             "metadata.google.internal",
             "metadata.google.com",
             "100.100.100.200",  # Alibaba Cloud metadata
+            "fd00:ec2::254",    # AWS IMDS IPv6
         }
         if hostname in _BLOCKED_HOSTS:
             return True
-        # Block link-local metadata IP range
+        # Block link-local metadata IP range (catches encoded forms before resolve)
         if hostname.startswith("169.254."):
             return True
-        # Resolve hostname and check if IP is private/reserved
+        # Resolve hostname and check every returned IP
         import socket
         try:
             addrs = socket.getaddrinfo(hostname, None)
@@ -166,15 +172,158 @@ def _is_ssrf_target(url: str) -> bool:
             return False  # Can't resolve, let httpx handle the error
         for family, _, _, _, sockaddr in addrs:
             ip_str = sockaddr[0]
+            # IPv6 zone-id strip ("fe80::1%eth0")
+            if "%" in ip_str:
+                ip_str = ip_str.split("%", 1)[0]
             try:
                 ip = ipaddress.ip_address(ip_str)
-                if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                if (
+                    ip.is_private
+                    or ip.is_loopback
+                    or ip.is_link_local
+                    or ip.is_reserved
+                    or ip.is_unspecified
+                    or ip.is_multicast
+                ):
                     return True
             except ValueError:
                 continue
     except Exception:
         return False
     return False
+
+
+class SSRFBlocked(httpx.RequestError):
+    """Raised when a request (or its redirect target) hits a blocked SSRF host."""
+
+    def __init__(self, target: str) -> None:
+        super().__init__(f"SSRF blocked (internal/private target): {target}")
+        self.target = target
+
+
+_MAX_REDIRECTS = 5
+
+
+def _safe_redirect_loop(
+    method: str,
+    url: str,
+    *,
+    timeout: float,
+    headers: dict[str, str] | None = None,
+    proxy: str | None = None,
+    max_redirects: int = _MAX_REDIRECTS,
+) -> tuple[str, "httpx.Response"]:
+    """Fetch with manual redirect handling — re-checks SSRF on every hop.
+
+    Returns (final_url, final_response). Body fully buffered so callers can use
+    r.text / r.content / r.json() after the underlying client is closed.
+    Raises SSRFBlocked if any hop targets an internal/private/metadata host.
+    """
+    from urllib.parse import urljoin
+    current = url
+    visited: set[str] = set()
+    base_kwargs: dict[str, Any] = {
+        "timeout": timeout, "follow_redirects": False, "headers": headers or {},
+    }
+    if proxy:
+        base_kwargs["proxy"] = proxy
+    for _hop in range(max_redirects + 1):
+        if _is_ssrf_target(current):
+            raise SSRFBlocked(current)
+        with httpx.Client(**base_kwargs) as client:
+            r = client.request(method, current)
+            _ = r.content  # force body read before client closes
+        if r.status_code in (301, 302, 303, 307, 308):
+            loc = r.headers.get("location") or ""
+            if not loc:
+                return current, r
+            new = urljoin(current, loc)
+            if new in visited:
+                raise SSRFBlocked(new)  # redirect loop ≈ malicious
+            visited.add(new)
+            current = new
+            continue
+        return current, r
+    raise SSRFBlocked(current)
+
+
+def _resolve_url_safely(
+    url: str,
+    *,
+    timeout: float,
+    headers: dict[str, str] | None = None,
+    proxy: str | None = None,
+    max_redirects: int = _MAX_REDIRECTS,
+) -> str:
+    """Resolve redirect chain via HEAD (with GET-fallback), checking SSRF on every hop.
+    Returns final URL. Raises SSRFBlocked if any hop is internal. Used by streaming
+    downloads where pre-reading the body is wasteful."""
+    from urllib.parse import urljoin
+    current = url
+    visited: set[str] = set()
+    base_kwargs: dict[str, Any] = {
+        "timeout": min(timeout, 30.0), "follow_redirects": False, "headers": headers or {},
+    }
+    if proxy:
+        base_kwargs["proxy"] = proxy
+    for _hop in range(max_redirects + 1):
+        if _is_ssrf_target(current):
+            raise SSRFBlocked(current)
+        try:
+            with httpx.Client(**base_kwargs) as client:
+                r = client.head(current)
+                if r.status_code == 405:
+                    # Some servers reject HEAD; tiny ranged GET as fallback
+                    r = client.get(current, headers={**(headers or {}), "Range": "bytes=0-0"})
+        except httpx.HTTPError:
+            # Network error during resolve — return current; final fetch will fail naturally
+            return current
+        if r.status_code in (301, 302, 303, 307, 308):
+            loc = r.headers.get("location") or ""
+            if not loc:
+                return current
+            new = urljoin(current, loc)
+            if new in visited:
+                raise SSRFBlocked(new)
+            visited.add(new)
+            current = new
+            continue
+        return current
+    raise SSRFBlocked(current)
+
+
+def _curl_cffi_safe_get(
+    url: str,
+    *,
+    impersonate: str,
+    timeout: float,
+    headers: dict[str, str] | None = None,
+    max_redirects: int = _MAX_REDIRECTS,
+):
+    """curl_cffi.get with manual redirect handling + SSRF check on each hop.
+    Returns the final curl_cffi response. Caller must check status code."""
+    from urllib.parse import urljoin
+    current = url
+    visited: set[str] = set()
+    for _hop in range(max_redirects + 1):
+        if _is_ssrf_target(current):
+            raise SSRFBlocked(current)
+        r = _curl_requests.get(
+            current, impersonate=impersonate, timeout=timeout,
+            headers=headers, allow_redirects=False,
+        )
+        if 300 <= r.status_code < 400:
+            loc = (r.headers.get("location") or r.headers.get("Location") or "")
+            if not loc:
+                return r
+            new = urljoin(current, loc)
+            if new in visited:
+                raise SSRFBlocked(new)
+            visited.add(new)
+            current = new
+            continue
+        return r
+    raise SSRFBlocked(current)
 
 
 # Browser User-Agent: Safari 18.4.1 auf macOS Sequoia (Apple Silicon meldet
@@ -312,18 +461,19 @@ def check_url(url: str, timeout: float = 10.0) -> dict[str, Any]:
     _cu_headers = {"User-Agent": _USER_AGENT}
     for attempt in range(_RETRY_ATTEMPTS):
         try:
-            with httpx.Client(timeout=timeout, follow_redirects=True, headers=_cu_headers) as client:
-                r = client.get(u)
-                final = str(r.url)
-                if r.status_code in _RETRYABLE_STATUS_CODES and attempt < _RETRY_ATTEMPTS - 1:
-                    _log.warning("check_url attempt %d/%d got HTTP %d, retrying in %ds …", attempt + 1, _RETRY_ATTEMPTS, r.status_code, _RETRY_DELAY)
-                    time.sleep(_RETRY_DELAY)
-                    continue
-                return {
-                    "reachable": 200 <= r.status_code < 400,
-                    "status_code": r.status_code,
-                    "final_url": final if final != u else None,
-                }
+            final_url, r = _safe_redirect_loop("GET", u, timeout=timeout, headers=_cu_headers)
+            final = final_url
+            if r.status_code in _RETRYABLE_STATUS_CODES and attempt < _RETRY_ATTEMPTS - 1:
+                _log.warning("check_url attempt %d/%d got HTTP %d, retrying in %ds …", attempt + 1, _RETRY_ATTEMPTS, r.status_code, _RETRY_DELAY)
+                time.sleep(_RETRY_DELAY)
+                continue
+            return {
+                "reachable": 200 <= r.status_code < 400,
+                "status_code": r.status_code,
+                "final_url": final if final != u else None,
+            }
+        except SSRFBlocked as e:
+            return {"reachable": False, "status_code": None, "final_url": None, "error": str(e)}
         except (httpx.TimeoutException, httpx.RemoteProtocolError) as e:
             last_err = e
             if attempt < _RETRY_ATTEMPTS - 1:
@@ -605,34 +755,30 @@ def read_url(url: str, max_chars: int | None = 8000, timeout: float = 15.0, conf
             "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
             "Accept-Encoding": "gzip, deflate, br" if _BROTLI_AVAILABLE else "gzip, deflate",
         }
-        client_kwargs: dict[str, Any] = {
-            "timeout": timeout,
-            "follow_redirects": True,
-            "headers": headers,
-        }
-        if proxy_url:
-            client_kwargs["proxy"] = proxy_url
         last_err: Exception | None = None
         for attempt in range(_RETRY_ATTEMPTS):
             try:
-                with httpx.Client(**client_kwargs) as client:
-                    r = client.get(u)
-                    r.raise_for_status()
-                    content_type = r.headers.get("content-type", "")
-                    if "html" in content_type:
-                        text = _html_to_text(r.text)
-                    elif "json" in content_type:
-                        text = r.text
-                    elif content_type.startswith("text/"):
-                        text = r.text
-                    else:
-                        return {
-                            "ok": False,
-                            "content": "",
-                            "error": f"Unsupported content-type: {content_type}",
-                            "connection": connection_name,
-                        }
+                _final_url, r = _safe_redirect_loop(
+                    "GET", u, timeout=timeout, headers=headers, proxy=proxy_url,
+                )
+                r.raise_for_status()
+                content_type = r.headers.get("content-type", "")
+                if "html" in content_type:
+                    text = _html_to_text(r.text)
+                elif "json" in content_type:
+                    text = r.text
+                elif content_type.startswith("text/"):
+                    text = r.text
+                else:
+                    return {
+                        "ok": False,
+                        "content": "",
+                        "error": f"Unsupported content-type: {content_type}",
+                        "connection": connection_name,
+                    }
                 return {"ok": True, "content": fallback_note + _cache_and_trim(text), "connection": connection_name}
+            except SSRFBlocked as e:
+                return {"ok": False, "content": "", "error": str(e), "connection": connection_name}
             except (httpx.TimeoutException, httpx.RemoteProtocolError) as e:
                 # Kein Retry bei Timeouts — wenn die Seite nicht antwortet, hilft warten nicht
                 return {"ok": False, "content": "", "error": str(e), "connection": connection_name}
@@ -642,7 +788,7 @@ def read_url(url: str, max_chars: int | None = 8000, timeout: float = 15.0, conf
                     # Bot-Detection (Cloudflare etc.) → Safari-Impersonation als Fallback
                     _log.info("read_url: HTTP %d → retrying with curl_cffi Safari impersonation", e.response.status_code)
                     try:
-                        cr = _curl_requests.get(u, impersonate="safari17_0", timeout=timeout)
+                        cr = _curl_cffi_safe_get(u, impersonate="safari17_0", timeout=timeout)
                         if cr.status_code < 400:
                             ct = cr.headers.get("content-type", "")
                             if "html" in ct:
@@ -650,6 +796,8 @@ def read_url(url: str, max_chars: int | None = 8000, timeout: float = 15.0, conf
                             else:
                                 text = cr.text
                             return {"ok": True, "content": _cache_and_trim(text), "connection": connection_name}
+                    except SSRFBlocked as ce:
+                        return {"ok": False, "content": "", "error": str(ce), "connection": connection_name}
                     except Exception as ce:
                         _log.debug("read_url curl_cffi fallback failed: %s", ce)
                 if attempt < _RETRY_ATTEMPTS - 1 and e.response.status_code in _RETRYABLE_STATUS_CODES:
@@ -787,14 +935,22 @@ def download_file(
         return {"ok": True, "path": str(p), "bytes": total, "content_type": ctype, "connection": connection_name}
 
     last_err: Exception | None = None
-    client_kwargs: dict[str, Any] = {"timeout": timeout, "follow_redirects": True, "headers": headers}
+    # Resolve redirects manually with SSRF check on every hop, then stream final URL.
+    try:
+        final_url = _resolve_url_safely(u, timeout=timeout, headers=headers, proxy=proxy_url)
+    except SSRFBlocked as e:
+        return {"ok": False, "error": str(e), "connection": connection_name}
+    client_kwargs: dict[str, Any] = {"timeout": timeout, "follow_redirects": False, "headers": headers}
     if proxy_url:
         client_kwargs["proxy"] = proxy_url
 
     for attempt in range(_RETRY_ATTEMPTS):
         try:
             with httpx.Client(**client_kwargs) as client:
-                with client.stream("GET", u) as r:
+                with client.stream("GET", final_url) as r:
+                    if r.status_code in (301, 302, 303, 307, 308):
+                        # _resolve_url_safely should have eliminated these; if not, refuse.
+                        return {"ok": False, "error": "unresolved redirect after safe resolve", "connection": connection_name}
                     if r.status_code in (403, 429) and _CURL_CFFI_AVAILABLE:
                         _log.info("download_file: HTTP %d → curl_cffi Safari impersonation", r.status_code)
                         break  # break to curl_cffi fallback below
@@ -816,10 +972,10 @@ def download_file(
         except Exception as e:
             return {"ok": False, "error": str(e), "connection": connection_name}
 
-    # curl_cffi Fallback (TLS-fingerprint = Safari)
+    # curl_cffi Fallback (TLS-fingerprint = Safari) — manual redirect with SSRF check
     if _CURL_CFFI_AVAILABLE:
         try:
-            cr = _curl_requests.get(u, headers=headers, impersonate="safari17_0", timeout=timeout, allow_redirects=True)
+            cr = _curl_cffi_safe_get(final_url, impersonate="safari17_0", timeout=timeout, headers=headers)
             if cr.status_code < 400:
                 ctype = cr.headers.get("content-type", "application/octet-stream")
                 content = cr.content or b""
@@ -829,6 +985,8 @@ def download_file(
                     f.write(content)
                 return {"ok": True, "path": str(p), "bytes": len(content), "content_type": ctype, "connection": f"{connection_name}+curl_cffi"}
             return {"ok": False, "error": f"HTTP {cr.status_code} (curl_cffi)", "connection": connection_name}
+        except SSRFBlocked as ce:
+            return {"ok": False, "error": str(ce), "connection": connection_name}
         except Exception as ce:
             return {"ok": False, "error": f"curl_cffi failed: {ce}", "connection": connection_name}
     return {"ok": False, "error": str(last_err) if last_err else "unknown error", "connection": connection_name}
@@ -839,68 +997,29 @@ def download_file(
 # ---------------------------------------------------------------------------
 
 def _get_email_account(config: dict[str, Any], account: str | None = None) -> dict[str, Any] | None:
-    """Resolve email account from config. Supports three formats:
-    Format 1: email.accounts.{name}  (documented, multi-account)
-    Format 2: email.{name}.{...}     (nested by account name, e.g. email.main.email)
-    Format 3: email.address/email    (flat, single account — treated as 'main')
-    Also normalizes 'address' key to 'email' for consistency.
-    """
+    """Resolve email account from config. Canonical schema: email.accounts.{name} + email.default."""
     email_cfg = config.get("email") or {}
-    if not email_cfg:
-        return None
-
-    # Format 1: email.accounts.{name}
     accounts = email_cfg.get("accounts")
-    if accounts and isinstance(accounts, dict):
-        default = email_cfg.get("default", next(iter(accounts), None))
-        name = account or default
-        acc = accounts.get(name) if name else None
-        return _normalize_email_acc(acc) if acc else None
-
-    # Format 2: email.{name}.{...} (skip meta keys, look for dict values)
-    meta_keys = {"default", "accounts"}
-    account_keys = [k for k in email_cfg if k not in meta_keys and isinstance(email_cfg[k], dict)]
-    if account_keys:
-        default = email_cfg.get("default", account_keys[0])
-        name = account or default
-        acc = email_cfg.get(name)
-        return _normalize_email_acc(acc) if acc else None
-
-    # Format 3: flat — email.address or email.email directly (single account)
-    if email_cfg.get("address") or email_cfg.get("email") or email_cfg.get("username"):
-        return _normalize_email_acc(email_cfg)
-
-    return None
-
-
-def _normalize_email_acc(acc: dict[str, Any]) -> dict[str, Any]:
-    """Ensure the account dict has an 'email' key (normalize from 'address'/'username' if needed)."""
-    if "email" not in acc:
-        addr = acc.get("address") or acc.get("username") or ""
-        if addr:
-            acc = dict(acc)
-            acc["email"] = addr
+    if not accounts or not isinstance(accounts, dict):
+        return None
+    default = email_cfg.get("default") or next(iter(accounts), None)
+    name = account or default
+    acc = accounts.get(name) if name else None
+    if not acc or not isinstance(acc, dict):
+        return None
+    # Ensure 'email' key (config.py normalizes to 'username' — copy for SMTP/IMAP compat)
+    if "email" not in acc and acc.get("username"):
+        acc = {**acc, "email": acc["username"]}
     return acc
 
 
 def _get_email_account_names(config: dict[str, Any]) -> list[str]:
     """Return list of configured email account names."""
     email_cfg = config.get("email") or {}
-    if not email_cfg:
-        return []
-    # Format 1
     accounts = email_cfg.get("accounts")
-    if accounts and isinstance(accounts, dict):
-        return list(accounts.keys())
-    # Format 2
-    meta_keys = {"default", "accounts"}
-    account_keys = [k for k in email_cfg if k not in meta_keys and isinstance(email_cfg[k], dict)]
-    if account_keys:
-        return account_keys
-    # Format 3: flat single account
-    if email_cfg.get("address") or email_cfg.get("email") or email_cfg.get("username"):
-        return ["main"]
-    return []
+    if not accounts or not isinstance(accounts, dict):
+        return []
+    return list(accounts.keys())
 
 
 def send_email(config: dict[str, Any], to: str, subject: str, body: str, account: str | None = None) -> dict[str, Any]:
@@ -919,12 +1038,16 @@ def send_email(config: dict[str, Any], to: str, subject: str, body: str, account
         return {"ok": False, "error": "Email account missing 'email'/'username' or 'password'."}
 
     # Sanitize headers against injection (strip newlines/carriage returns)
-    to = to.replace("\n", "").replace("\r", "")
-    subject = subject.replace("\n", "").replace("\r", "")
+    def _strip_crlf(s: str) -> str:
+        return (s or "").replace("\n", "").replace("\r", "")
+    to = _strip_crlf(to)
+    subject = _strip_crlf(subject)
+    sender_clean = _strip_crlf(sender)
+    name_raw = _strip_crlf(str(acc.get("name") or ""))
 
     try:
         msg = MIMEMultipart()
-        msg["From"] = acc.get("name", sender) + f" <{sender}>" if acc.get("name") else sender
+        msg["From"] = f"{name_raw} <{sender_clean}>" if name_raw else sender_clean
         msg["To"] = to
         msg["Subject"] = subject
         msg.attach(MIMEText(body, "plain", "utf-8"))
@@ -974,6 +1097,16 @@ def read_email(
     password = acc.get("password", "")
     if not sender or not password:
         return {"ok": False, "error": "Email account missing credentials.", "emails": []}
+
+    # IMAP-Argumente defensiv prüfen (auch wenn Agent-controlled — verhindert Halluzinations-Schaden).
+    # Folder: nur Buchstaben/Zahlen/Punkt/Slash/Bindestrich/Unterstrich/Leerzeichen, max 64 Zeichen.
+    if not isinstance(folder, str) or not re.match(r"^[A-Za-z0-9._/ \-]{1,64}$", folder):
+        return {"ok": False, "error": f"invalid folder name: {folder!r}", "emails": []}
+    # Filter: nur IMAP-Standard-Schlüsselwörter + simple Argumente. Keine CRLF/Quotes.
+    if not isinstance(filter_criteria, str) or "\r" in filter_criteria or "\n" in filter_criteria:
+        return {"ok": False, "error": "invalid filter_criteria (CRLF)", "emails": []}
+    if len(filter_criteria) > 256 or not re.match(r"^[A-Za-z0-9 _.@\-:/+()<>=*]+$", filter_criteria):
+        return {"ok": False, "error": f"invalid filter_criteria: {filter_criteria!r}", "emails": []}
 
     try:
         imap_server = acc.get("imap_server", "imap.gmail.com")

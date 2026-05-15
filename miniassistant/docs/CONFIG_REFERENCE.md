@@ -149,11 +149,19 @@ voice:
   stt:
     url: tcp://localhost:10300          # Wyoming STT server (e.g. faster-whisper)
   tts:
-    url: tcp://localhost:10200          # Wyoming TTS server (e.g. Piper)
-    # url: http://localhost:8880        # or HTTP API (Kokoro, LocalAI/VibeVoice)
-    # model: vibevoice                  # TTS model name (optional, default: kokoro)
+    url: tcp://localhost:10200          # Wyoming TTS (Piper) | http://host:8880 (OpenAI-compat) | http://host:8004/tts (Chatterbox-native)
+    # model: vibevoice                  # TTS model name (OpenAI-compat path; also llama-swap routing key)
+    # response_format: wav              # wav|mp3|opus (mapped to output_format on /tts)
+    # seed: 42                          # >0 = reproducible voice (Chatterbox)
+    # voice_mode: clone                 # Chatterbox /tts: "predefined" or "clone"
+    # cfg_weight: 0.6                   # Chatterbox /tts only
+    # exaggeration: 1.4                 # Chatterbox /tts only
+    # temperature: 1.0                  # Chatterbox /tts only
+    # chunk_size: 240                   # Chatterbox /tts only
+    # split_text: true                  # Chatterbox /tts only
+    # speed: 1.0                        # speed_factor on /tts, speed on OpenAI-compat
   language: de                          # STT + TTS language (default: de)
-  tts_voice: de_DE-thorsten-medium      # Voice name (optional)
+  tts_voice: de_DE-thorsten-medium      # Voice name (predefined_voice_id / reference_audio_filename for Chatterbox)
 
 avatar: "~/.config/miniassistant/agent/avatar.png"  # Bot profile picture (path or URL)
 

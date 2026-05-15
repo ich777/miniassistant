@@ -226,8 +226,9 @@ def _persistence_section(config: dict[str, Any]) -> str:
             f"- `chat_clients.matrix` / `chat_clients.discord` — chat bot connections (Matrix, Discord) — **NOT email**\n"
             f"- `email` — email accounts (IMAP/SMTP) — **completely separate from chat_clients**\n\n"
             f"**Rules:**\n"
-            f"- **Trigger phrases:** When the user says 'merk dir', 'speicher dir', 'remember', 'save', 'notier dir' → "
-            f"write a `.md` file to `{prefs_path}/` via `exec`. Filename = topic (e.g. `wetter.md`, `backup.md`).\n"
+            f"- **Only save when the user explicitly asks** — 'merk dir', 'speicher dir', 'remember', 'save', 'notier dir'. "
+            f"Write a `.md` file to `{prefs_path}/` via `exec`. Filename = topic (e.g. `wetter.md`, `backup.md`).\n"
+            f"- **Never save anything that's already in your system prompt** (rules, instructions, identity, behavior notes). Only save NEW user facts.\n"
             f"- `save_config` is **ONLY** for system config. **NEVER** use it for user preferences.\n"
             f"- Prefs are plain Markdown. They are loaded into your system prompt at session start (see \"Stored preferences\" above) — every line costs context tokens.\n"
             f"- **Keep prefs short:** Only key facts, key-value style (e.g. `Ort: Lunz am See`). No long explanations, no full instructions. Max 5-10 lines per file.\n"
@@ -422,6 +423,21 @@ def _language_from_identity_md(identity_md: str) -> str:
     return ""
 
 
+def _strip_language_from_identity(identity_md: str) -> str:
+    """Entfernt jede 'Response language: X' / 'language: X' / 'Sprache: X' Stelle aus IDENTITY,
+    damit sie nicht mit dem Detection-Header kollidiert wenn respond_in_input_language aktiv ist."""
+    if not (identity_md or "").strip():
+        return identity_md
+    import re
+    # In-line entfernen ('. Response language: **Deutsch**' \u2192 '.')
+    return re.sub(
+        r"\.?\s*(?:Response\s+language|Language|Sprache)\s*[:\-]\s*\*{0,2}[A-Za-z\u00C0-\u024F]+\*{0,2}\.?",
+        "",
+        identity_md,
+        flags=re.IGNORECASE,
+    ).strip()
+
+
 def _filter_language_blocks(rule: str, lang: str) -> str:
     """Keep <!-- IF:{lang} --> blocks matching *lang*, remove all others."""
     import re
@@ -441,10 +457,22 @@ def _language_section(config: dict[str, Any], identity_md_content: str = "") -> 
     """Response language: config.respond_in_input_language > IDENTITY.md > default Deutsch."""
     if config.get("respond_in_input_language"):
         rule = _get_rule("language.md")
-        header = "## Language\nDetect the language of the user's message and always respond in that same language. Do not switch languages unless the user explicitly asks for it.\n\n"
+        header = (
+            "## Language\n"
+            "**Reply in the language of the user's latest message.** The rest of this system prompt is German; that is NOT your reply language.\n\n"
+        )
         if rule:
+            # Drop language.md's "## Language" preamble (hardcodes Deutsch default) and IF:Deutsch blocks.
             rule = _filter_language_blocks(rule, "")
-            return header + rule + "\n\n"
+            import re as _re
+            rule = _re.sub(
+                r"^\s*##\s*Language\s*\n.*?(?=\n##\s|\Z)",
+                "",
+                rule,
+                count=1,
+                flags=_re.DOTALL,
+            )
+            return header + rule.strip() + "\n\n"
         return header
     lang = _language_from_identity_md(identity_md_content) or "Deutsch"
     rule = _get_rule("language.md")
@@ -578,6 +606,19 @@ def _tools_section(config: dict[str, Any]) -> str:
         lines.append(
             "- **Waiting:** need result in this session ≤10 min → `wait`. "
             "Background task, notify when done → `watch`. Future or recurring → `schedule`."
+        )
+    wh_cfg = config.get("webhooks")
+    if isinstance(wh_cfg, dict) and wh_cfg.get("enabled"):
+        lines.append(
+            "- **Webhooks:** external HTTP triggers for autonomous tasks. "
+            "Use `webhook` tool (actions: create, list, remove, info, last_output). "
+            "Each webhook has a fixed default prompt; callers add `extra_context` per HTTP call. "
+            "**Before creating a webhook, ASK the user for any missing essentials**: default prompt (or 'open' = caller-supplied each call), target (matrix room / discord channel / silent / none), optional name. "
+            "Do NOT invent a name or pick a target on your own — confirm first. "
+            "Default prompt is OPTIONAL — empty = open webhook (every POST must carry its own `prompt`). "
+            "When writing prompts: never say 'send it' / 'post it' / 'reply via matrix' — the bot's response text is auto-delivered, no send_*-tools needed. Describe WHAT to produce. "
+            "After create: show the token + POST URL exactly once and a one-line curl example. "
+            f"Read `{docs_prefix}WEBHOOKS.md` for body schema, silent mode, GET endpoints, security."
         )
     lines.append(
         "- `save_config`: **only for system config** (see Persistence section). Pass only keys to change (deep-merged). After saving, tell the user to restart **miniassistant**.\n"
@@ -910,7 +951,7 @@ def build_system_prompt(
         + "\n\nDo not mention being an AI, the user knows. Be focused and factual.",
         "",
         "## IDENTITY (your identity)",
-        files.get("IDENTITY.md", ""),
+        (_strip_language_from_identity(files.get("IDENTITY.md", "")) if config.get("respond_in_input_language") else files.get("IDENTITY.md", "")),
         "",
         "## Environment",
         _tools_umgebung_section(files.get("TOOLS.md", ""), config),

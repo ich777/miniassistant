@@ -20,15 +20,31 @@ Read this section before using `send_audio` or replying to `[Voice]` messages.
 
 | Written form | Spoken form |
 |---|---|
-| Number ranges: `10-20` | `10 bis 20` (compounds like `E-Mail` stay) |
+| Decimal comma: `3,5` / `0,25` | `3 Komma 5` / `0 Komma 25` (German decimal separator — never leave bare `,` in numbers) |
+| Number ranges: `10-20` / `Mo-Fr` / `8-17 Uhr` | `10 bis 20` / `Montag bis Freitag` / `8 bis 17 Uhr` (any `-` between two values = `bis`. Compounds like `E-Mail`, `WLAN-Passwort` stay) |
 | Times: `14:30` | `14 Uhr 30` |
-| Slashes: `km/h` | `Kilometer pro Stunde` |
-| `und/oder` | `und oder` |
+| Ordinals (dates): `12. Mai` / `am 1. Januar` / `3. Stock` | `zwölfter Mai` / `am ersten Januar` / `dritter Stock` (digit + `.` after number = ordinal — spell out: 1.→erster, 2.→zweiter, 3.→dritter, 4.→vierter, 5.→fünfter, 6.→sechster, 7.→siebter, 8.→achter, 9.→neunter, 10.→zehnter, 11.→elfter, 12.→zwölfter, 13.→dreizehnter, 20.→zwanzigster, 21.→einundzwanzigster, 30.→dreißigster, 31.→einunddreißigster. Adjust ending by case: "am 12." → "am zwölften") |
+| Temperature: `20°C` / `-5°C` / `68°F` | `20 Grad Celsius` / `minus 5 Grad Celsius` / `68 Grad Fahrenheit` |
+| Speed: `km/h` / `m/s` / `mph` | `Kilometer pro Stunde` / `Meter pro Sekunde` / `Meilen pro Stunde` |
+| Length: `km` / `m` / `cm` / `mm` | `Kilometer` / `Meter` / `Zentimeter` / `Millimeter` |
+| Weight: `kg` / `g` / `mg` / `t` | `Kilogramm` / `Gramm` / `Milligramm` / `Tonnen` |
+| Volume: `l` / `ml` / `hl` | `Liter` / `Milliliter` / `Hektoliter` |
+| Area: `m²` / `km²` / `ha` | `Quadratmeter` / `Quadratkilometer` / `Hektar` |
+| Volume³: `m³` / `cm³` | `Kubikmeter` / `Kubikzentimeter` |
+| Power/Energy: `W` / `kW` / `kWh` / `PS` | `Watt` / `Kilowatt` / `Kilowattstunden` / `PS` |
+| Data: `MB` / `GB` / `TB` / `Mbit/s` | `Megabyte` / `Gigabyte` / `Terabyte` / `Megabit pro Sekunde` |
+| Currency: `€` / `$` / `CHF` / `12,50 €` | `Euro` / `Dollar` / `Schweizer Franken` / `12 Euro 50` |
+| Percent: `25%` / `0,5%` | `25 Prozent` / `0 Komma 5 Prozent` |
+| Slashes (general): `und/oder` | `und oder` |
 | `z.B.` | `zum Beispiel` |
 | `d.h.` | `das heisst` |
 | `ca.` | `circa` |
 | `usw.` | `und so weiter` |
+| `bzw.` | `beziehungsweise` |
+| `etc.` | `et cetera` |
 | Numbered lists: `1. ... 2. ...` | `Erstens ... Zweitens ...` |
+
+**Rule of thumb:** if a symbol (`,` `-` `°` `/` `%` `€`) sits between or after digits, expand it to a German word. Never let the TTS see a bare symbol next to a number.
 
 Tables and code blocks are automatically extracted and sent as separate text message.
 
@@ -83,10 +99,41 @@ voice:
     url: http://localhost:8080/tts
     model: vibevoice
     voice: Emma
+
+# Chatterbox-TTS-Server (native /tts endpoint):
+# llama-swap healthcheck: use `checkEndpoint: /v1/audio/voices` (tagged
+# "llama-swap Compatible" by chatterbox itself). NOT `/health` — doesn't exist.
+# `/` works but renders HTML every probe.
+voice:
+  tts:
+    url: http://localhost:8004/tts
+    # Behind llama-swap: use /upstream/<model-name>/tts so swap can route by path:
+    # url: http://swap-host:8080/upstream/chatterbox-multilingual/tts
+    voice: siri.wav
+    voice_mode: clone           # or "predefined"
+    language: de
+    cfg_weight: 0.6
+    exaggeration: 1.4
+    temperature: 1.0
+    chunk_size: 240
+    split_text: true
+    seed: 42                    # set >0 for stable cloned voice
+    response_format: wav        # → output_format
+
+# Chatterbox via OpenAI-compat endpoint (limited params):
+voice:
+  tts:
+    url: http://localhost:8004/v1/audio/speech
+    model: chatterbox-multilingual
+    voice: siri.wav
+    seed: 42                    # only: model, voice, response_format, speed, seed accepted
 ```
 
-Backend auto-detected from URL scheme: `tcp://` = Wyoming/Piper, `http://` = HTTP API.
-HTTP without path appends `/v1/audio/speech`. HTTP with path is used as-is.
+Backend auto-detected from URL scheme + path:
+- `tcp://` / `wyoming://` → Wyoming/Piper
+- HTTP path ends `/tts` → Chatterbox-native (`CustomTTSRequest`), forwards `voice_mode`, `cfg_weight`, `exaggeration`, `temperature`, `chunk_size`, `split_text`, `seed`, `speed_factor`, `language`
+- HTTP path ends `/audio/speech` or no path → OpenAI-compat. Only `model`, `voice`, `response_format`, `speed`, `seed`, `language` forwarded — extra keys are silently dropped by the server.
+
 Restart after config changes.
 
 ## How it works

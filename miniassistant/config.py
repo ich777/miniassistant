@@ -175,20 +175,48 @@ def get_voice_tts_language(config: dict[str, Any]) -> str | None:
     return (voice.get("tts") or {}).get("language") or voice.get("language") or None
 
 
-def get_voice_tts_options(config: dict[str, Any]) -> dict[str, float]:
-    """Synthesis-Optionen für Wyoming TTS aus config.voice.tts.*
+def get_voice_tts_options(config: dict[str, Any]) -> dict[str, Any]:
+    """Synthesis-Optionen für TTS aus config.voice.tts.*
     Gibt nur gesetzte Werte zurück (keine Defaults — der Server verwendet seine eigenen Defaults).
-    Keys: noise_scale, noise_w, length_scale, sentence_silence
+
+    Wyoming/Piper-Keys (float): noise_scale, noise_w, length_scale, sentence_silence
+    OpenAI-compat/Chatterbox-Keys: seed (int), speed (float), response_format (str)
+    Chatterbox-native-Keys (HTTP-Pfad /tts): voice_mode (str), cfg_weight (float),
+        exaggeration (float), temperature (float), chunk_size (int), split_text (bool),
+        speed_factor (float)
+    Unbekannte Server ignorieren ihre fremden Felder — Forwarding ist gefahrlos.
     """
     tts = (config.get("voice") or {}).get("tts") or {}
-    opts: dict[str, float] = {}
-    for key in ("noise_scale", "noise_w", "length_scale", "sentence_silence"):
+    opts: dict[str, Any] = {}
+    float_keys = (
+        "noise_scale", "noise_w", "length_scale", "sentence_silence",
+        "speed", "speed_factor", "cfg_weight", "exaggeration", "temperature",
+    )
+    int_keys = ("seed", "chunk_size")
+    str_keys = ("response_format", "voice_mode")
+    bool_keys = ("split_text",)
+    for key in float_keys:
         val = tts.get(key)
         if val is not None:
             try:
                 opts[key] = float(val)
             except (TypeError, ValueError):
                 pass
+    for key in int_keys:
+        val = tts.get(key)
+        if val is not None:
+            try:
+                opts[key] = int(val)
+            except (TypeError, ValueError):
+                pass
+    for key in str_keys:
+        val = tts.get(key)
+        if val is not None:
+            opts[key] = str(val)
+    for key in bool_keys:
+        val = tts.get(key)
+        if val is not None:
+            opts[key] = bool(val)
     return opts
 
 
@@ -351,25 +379,16 @@ def _default_config() -> dict[str, Any]:
 
 
 def _normalize_matrix(matrix: Any) -> dict[str, Any] | None:
-    """Matrix-Config: enabled, homeserver, bot_name, user_id, token, device_id (optional), encrypted_rooms (bool).
-    Akzeptiert auch häufige Alias-Feldnamen (access_token → token, homeserver_url → homeserver, enable_e2ee → encrypted_rooms)."""
+    """Matrix-Config: enabled, homeserver, bot_name, user_id, token, device_id (optional), encrypted_rooms (bool)."""
     if not matrix or not isinstance(matrix, dict):
         return None
     m = matrix
-    # Alias-Migration: häufige falsche Feldnamen akzeptieren
-    homeserver = (m.get("homeserver") or m.get("homeserver_url") or "").strip()
-    token = (m.get("token") or m.get("access_token") or "").strip()
+    homeserver = (m.get("homeserver") or "").strip()
+    token = (m.get("token") or "").strip()
     if not homeserver or not token:
         return None
     user_id = (m.get("user_id") or "").strip() or None
-    # encrypted_rooms: auch enable_e2ee / e2ee / encryption akzeptieren
     encrypted_rooms = m.get("encrypted_rooms")
-    if encrypted_rooms is None:
-        encrypted_rooms = m.get("enable_e2ee")
-    if encrypted_rooms is None:
-        encrypted_rooms = m.get("e2ee")
-    if encrypted_rooms is None:
-        encrypted_rooms = m.get("encryption")
     if encrypted_rooms is None:
         encrypted_rooms = True
     return {
@@ -399,26 +418,19 @@ def _normalize_discord(discord: Any) -> dict[str, Any] | None:
 
 
 def _normalize_email_account(raw: Any) -> dict[str, Any] | None:
-    """Ein einzelnes E-Mail-Konto normalisieren. Akzeptiert gängige Alias-Feldnamen."""
+    """Ein einzelnes E-Mail-Konto normalisieren."""
     if not raw or not isinstance(raw, dict):
         return None
-    # username: accept address/email as aliases
-    username = (raw.get("username") or raw.get("address") or raw.get("email") or "").strip()
+    username = (raw.get("username") or "").strip()
     password = (raw.get("password") or "").strip()
     if not username or not password:
         return None
-    # nested smtp/imap dicts auflösen (z.B. smtp: {server: ..., port: ...})
-    smtp = raw.get("smtp") if isinstance(raw.get("smtp"), dict) else {}
-    imap = raw.get("imap") if isinstance(raw.get("imap"), dict) else {}
-    # ssl: accept ssl_tls/tls as aliases
-    ssl_val = raw.get("ssl") if raw.get("ssl") is not None else (
-        raw.get("ssl_tls") if raw.get("ssl_tls") is not None else raw.get("tls")
-    )
+    ssl_val = raw.get("ssl")
     return {
-        "imap_server": (raw.get("imap_server") or imap.get("server") or "").strip(),
-        "imap_port": int(raw.get("imap_port") or imap.get("port") or 993),
-        "smtp_server": (raw.get("smtp_server") or smtp.get("server") or "").strip(),
-        "smtp_port": int(raw.get("smtp_port") or smtp.get("port") or 587),
+        "imap_server": (raw.get("imap_server") or "").strip(),
+        "imap_port": int(raw.get("imap_port") or 993),
+        "smtp_server": (raw.get("smtp_server") or "").strip(),
+        "smtp_port": int(raw.get("smtp_port") or 587),
         "username": username,
         "password": password,
         "ssl": bool(ssl_val if ssl_val is not None else True),
@@ -432,14 +444,8 @@ def _normalize_email(data: dict[str, Any]) -> dict[str, Any] | None:
     if not raw or not isinstance(raw, dict):
         return None
     accounts_raw = raw.get("accounts") or {}
-    # Fallback 1: accounts direkt unter email (fehlendes 'accounts:'-Level)
-    if not accounts_raw:
-        accounts_raw = {k: v for k, v in raw.items() if k != "default" and isinstance(v, dict)}
-    # Fallback 2: flat single account (email.address/email/username directly, no account name)
-    if not accounts_raw:
-        acc = _normalize_email_account(raw)
-        if acc:
-            return {"accounts": {"main": acc}, "default": "main"}
+    if not isinstance(accounts_raw, dict) or not accounts_raw:
+        return None
     accounts: dict[str, Any] = {}
     for k, v in accounts_raw.items():
         if not k or not isinstance(k, str):
@@ -455,17 +461,33 @@ def _normalize_email(data: dict[str, Any]) -> dict[str, Any] | None:
     return {"accounts": accounts, "default": default}
 
 
+def _normalize_webhooks_cfg(raw: Any) -> dict[str, Any] | bool:
+    """Normalize webhooks: section. Returns False when disabled, dict otherwise.
+    Defaults: enabled=False, rate_limit_per_min=10, output_keep_last=10, parallel=True, max_retries=3.
+    """
+    if raw is None or raw is False:
+        return False
+    if raw is True:
+        raw = {"enabled": True}
+    if not isinstance(raw, dict):
+        return False
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "rate_limit_per_min": int(raw.get("rate_limit_per_min", 10) or 10),
+        "output_keep_last": int(raw.get("output_keep_last", 10) or 0),
+        "parallel": bool(raw.get("parallel", True)),
+        "max_retries": int(raw.get("max_retries", 3) or 3),
+    }
+
+
 def _normalize_chat_clients(data: dict[str, Any]) -> dict[str, Any]:
-    """Normalisiert chat_clients; migriert top-level matrix: automatisch."""
+    """Normalisiert chat_clients."""
     cc = data.get("chat_clients") or {}
     if not isinstance(cc, dict):
         cc = {}
-    # Abwärtskompatibilität: top-level matrix: → chat_clients.matrix
-    matrix_raw = cc.get("matrix") or data.get("matrix")
-    discord_raw = cc.get("discord") or data.get("discord")
     return {
-        "matrix": _normalize_matrix(matrix_raw),
-        "discord": _normalize_discord(discord_raw),
+        "matrix": _normalize_matrix(cc.get("matrix")),
+        "discord": _normalize_discord(cc.get("discord")),
     }
 
 
@@ -603,8 +625,8 @@ def _merge_with_defaults(data: dict[str, Any]) -> dict[str, Any]:
         "default_search_engine": _default_search_engine_merged(data),
         "max_chars_per_file": data.get("max_chars_per_file", DEFAULT_MAX_CHARS_PER_FILE),
         "scheduler": data.get("scheduler") if data.get("scheduler") else False,  # false | { enabled: true }
+        "webhooks": _normalize_webhooks_cfg(data.get("webhooks")),
         "chat_clients": _normalize_chat_clients(data),
-        "matrix": _normalize_chat_clients(data).get("matrix"),  # Alias für Abwärtskompatibilität
         "onboarding_complete": bool(data.get("onboarding_complete", False)),  # erst true nach Speichern in UI oder CLI config
         "memory": {
             "enabled": bool((data.get("memory") or {}).get("enabled", True)),
@@ -727,6 +749,7 @@ def save_config(config: dict[str, Any], project_dir: str | None = None) -> Path:
         "default_search_engine": config.get("default_search_engine"),
         "max_chars_per_file": config.get("max_chars_per_file", DEFAULT_MAX_CHARS_PER_FILE),
         "scheduler": config.get("scheduler") or False,
+        "webhooks": config.get("webhooks") or False,
         "chat_clients": {k: v for k, v in _normalize_chat_clients(config).items() if v} or False,
         "onboarding_complete": bool(config.get("onboarding_complete", False)),
         "memory": {
@@ -772,39 +795,24 @@ def save_config(config: dict[str, Any], project_dir: str | None = None) -> Path:
         _v = config.get(_k)
         if _v is not None:
             out[_k] = _v
-    # Auto-Migration: email unter chat_clients.* → top-level email:
-    cc_raw = config.get("chat_clients") or {}
-    if not config.get("email"):
-        for _client_cfg in cc_raw.values():
-            if isinstance(_client_cfg, dict) and isinstance(_client_cfg.get("email"), dict):
-                _acc = _normalize_email_account(_client_cfg["email"])
-                if _acc:
-                    config = {**config, "email": {"accounts": {"main": _acc}, "default": "main"}}
-                    break
     email_norm = _normalize_email(config)
     if email_norm:
         out["email"] = email_norm
     # Atomarer Schreibvorgang: erst temp-Datei, dann os.replace() (POSIX-atomar)
     # Verhindert halb-geschriebene Config bei parallelem Start (z.B. serve + token)
+    fd, tmp_str = tempfile.mkstemp(dir=path.parent, prefix=".config_tmp_", suffix=".yaml")
+    tmp = Path(tmp_str)
     try:
-        fd, tmp_str = tempfile.mkstemp(dir=path.parent, prefix=".config_tmp_", suffix=".yaml")
-        tmp = Path(tmp_str)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                yaml.safe_dump(out, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-            tmp.chmod(0o600)
-            os.replace(tmp, path)
-        except Exception:
-            try:
-                tmp.unlink(missing_ok=True)
-            except Exception:
-                pass
-            raise
-    except Exception:
-        # Fallback auf direktes Schreiben wenn temp-Datei nicht möglich
-        with open(path, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             yaml.safe_dump(out, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-        path.chmod(0o600)
+        tmp.chmod(0o600)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
     invalidate_config_cache()
     return path
 

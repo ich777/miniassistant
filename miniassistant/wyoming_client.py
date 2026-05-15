@@ -145,39 +145,90 @@ def _synthesize_http(
     voice: str | None = None,
     model: str | None = None,
     language: str | None = None,
+    **opts: Any,
 ) -> bytes:
-    """TTS via HTTP API (Kokoro-FastAPI, LocalAI/VibeVoice o.ä.).
+    """TTS via HTTP API.
 
-    URL-Logik:
-      - URL mit Pfad (z.B. http://host:8080/tts) → direkt verwenden
-      - URL ohne Pfad (z.B. http://host:8880)    → /v1/audio/speech anhängen
-    Body: {"model": MODEL, "voice": VOICE, "input": TEXT, "response_format": "wav"}
-    Optional: "language" (z.B. für VibeVoice via LocalAI).
-    Antwort: rohe WAV-Bytes.
+    Zwei Body-Schemas, automatisch nach URL-Pfad gewählt:
+
+      Pfad endet auf `/tts`          → Chatterbox-native (CustomTTSRequest)
+                                       Felder: text, voice_mode, predefined_voice_id /
+                                       reference_audio_filename, output_format, split_text,
+                                       chunk_size, temperature, exaggeration, cfg_weight,
+                                       seed, speed_factor, language
+      Pfad endet auf `/audio/speech` → OpenAI-compat (Kokoro-FastAPI, Chatterbox-OpenAI,
+                                       LocalAI/VibeVoice). Felder: model, input, voice,
+                                       response_format, speed, seed, language
+      kein Pfad                      → /v1/audio/speech anhängen, OpenAI-compat
+
+    Unbekannte Keys in `opts` werden je Pfad gefiltert und weitergegeben.
+    Antwort: rohe Audio-Bytes (WAV by default).
     """
     import httpx as _httpx
     from urllib.parse import urlparse as _urlparse
     _path = _urlparse(url).path.rstrip("/")
-    # URL hat bereits einen spezifischen Pfad (z.B. /tts, /api/v1/tts) → direkt nutzen
-    # Nur reiner Host ohne Pfad (z.B. http://host:8880) → /v1/audio/speech anhängen
     if _path and _path != "/":
         endpoint = url.rstrip("/")
     else:
         endpoint = url.rstrip("/") + "/v1/audio/speech"
-    payload: dict[str, Any] = {
-        "model": model or "kokoro",
-        "input": text,
-        "response_format": "wav",
-    }
-    if voice:
-        payload["voice"] = voice
-    if language:
-        payload["language"] = language
-    _log.info("HTTP TTS: %d Zeichen → %s (model=%s, voice=%s, lang=%s)", len(text), endpoint, payload["model"], voice or "default", language or "-")
+
+    is_chatterbox_native = endpoint.endswith("/tts")
+
+    if is_chatterbox_native:
+        # Chatterbox CustomTTSRequest
+        voice_mode = str(opts.get("voice_mode") or "predefined")
+        payload: dict[str, Any] = {
+            "text": text,
+            "voice_mode": voice_mode,
+            "output_format": str(opts.get("response_format") or "wav"),
+        }
+        if voice:
+            if voice_mode == "clone":
+                payload["reference_audio_filename"] = voice
+            else:
+                payload["predefined_voice_id"] = voice
+        if language:
+            payload["language"] = language
+        # Float/Int/Bool-Forwards (nur wenn gesetzt)
+        for key in ("temperature", "exaggeration", "cfg_weight", "speed_factor"):
+            if opts.get(key) is not None:
+                payload[key] = float(opts[key])
+        # speed → speed_factor Alias (OpenAI-Stil → native)
+        if "speed_factor" not in payload and opts.get("speed") is not None:
+            payload["speed_factor"] = float(opts["speed"])
+        for key in ("seed", "chunk_size"):
+            if opts.get(key) is not None:
+                payload[key] = int(opts[key])
+        if opts.get("split_text") is not None:
+            payload["split_text"] = bool(opts["split_text"])
+        _log.info(
+            "HTTP TTS (chatterbox-native): %d Zeichen → %s (mode=%s, voice=%s, lang=%s)",
+            len(text), endpoint, voice_mode, voice or "default", language or "-",
+        )
+    else:
+        # OpenAI-compat (Kokoro, Chatterbox-OpenAI, LocalAI)
+        payload = {
+            "model": model or "kokoro",
+            "input": text,
+            "response_format": str(opts.get("response_format") or "wav"),
+        }
+        if voice:
+            payload["voice"] = voice
+        if language:
+            payload["language"] = language
+        if opts.get("speed") is not None:
+            payload["speed"] = float(opts["speed"])
+        if opts.get("seed") is not None:
+            payload["seed"] = int(opts["seed"])
+        _log.info(
+            "HTTP TTS (openai-compat): %d Zeichen → %s (model=%s, voice=%s, lang=%s)",
+            len(text), endpoint, payload["model"], voice or "default", language or "-",
+        )
+
     resp = _httpx.post(endpoint, json=payload, timeout=120.0)
     resp.raise_for_status()
     wav = resp.content
-    _log.info("HTTP TTS: %d bytes WAV empfangen", len(wav))
+    _log.info("HTTP TTS: %d bytes Audio empfangen", len(wav))
     return wav
 
 
@@ -191,19 +242,22 @@ def synthesize(
     sentence_silence: float | None = None,
     model: str | None = None,
     language: str | None = None,
+    **opts: Any,
 ) -> bytes:
     """Synthetisiert Text zu WAV-Audio.
 
     URL-Schema bestimmt das Backend:
-      http:// / https://  → HTTP OpenAI-compat API (Kokoro-FastAPI, LocalAI/VibeVoice o.ä.)
+      http:// / https://  → HTTP API (siehe _synthesize_http für die zwei Body-Schemas)
       tcp:// / wyoming:// → Wyoming TCP-Protokoll (Piper)
 
-    HTTP-spezifische Optionen: model, language
+    HTTP-spezifische Optionen kommen via **opts durch (z.B. seed, speed,
+    voice_mode, cfg_weight, exaggeration, temperature, chunk_size, split_text,
+    response_format) — werden je nach Endpoint gefiltert.
     Piper-spezifische Optionen (Wyoming only):
       noise_scale, noise_w, length_scale, sentence_silence
     """
     if url.startswith("http://") or url.startswith("https://"):
-        return _synthesize_http(text, url, voice=voice, model=model, language=language)
+        return _synthesize_http(text, url, voice=voice, model=model, language=language, **opts)
 
     _log.info("Wyoming TTS: %d Zeichen → %s", len(text), url)
     host, port = _parse_url(url)

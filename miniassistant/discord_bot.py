@@ -142,7 +142,7 @@ async def run_discord_bot(config: dict[str, Any]) -> None:
         )
         return
 
-    discord_cfg = (config.get("chat_clients") or {}).get("discord") or config.get("discord")
+    discord_cfg = (config.get("chat_clients") or {}).get("discord")
     if not discord_cfg or not discord_cfg.get("bot_token"):
         return
     if not discord_cfg.get("enabled", True):
@@ -152,9 +152,10 @@ async def run_discord_bot(config: dict[str, Any]) -> None:
     bot_token = discord_cfg["bot_token"]
 
     from miniassistant.chat_auth import get_or_generate_code, is_authorized
+    from miniassistant.chat_loop import SessionLRU
 
-    # Sessions pro Discord-User
-    discord_sessions: dict[str, Any] = {}
+    # Sessions pro (channel, discord_user) — LRU mit Cap, sonst wachsen sie unbegrenzt
+    discord_sessions: Any = SessionLRU(max_size=200)
     # Pending Images: User hat Bild ohne Text geschickt → nächste Textnachricht bekommt das Bild
     _pending_images: dict[str, list[dict[str, Any]]] = {}
 
@@ -322,7 +323,7 @@ async def run_discord_bot(config: dict[str, Any]) -> None:
         config_dir = config.get("_config_dir")
         if not is_authorized("discord", sender_id, config_dir):
             code = get_or_generate_code("discord", sender_id, config_dir)
-            logger.info("Discord: Auth-Code an %s gesendet: %s", sender_id, code)
+            logger.info("Discord: Auth-Code an %s gesendet (Code redacted)", sender_id)
             await message.reply(
                 f"Du bist noch nicht freigeschaltet. Dein Auth-Code: **{code}**\n\n"
                 f"Gib in der Web-UI ein: `/auth discord {code}`"

@@ -1,14 +1,13 @@
 """
 Plattform-übergreifendes Auth-System für Chat-Clients (Matrix, Discord, …).
 Speichert ausstehende Codes und autorisierte Nutzer unter config/auth/.
-Migriert automatisch alte Daten aus config/matrix/.
 """
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import secrets
-import shutil
 import tempfile
 import threading
 import time
@@ -24,16 +23,11 @@ _MAX_FAILED_ATTEMPTS = 5
 _RATE_LIMIT_WINDOW = 60  # seconds
 _failed_attempts: dict[str, list[float]] = {}  # key → list of timestamps
 
-_migration_done = False
 _auth_file_lock = threading.Lock()  # Schützt Read-Modify-Write auf JSON-Dateien
 
 
 def _auth_dir(config_dir: str | None = None) -> Path:
     """Auth-Verzeichnis: config_dir/auth wenn angegeben (gleiche Config wie die App), sonst get_config_dir()/auth."""
-    global _migration_done
-    if not _migration_done:
-        _migrate_from_matrix()
-        _migration_done = True
     if config_dir and str(config_dir).strip():
         d = Path(config_dir).expanduser().resolve() / "auth"
     else:
@@ -48,61 +42,6 @@ def _pending_path(config_dir: str | None = None) -> Path:
 
 def _authorized_path(config_dir: str | None = None) -> Path:
     return _auth_dir(config_dir) / "authorized.json"
-
-
-def _migrate_from_matrix() -> None:
-    """Einmalig: Daten von config/matrix/ nach config/auth/ migrieren."""
-    root = Path(get_config_dir()).expanduser().resolve()
-    old_dir = root / "matrix"
-    new_dir = root / "auth"
-    # Alte pending codes migrieren
-    old_pending = old_dir / "matrix_pending_codes.json"
-    new_pending = new_dir / "pending_codes.json"
-    if old_pending.exists() and not new_pending.exists():
-        new_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            with open(old_pending, "r", encoding="utf-8") as f:
-                old_data = json.load(f)
-            # Altes Format: {code: {matrix_user_id, expires_at}} → Neu: {code: {platform, user_id, expires_at}}
-            new_data = {}
-            if isinstance(old_data, dict):
-                for code, entry in old_data.items():
-                    if isinstance(entry, dict):
-                        new_data[code] = {
-                            "platform": "matrix",
-                            "user_id": entry.get("matrix_user_id", ""),
-                            "expires_at": entry.get("expires_at", 0),
-                        }
-            with open(new_pending, "w", encoding="utf-8") as f:
-                json.dump(new_data, f, ensure_ascii=False, indent=0)
-        except Exception:
-            pass
-    # Alte authorized migrieren
-    old_auth = old_dir / "matrix_authorized.json"
-    new_auth = new_dir / "authorized.json"
-    if old_auth.exists() and not new_auth.exists():
-        new_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            with open(old_auth, "r", encoding="utf-8") as f:
-                old_list = json.load(f)
-            # Altes Format: ["@user:server", ...] → Neu: [{"platform": "matrix", "user_id": "@user:server"}, ...]
-            new_list = []
-            if isinstance(old_list, list):
-                for uid in old_list:
-                    if isinstance(uid, str) and uid.strip():
-                        new_list.append({"platform": "matrix", "user_id": uid.strip()})
-            with open(new_auth, "w", encoding="utf-8") as f:
-                json.dump(new_list, f, ensure_ascii=False, indent=0)
-        except Exception:
-            pass
-    # Auch alte Dateien im config-root migrieren (ganz alter Pfad)
-    for name in ("matrix_pending_codes.json", "matrix_authorized.json"):
-        old_p = root / name
-        target = old_dir / name
-        if old_p.exists() and not target.exists():
-            old_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(old_p, target)
-            old_p.unlink()
 
 
 def _load_json(path: Path, default: dict | list) -> dict | list:
@@ -197,34 +136,40 @@ def _record_failed_attempt(key: str) -> None:
     _failed_attempts[key] = attempts
 
 
-def consume_code(code: str, config_dir: str | None = None) -> tuple[str, str] | None:
+def consume_code(code: str, *, config_dir: str | None = None, rate_key: str | None = None) -> tuple[str, str] | None:
     """
     Prüft den Code; wenn gültig, trägt den Nutzer in die autorisierte Liste ein,
     entfernt den Code und gibt (platform, user_id) zurück. Sonst None.
     Akzeptiert auch Eingaben wie "/auth matrix 5MHX456J" oder "/auth 5MHX456J".
     config_dir: dasselbe Verzeichnis wie die geladene Config (z. B. config.get("_config_dir")), damit Bot und Web-UI dieselbe Auth-Datei nutzen.
+    rate_key: Aufrufer-Identität (z. B. matrix-user-id oder client-ip) — Rate-Limit pro Aufrufer statt global,
+              damit Spammen eines Codes andere Nutzer nicht aussperrt. Default = global (alt).
     """
     code = _normalize_code(code)
     if not code:
         return None
-    # Rate limit check based on normalized code prefix (first 4 chars as key to group attempts)
-    rate_key = f"auth:{config_dir or 'default'}"
-    if _check_rate_limit(rate_key):
+    rk = f"auth:{config_dir or 'default'}:{rate_key or 'global'}"
+    if _check_rate_limit(rk):
         return None
     with _auth_file_lock:
         path = _pending_path(config_dir)
         data = _load_json(path, {})
         if not isinstance(data, dict):
-            _record_failed_attempt(rate_key)
+            _record_failed_attempt(rk)
             return None
-        entry = data.pop(code, None)
+        # Constant-time lookup: gegen ALLE pending-Codes vergleichen, kein dict-key-lookup.
+        matched_key: str | None = None
+        for stored in list(data.keys()):
+            if hmac.compare_digest(stored, code):
+                matched_key = stored
+        entry = data.pop(matched_key, None) if matched_key else None
         if not entry or not isinstance(entry, dict):
-            _record_failed_attempt(rate_key)
+            _record_failed_attempt(rk)
             return None
         expires = entry.get("expires_at") or 0
         if time.time() > expires:
             _save_json(path, data)
-            _record_failed_attempt(rate_key)
+            _record_failed_attempt(rk)
             return None
         platform = (entry.get("platform") or "").strip()
         user_id = (entry.get("user_id") or "").strip()
@@ -279,16 +224,3 @@ def list_authorized(platform: str | None = None, config_dir: str | None = None) 
         plat = platform.strip().lower()
         return [e for e in data if isinstance(e, dict) and e.get("platform") == plat]
     return [e for e in data if isinstance(e, dict)]
-
-
-# ---- Abwärtskompatibilität: alte matrix_auth Funktionen ----
-# Diese werden von bestehenden Importen genutzt und leiten auf das neue System weiter.
-
-def get_or_generate_code_matrix(matrix_user_id: str) -> str:
-    """Kompatibilitäts-Wrapper für Matrix."""
-    return get_or_generate_code("matrix", matrix_user_id)
-
-
-def is_authorized_matrix(matrix_user_id: str) -> bool:
-    """Kompatibilitäts-Wrapper für Matrix."""
-    return is_authorized("matrix", matrix_user_id)

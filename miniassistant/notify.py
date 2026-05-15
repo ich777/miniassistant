@@ -20,6 +20,12 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 
+def _is_valid_discord_id(value: Any) -> bool:
+    """Discord-IDs sind dezimale Snowflakes (17-20 Ziffern). Verhindert URL-Path-Injection."""
+    s = str(value or "").strip()
+    return s.isdigit() and 1 <= len(s) <= 32
+
+
 def send_notification(
     message: str,
     client: str | None = None,
@@ -40,7 +46,7 @@ def send_notification(
     results: dict[str, str] = {}
 
     if client is None or client == "matrix":
-        mc = cc.get("matrix") or config.get("matrix")
+        mc = cc.get("matrix")
         if mc and mc.get("enabled", True) and mc.get("token") and mc.get("user_id"):
             if room_id:
                 results["matrix"] = _send_matrix_to_room(mc, message, room_id)
@@ -226,7 +232,7 @@ def send_image(
     results: dict[str, str] = {}
 
     if client is None or client == "matrix":
-        mc = cc.get("matrix") or config.get("matrix")
+        mc = cc.get("matrix")
         if mc and mc.get("enabled", True) and mc.get("token") and mc.get("user_id"):
             results["matrix"] = _send_matrix_image(mc, image_path, caption, room_id=room_id, config_dir=config.get("_config_dir"))
         elif client == "matrix":
@@ -288,7 +294,10 @@ def _send_discord_image(dc: dict[str, Any], image_path: str, caption: str = "", 
 
     channels: list[str] = []
     if channel_id:
-        channels.append(channel_id)
+        if not _is_valid_discord_id(channel_id):
+            logger.warning("Discord Bild -> Channel %r abgelehnt (keine gueltige Snowflake-ID)", channel_id)
+            return "ungueltige channel_id"
+        channels.append(str(channel_id).strip())
     else:
         try:
             from miniassistant.chat_auth import list_authorized
@@ -298,6 +307,8 @@ def _send_discord_image(dc: dict[str, Any], image_path: str, caption: str = "", 
         for entry in authorized:
             discord_user_id = entry.get("user_id", entry) if isinstance(entry, dict) else entry
             if not discord_user_id or not isinstance(discord_user_id, str):
+                continue
+            if not _is_valid_discord_id(discord_user_id):
                 continue
             try:
                 create_url = "https://discord.com/api/v10/users/@me/channels"
@@ -314,8 +325,8 @@ def _send_discord_image(dc: dict[str, Any], image_path: str, caption: str = "", 
                 )
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     cid = json.loads(resp.read()).get("id")
-                if cid:
-                    channels.append(cid)
+                if cid and _is_valid_discord_id(cid):
+                    channels.append(str(cid))
             except Exception as e:
                 logger.warning("Discord DM-Channel fuer %s fehlgeschlagen: %s", discord_user_id, e)
 
@@ -422,7 +433,7 @@ def send_audio(
     results: dict[str, str] = {}
 
     if client is None or client == "matrix":
-        mc = cc.get("matrix") or config.get("matrix")
+        mc = cc.get("matrix")
         if mc and mc.get("enabled", True) and mc.get("token") and mc.get("user_id"):
             results["matrix"] = _send_matrix_audio(mc, wav_bytes, room_id=room_id, config_dir=config.get("_config_dir"))
         elif client == "matrix":
@@ -477,7 +488,10 @@ def _send_discord_audio(dc: dict[str, Any], wav_bytes: bytes, channel_id: str | 
 
     channels: list[str] = []
     if channel_id:
-        channels.append(channel_id)
+        if not _is_valid_discord_id(channel_id):
+            logger.warning("Discord Audio -> Channel %r abgelehnt (keine gueltige Snowflake-ID)", channel_id)
+            return "ungueltige channel_id"
+        channels.append(str(channel_id).strip())
     else:
         try:
             from miniassistant.chat_auth import list_authorized
@@ -487,6 +501,8 @@ def _send_discord_audio(dc: dict[str, Any], wav_bytes: bytes, channel_id: str | 
         for entry in authorized:
             discord_user_id = entry.get("user_id", entry) if isinstance(entry, dict) else entry
             if not discord_user_id or not isinstance(discord_user_id, str):
+                continue
+            if not _is_valid_discord_id(discord_user_id):
                 continue
             try:
                 create_url = "https://discord.com/api/v10/users/@me/channels"
@@ -503,8 +519,8 @@ def _send_discord_audio(dc: dict[str, Any], wav_bytes: bytes, channel_id: str | 
                 )
                 with urllib.request.urlopen(req, timeout=10) as resp:
                     cid = json.loads(resp.read()).get("id")
-                if cid:
-                    channels.append(cid)
+                if cid and _is_valid_discord_id(cid):
+                    channels.append(str(cid))
             except Exception as e:
                 logger.warning("Discord DM-Channel fuer %s fehlgeschlagen: %s", discord_user_id, e)
 
@@ -591,6 +607,8 @@ def _send_discord(dc: dict[str, Any], message: str, config_dir: str | None = Non
         discord_user_id = entry.get("user_id", entry) if isinstance(entry, dict) else entry
         if not discord_user_id or not isinstance(discord_user_id, str):
             continue
+        if not _is_valid_discord_id(discord_user_id):
+            continue
         try:
             # DM-Channel erstellen
             create_url = "https://discord.com/api/v10/users/@me/channels"
@@ -608,7 +626,7 @@ def _send_discord(dc: dict[str, Any], message: str, config_dir: str | None = Non
             with urllib.request.urlopen(req, timeout=10) as resp:
                 channel_id = json.loads(resp.read()).get("id")
 
-            if not channel_id:
+            if not channel_id or not _is_valid_discord_id(channel_id):
                 continue
 
             # Nachricht senden
@@ -640,6 +658,9 @@ def _send_discord_to_channel(dc: dict[str, Any], message: str, channel_id: str) 
     bot_token = dc.get("bot_token", "")
     if not bot_token:
         return "bot_token fehlt"
+    if not _is_valid_discord_id(channel_id):
+        logger.warning("Discord -> Channel %r abgelehnt (keine gueltige Snowflake-ID)", channel_id)
+        return "ungueltige channel_id"
 
     try:
         send_url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
