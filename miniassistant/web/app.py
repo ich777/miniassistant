@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import json
 import logging
 import os
 import shutil
@@ -441,7 +442,7 @@ def _require_token(request: Request) -> str:
     raise HTTPException(status_code=401, detail="Invalid or missing token")
 
 
-_TOKEN_COOKIE_PAGES = {"/", "/chat", "/chats", "/config", "/schedules", "/webhooks", "/onboarding", "/logs", "/nutzung", "/workspace"}
+_TOKEN_COOKIE_PAGES = {"/", "/chat", "/chats", "/config", "/config/raw", "/schedules", "/webhooks", "/rooms", "/onboarding", "/logs", "/nutzung", "/workspace"}
 
 
 @app.middleware("http")
@@ -595,7 +596,10 @@ async def index(request: Request):
     if has_token:
         wh_cfg = cfg.get("webhooks") or {}
         wh_link = ('<li><a href="/webhooks' + tq + '">Webhooks</a></li>') if (isinstance(wh_cfg, dict) and wh_cfg.get("enabled")) else ""
-        config_links = '<li><a href="/config' + tq + '">Konfiguration</a></li><li><a href="/nutzung' + tq + '">Nutzung</a></li><li><a href="/schedules' + tq + '">Geplante Jobs</a></li>' + wh_link + '<li><a href="/workspace' + tq + '">Workspace Explorer</a></li><li><a href="/logs' + tq + '">Logs</a></li>'
+        cc = cfg.get("chat_clients") or {}
+        rooms_visible = bool((cc.get("matrix") or {}).get("enabled") or (cc.get("discord") or {}).get("enabled"))
+        rooms_link = ('<li><a href="/rooms' + tq + '">Räume &amp; Channels</a></li>') if rooms_visible else ""
+        config_links = '<li><a href="/config' + tq + '">Konfiguration</a></li><li><a href="/nutzung' + tq + '">Nutzung</a></li><li><a href="/schedules' + tq + '">Geplante Jobs</a></li>' + wh_link + rooms_link + '<li><a href="/workspace' + tq + '">Workspace Explorer</a></li><li><a href="/logs' + tq + '">Logs</a></li>'
     logout_btn = '<button type="button" class="btn btn-outline" id="logout-btn" style="margin-left:0.5em;">Logout</button>' if is_authed else ""
     html = f"""
     <!DOCTYPE html>
@@ -679,9 +683,9 @@ async def index(request: Request):
     return HTMLResponse(html)
 
 
-@app.get("/config", response_class=HTMLResponse)
+@app.get("/config/raw", response_class=HTMLResponse)
 async def config_page(request: Request):
-    """Config-Seite: YAML in Textarea anzeigen, editierbar. Nur zugänglich mit gültigem Token (oder wenn noch keiner gesetzt)."""
+    """Config-Seite (Raw YAML): YAML in Textarea anzeigen, editierbar. Nur zugänglich mit gültigem Token (oder wenn noch keiner gesetzt)."""
     _require_token(request)  # 401 wenn Token in Config gesetzt, aber fehlt oder falsch
     import base64
     token = request.query_params.get("token", "")
@@ -712,11 +716,15 @@ async def config_page(request: Request):
       border: 1.5px solid var(--border); border-radius: var(--radius); background: var(--card);
       color: var(--text); outline: none; transition: border-color 0.15s; line-height: 1.5; }}
     #config-yaml:focus {{ border-color: var(--primary); }}
-    .form-actions {{ display: flex; align-items: center; gap: 0.8em; margin-top: 0.8em; flex-wrap: wrap; }}
+    .tabs {{ display: flex; gap: 0.4em; margin-bottom: 1em; border-bottom: 1.5px solid var(--border); }}
+    .tab {{ padding: 0.55em 1em; border-radius: var(--radius) var(--radius) 0 0; background: transparent;
+       border: 1.5px solid transparent; border-bottom: none; cursor: pointer; color: var(--muted); font-weight: 500; text-decoration: none; }}
+    .tab.active {{ background: var(--card); border-color: var(--border); color: var(--text); margin-bottom: -1.5px; }}
+    .actions-bar {{ position: sticky; bottom: 0; background: var(--card); border-top: 1px solid var(--border);
+       padding: 0.7em 1em; margin: 1em -1em -1em; display: flex; gap: 0.7em; align-items: center; flex-wrap: wrap; }}
     #msg {{ font-size: 0.9em; font-weight: 500; }}
     #msg.success {{ color: var(--success); }}
     #msg.error {{ color: var(--danger); }}
-    .nav-bottom {{ margin-top: 1.2em; padding-top: 0.8em; border-top: 1px solid var(--border); }}
     </style>
     </head>
     <body>
@@ -726,15 +734,19 @@ async def config_page(request: Request):
         <h1>Konfiguration</h1>
       </div>
       <p class="config-desc">YAML bearbeiten und speichern. Die Datei wird auf gueltiges YAML und erwartete Struktur geprueft.</p>
+      <div class="tabs">
+        <a href="/config{tq}" class="tab">Form</a>
+        <a href="/config/raw{tq}" class="tab active">Raw YAML</a>
+      </div>
       <form id="f">
         <textarea id="config-yaml" name="yaml" spellcheck="false"></textarea>
-        <div class="form-actions">
-          <button type="submit" class="btn btn-primary">Speichern</button>
-          <span id="msg"></span>
-        </div>
       </form>
-      <div class="nav-bottom">
+      <div class="actions-bar">
+        <button type="button" id="save-btn" class="btn btn-primary">Speichern</button>
+        <button type="button" id="reload-btn" class="btn btn-outline">Neu laden</button>
+        <button type="button" id="restart-btn" class="btn btn-outline" style="color:var(--warning);border-color:var(--warning);">Service neustarten</button>
         <a href="/{tq}" class="btn btn-outline">Startseite</a>
+        <span id="msg"></span>
       </div>
     </div>
     <div id="config-raw" data-yaml="{raw_b64}" style="display:none;"></div>
@@ -747,14 +759,14 @@ async def config_page(request: Request):
         }} catch (_) {{}}
       }}
     }})();
-    document.getElementById("f").addEventListener("submit", function(e) {{
-      e.preventDefault();
+    var TOKEN = new URLSearchParams(window.location.search).get("token") || "";
+    function tokenQS() {{ return TOKEN ? "?token=" + encodeURIComponent(TOKEN) : ""; }}
+    document.getElementById("save-btn").addEventListener("click", function() {{
       var msg = document.getElementById("msg");
       msg.textContent = "";
       msg.className = "";
       var yaml = document.getElementById("config-yaml").value;
-      var token = new URLSearchParams(window.location.search).get("token") || "";
-      fetch("/api/config" + (token ? "?token=" + encodeURIComponent(token) : ""), {{
+      fetch("/api/config" + tokenQS(), {{
         method: "POST",
         headers: {{ "Content-Type": "text/plain; charset=utf-8" }},
         body: yaml
@@ -768,11 +780,719 @@ async def config_page(request: Request):
         }});
       }});
     }});
+    document.getElementById("reload-btn").addEventListener("click", function() {{
+      window.location.reload();
+    }});
+    document.getElementById("restart-btn").addEventListener("click", function() {{
+      if (!confirm("Service wirklich neustarten?")) return;
+      var msg = document.getElementById("msg");
+      var btn = document.getElementById("restart-btn");
+      btn.disabled = true;
+      msg.textContent = "Restart wird ausgel\u00f6st\u2026";
+      msg.className = "";
+      fetch("/api/restart" + tokenQS(), {{ method: "POST", credentials: "same-origin" }})
+        .then(function(r) {{ return r.json(); }})
+        .then(function(data) {{
+          msg.textContent = data.message || "Restart ausgel\u00f6st. Seite wird gleich neu geladen\u2026";
+          msg.className = "success";
+          setTimeout(function() {{ window.location.reload(); }}, 4000);
+        }})
+        .catch(function(e) {{
+          msg.textContent = "Fehler: " + e.message;
+          msg.className = "error";
+          btn.disabled = false;
+        }});
+    }});
     </script>
     {_THEME_JS}
     </body>
     </html>
     """
+    return HTMLResponse(html)
+
+
+@app.get("/config", response_class=HTMLResponse)
+async def config_form_page(request: Request):
+    """Form-basierter Config-Editor (Tabellen-Ansicht, Standard). Daten kommen via JS aus /api/config/form."""
+    _require_token(request)
+    token = request.query_params.get("token", "")
+    tq = _token_query(token)
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Konfiguration (Form) – MiniAssistant</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/favicon.ico">
+<style>
+{_COMMON_CSS}
+.config-wrap {{ max-width: 1000px; margin: 0 auto; padding: 1.2em 1em; }}
+.config-header {{ display: flex; align-items: center; gap: 0.6em; margin-bottom: 0.4em; }}
+.config-header img {{ width: 40px; height: 40px; border-radius: 8px; }}
+.config-header h1 {{ margin: 0; font-size: 1.4em; }}
+.config-desc {{ color: var(--muted); margin-bottom: 1em; font-size: 0.92em; }}
+.tabs {{ display: flex; gap: 0.4em; margin-bottom: 1em; border-bottom: 1.5px solid var(--border); }}
+.tab {{ padding: 0.55em 1em; border-radius: var(--radius) var(--radius) 0 0; background: transparent;
+       border: 1.5px solid transparent; border-bottom: none; cursor: pointer; color: var(--muted); font-weight: 500; }}
+.tab.active {{ background: var(--card); border-color: var(--border); color: var(--text); margin-bottom: -1.5px; }}
+.section {{ background: var(--card); border-radius: var(--radius); border: 1px solid var(--border); margin-bottom: 0.8em; }}
+.section > .sec-header {{ padding: 0.7em 1em; font-weight: 600; cursor: pointer; user-select: none;
+       display: flex; align-items: center; justify-content: space-between; }}
+.section > .sec-header:hover {{ background: var(--bg); }}
+.section > .sec-body {{ padding: 0.6em 1em 1em; border-top: 1px solid var(--border); display: none; }}
+.section.open > .sec-body {{ display: block; }}
+.section .sec-chev {{ transition: transform 0.15s; }}
+.section.open .sec-chev {{ transform: rotate(90deg); }}
+.field {{ margin-bottom: 0.8em; }}
+.field label {{ display: block; font-size: 0.88em; font-weight: 500; margin-bottom: 0.25em; color: var(--text); }}
+.field .desc {{ color: var(--muted); font-size: 0.82em; margin-top: 0.2em; }}
+.field input[type="text"], .field input[type="password"], .field input[type="number"], .field select, .field textarea {{
+       width: 100%; max-width: 540px; }}
+.field textarea {{ font-family: 'SF Mono', monospace; font-size: 0.85em; min-height: 80px; }}
+.field.bool {{ display: flex; align-items: center; gap: 0.5em; }}
+.field.bool label {{ margin: 0; }}
+.dict-item {{ background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+       padding: 0.7em 0.9em; margin-bottom: 0.6em; }}
+.dict-item-header {{ display: flex; gap: 0.5em; align-items: center; margin-bottom: 0.5em; }}
+.dict-item-header input {{ flex: 1; max-width: 320px; }}
+.dict-item-header .btn-remove {{ padding: 0.3em 0.7em; background: var(--danger); color: #fff; }}
+.dict-item-header .btn-remove:hover {{ background: var(--danger); opacity: 0.85; }}
+.btn-add {{ padding: 0.35em 0.9em; background: transparent; border: 1.5px dashed var(--primary);
+       color: var(--primary); font-size: 0.9em; }}
+.btn-add:hover {{ background: var(--primary); color: #fff; }}
+.secret-badge {{ display: inline-block; padding: 0.1em 0.5em; border-radius: 999px; font-size: 0.75em;
+       background: var(--success); color: #fff; margin-left: 0.4em; vertical-align: middle; }}
+.secret-badge.unset {{ background: var(--muted); }}
+.ro-tag {{ display: inline-block; padding: 0.1em 0.5em; border-radius: 999px; font-size: 0.72em;
+       background: var(--warning); color: #000; margin-left: 0.4em; vertical-align: middle; }}
+.actions-bar {{ position: sticky; bottom: 0; background: var(--card); border-top: 1px solid var(--border);
+       padding: 0.7em 1em; margin: 1em -1em -1em; display: flex; gap: 0.7em; align-items: center; flex-wrap: wrap; }}
+#msg.success {{ color: var(--success); font-weight: 500; }}
+#msg.error {{ color: var(--danger); font-weight: 500; }}
+.row-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 0.6em 1em; }}
+@media (max-width: 700px) {{ .row-2 {{ grid-template-columns: 1fr; }} }}
+.subsec {{ border-top: 1px dashed var(--border); margin-top: 0.8em; padding-top: 0.7em; }}
+.subsec h4 {{ margin: 0 0 0.5em; font-size: 0.95em; }}
+.providers-list {{ display: flex; flex-direction: column; gap: 0.5em; }}
+.providers-list .prov {{ background: var(--bg); padding: 0.6em 0.9em; border-radius: var(--radius); font-size: 0.9em; }}
+.providers-list .prov .pname {{ font-weight: 600; }}
+.providers-list .prov .pkv {{ color: var(--muted); font-size: 0.85em; }}
+.list-rows .lrow {{ display: flex; gap: 0.4em; align-items: center; margin-bottom: 0.35em; }}
+.list-rows .lrow input {{ flex: 1; max-width: 540px; }}
+.list-rows .lrow .btn-remove {{ padding: 0.25em 0.55em; background: var(--danger); color: #fff; }}
+.toggle-disabled {{ opacity: 0.55; pointer-events: none; }}
+</style>
+</head>
+<body>
+<div class="config-wrap">
+  <div class="config-header">
+    <img src="/static/miniassistant.png" alt="Logo">
+    <h1>Konfiguration</h1>
+  </div>
+  <p class="config-desc">Form-basierter Editor. Leere Secret-Felder bleiben unverändert. Provider sind read-only (im Raw-Editor bearbeiten).</p>
+  <div class="tabs">
+    <a href="/config{tq}" class="tab active">Form</a>
+    <a href="/config/raw{tq}" class="tab">Raw YAML</a>
+  </div>
+  <div id="config-form">Lade Config…</div>
+  <div class="actions-bar">
+    <button id="save-btn" class="btn btn-primary" type="button">Speichern</button>
+    <button id="reload-btn" class="btn btn-outline" type="button">Neu laden</button>
+    <button id="restart-btn" class="btn btn-outline" type="button" style="color:var(--warning);border-color:var(--warning);">Service neustarten</button>
+    <a href="/{tq}" class="btn btn-outline">Startseite</a>
+    <span id="msg"></span>
+  </div>
+</div>
+<script>
+(function() {{
+  var TOKEN = new URLSearchParams(window.location.search).get("token") || "";
+  function qs(p) {{ return TOKEN ? "?token=" + encodeURIComponent(TOKEN) : ""; }}
+
+  // ---- Schema: beschreibt alle editierbaren Sektionen ----
+  // Pfad-Syntax: "a.b.c" → cfg.a.b.c
+  // Felder können fd.revealPath: "..." haben (statischer Pfad zum Reveal-Endpoint).
+  // Für dynamische Pfade (email-Account-Password) markiert "{{NAME}}" den Konto-Namen.
+  var SCHEMA = [
+    {{ id: "server", title: "Server", path: "server", fields: [
+        {{ n:"host", t:"text", l:"Host", desc:"Bind-Adresse (z.B. 127.0.0.1 oder 0.0.0.0)" }},
+        {{ n:"port", t:"int", l:"Port" }},
+        {{ n:"token", t:"password", l:"API-Token", secretFlag:"_token_set", revealPath:"server.token", desc:"Leer = unverändert. Auge: aktuellen Wert anzeigen." }},
+        {{ n:"debug", t:"bool", l:"Debug (Request/Response im JSON)" }},
+        {{ n:"show_estimated_tokens", t:"bool", l:"Token-Schätzung im Stream zeigen" }},
+        {{ n:"log_agent_actions", t:"bool", l:"Agent-Actions loggen" }},
+        {{ n:"show_context", t:"bool", l:"Kontext anzeigen" }},
+        {{ n:"track_usage", t:"bool", l:"Usage-Tracking" }},
+    ]}},
+
+    {{ id: "paths", title: "Verzeichnisse & Top-Level", path: "", fields: [
+        {{ n:"agent_dir", t:"text", l:"Agent-Verzeichnis" }},
+        {{ n:"workspace", t:"text", l:"Workspace" }},
+        {{ n:"trash_dir", t:"text", l:"Papierkorb" }},
+        {{ n:"avatar", t:"text", l:"Avatar (Pfad oder URL)" }},
+        {{ n:"max_chars_per_file", t:"int", l:"Max. Zeichen pro Datei" }},
+        {{ n:"github_token", t:"password", l:"GitHub-Token", secretFlag:"_github_token_set", revealPath:"github_token" }},
+    ]}},
+
+    {{ id: "providers", title: "Provider (read-only)", type:"providers_ro" }},
+
+    {{ id: "models_top", title: "Modell-Auswahl (Default-Provider Shortcut)", path: "models", fields: [
+        {{ n:"default", t:"text", l:"Default-Modell" }},
+        {{ n:"list", t:"list_inline", l:"Modell-Whitelist (leer = alle)" }},
+        {{ n:"subagents", t:"bool", l:"Als Subagent-Quelle nutzen" }},
+    ]}},
+    {{ id: "models_aliases", title: "Modell-Aliase", path: "models.aliases", type:"dict_kv", keyLabel:"Alias", valueLabel:"Modell-Name" }},
+    {{ id: "models_fallbacks", title: "Modell-Fallbacks (Liste)", path: "models.fallbacks", type:"list" }},
+
+    {{ id: "subagents_top", title: "Subagents (Liste)", path: "subagents", type:"list" }},
+    {{ id: "fallbacks_top", title: "Globale Fallback-Modelle", path: "fallbacks", type:"list" }},
+    {{ id: "vision_top", title: "Vision-Modelle", path: "vision", type:"list" }},
+    {{ id: "image_gen", title: "Image-Generation-Modelle", path: "image_generation", type:"list" }},
+
+    {{ id: "matrix", title: "Matrix-Bot", path: "chat_clients.matrix",
+       desc:"Per-Room-Modi (always/mention/off) werden auf der Seite /rooms verwaltet.",
+       fields: [
+        {{ n:"enabled", t:"bool", l:"Aktiv" }},
+        {{ n:"homeserver", t:"text", l:"Homeserver-URL" }},
+        {{ n:"bot_name", t:"text", l:"Bot-Name" }},
+        {{ n:"user_id", t:"text", l:"User-ID (@bot:server.tld)" }},
+        {{ n:"token", t:"password", l:"Access-Token", secretFlag:"_token_set", revealPath:"chat_clients.matrix.token" }},
+        {{ n:"device_id", t:"text", l:"Device-ID (optional)" }},
+        {{ n:"encrypted_rooms", t:"bool", l:"E2EE-Räume zulassen" }},
+    ]}},
+
+    {{ id: "discord", title: "Discord-Bot", path: "chat_clients.discord",
+       desc:"Per-Channel-Modi (always/mention/off) werden auf der Seite /rooms verwaltet.",
+       fields: [
+        {{ n:"enabled", t:"bool", l:"Aktiv" }},
+        {{ n:"bot_token", t:"password", l:"Bot-Token", secretFlag:"_bot_token_set", revealPath:"chat_clients.discord.bot_token" }},
+        {{ n:"command_prefix", t:"text", l:"Befehls-Präfix (z.B. !)" }},
+    ]}},
+
+    {{ id: "email", title: "E-Mail", path: "email", fields: [
+        {{ n:"default", t:"text", l:"Default-Konto" }},
+    ], dictObj:{{ key:"accounts", title:"Konten", keyLabel:"Konto-Name", item:[
+        {{ n:"imap_server", t:"text", l:"IMAP-Server" }},
+        {{ n:"imap_port", t:"int", l:"IMAP-Port (993)" }},
+        {{ n:"smtp_server", t:"text", l:"SMTP-Server" }},
+        {{ n:"smtp_port", t:"int", l:"SMTP-Port (587)" }},
+        {{ n:"username", t:"text", l:"Benutzer / Adresse" }},
+        {{ n:"password", t:"password", l:"Passwort", secretFlag:"_password_set", revealPath:"email.accounts.{{NAME}}.password" }},
+        {{ n:"ssl", t:"bool", l:"SSL/TLS" }},
+        {{ n:"name", t:"text", l:"Anzeigename" }},
+    ] }} }},
+
+    {{ id: "voice_top", title: "Voice (allgemein)", path: "voice", fields: [
+        {{ n:"language", t:"text", l:"Sprache (z.B. de)" }},
+        {{ n:"tts_voice", t:"text", l:"TTS-Stimme (Shortcut)" }},
+    ]}},
+    {{ id: "voice_stt", title: "Voice → STT", path: "voice.stt", fields: [
+        {{ n:"url", t:"text", l:"STT-URL (Wyoming)" }},
+        {{ n:"language", t:"text", l:"Sprache (Fallback)" }},
+    ]}},
+    {{ id: "voice_tts", title: "Voice → TTS", path: "voice.tts", fields: [
+        {{ n:"url", t:"text", l:"TTS-URL" }},
+        {{ n:"model", t:"text", l:"Modell (piper/vibevoice/kokoro/…)" }},
+        {{ n:"language", t:"text", l:"Sprache" }},
+        {{ n:"voice", t:"text", l:"Stimme" }},
+        {{ n:"speed", t:"float", l:"speed" }},
+        {{ n:"length_scale", t:"float", l:"length_scale (Piper)" }},
+        {{ n:"noise_scale", t:"float", l:"noise_scale (Piper)" }},
+        {{ n:"noise_w", t:"float", l:"noise_w (Piper)" }},
+        {{ n:"sentence_silence", t:"float", l:"sentence_silence" }},
+        {{ n:"seed", t:"int", l:"seed" }},
+        {{ n:"response_format", t:"text", l:"response_format" }},
+        {{ n:"voice_mode", t:"text", l:"voice_mode (Chatterbox)" }},
+        {{ n:"cfg_weight", t:"float", l:"cfg_weight" }},
+        {{ n:"exaggeration", t:"float", l:"exaggeration" }},
+        {{ n:"temperature", t:"float", l:"temperature" }},
+        {{ n:"chunk_size", t:"int", l:"chunk_size" }},
+        {{ n:"split_text", t:"bool", l:"split_text" }},
+        {{ n:"speed_factor", t:"float", l:"speed_factor" }},
+    ]}},
+
+    {{ id: "search_engines", title: "Suchmaschinen (Searx-NG)", path: "search_engines", type:"dict_obj_inline",
+       keyLabel:"Engine-ID", item:[{{ n:"url", t:"text", l:"URL (z.B. https://searx.example/search?q=)" }}] }},
+    {{ id: "default_search_engine", title: "Default-Suchmaschine", path: "", fields: [
+        {{ n:"default_search_engine", t:"text", l:"ID der Default-Engine" }},
+        {{ n:"search_engine_strategy", t:"enum", l:"Strategie", options:["first","roundrobin","fallback","random","specific"] }},
+    ]}},
+
+    {{ id: "memory", title: "Memory", path: "memory", fields: [
+        {{ n:"enabled", t:"bool", l:"Aktiv" }},
+        {{ n:"max_chars_per_line", t:"int", l:"Max. Zeichen pro Zeile" }},
+        {{ n:"days", t:"int", l:"Tage Retention" }},
+        {{ n:"max_tokens", t:"int", l:"Max. Tokens" }},
+        {{ n:"track_user_id", t:"bool", l:"User-ID tracken" }},
+    ]}},
+
+    {{ id: "mempalace", title: "MemPalace (Semantic Memory)", path: "mempalace", fields: [
+        {{ n:"enabled", t:"bool", l:"Aktiv (memory.enabled muss true sein)" }},
+        {{ n:"wing", t:"text", l:"Wing" }},
+        {{ n:"default_room", t:"text", l:"Default-Room" }},
+        {{ n:"max_tokens", t:"int", l:"Max. Tokens" }},
+        {{ n:"language", t:"list_inline", l:"Sprachen" }},
+    ]}},
+
+    {{ id: "chat_section", title: "Chat", path: "chat", fields: [
+        {{ n:"context_quota", t:"float", l:"Context-Quota (0..1)" }},
+    ]}},
+
+    {{ id: "scheduler", title: "Scheduler", path: "scheduler", type:"falsy_or_form",
+       fields:[{{n:"enabled", t:"bool", l:"Aktiv"}}] }},
+
+    {{ id: "webhooks", title: "Webhooks", path: "webhooks", type:"falsy_or_form", fields: [
+        {{ n:"enabled", t:"bool", l:"Aktiv" }},
+        {{ n:"rate_limit_per_min", t:"int", l:"Rate-Limit/min" }},
+        {{ n:"output_keep_last", t:"int", l:"Letzte N Outputs behalten" }},
+        {{ n:"parallel", t:"bool", l:"Parallele Ausführung" }},
+        {{ n:"max_retries", t:"int", l:"Max. Retries" }},
+    ]}},
+
+    {{ id: "raw_proxy", title: "Raw-Proxy (/raw/v1)", path: "raw_proxy", fields: [
+        {{ n:"enabled", t:"bool", l:"Aktiv" }},
+        {{ n:"token", t:"password", l:"Proxy-Token", secretFlag:"_token_set", revealPath:"raw_proxy.token" }},
+        {{ n:"rate_limit", t:"int", l:"Rate-Limit/min" }},
+        {{ n:"allowed_models", t:"list_inline", l:"Erlaubte Modelle (leer = alle)" }},
+    ]}},
+
+    {{ id: "tuning", title: "Tuning (Timeouts & Limits)", path: "", fields: [
+        {{ n:"api_timeout", t:"int", l:"api_timeout (s)" }},
+        {{ n:"subagent_api_timeout", t:"int", l:"subagent_api_timeout (s)" }},
+        {{ n:"invoke_model_timeout", t:"int", l:"invoke_model_timeout (s)" }},
+        {{ n:"tool_execution_timeout", t:"int", l:"tool_execution_timeout (s)" }},
+        {{ n:"subagent_execution_timeout", t:"int", l:"subagent_execution_timeout (s)" }},
+        {{ n:"schedule_timeout", t:"int", l:"schedule_timeout (s)" }},
+        {{ n:"stream_stall_timeout", t:"int", l:"stream_stall_timeout (s)" }},
+        {{ n:"stream_thinking_timeout", t:"int", l:"stream_thinking_timeout (s)" }},
+        {{ n:"stream_thinking_hard_timeout", t:"int", l:"stream_thinking_hard_timeout (s)" }},
+        {{ n:"stream_round_timeout", t:"int", l:"stream_round_timeout (s)" }},
+        {{ n:"stream_loop_max_consecutive", t:"int", l:"stream_loop_max_consecutive" }},
+        {{ n:"stream_loop_recovery_max", t:"int", l:"stream_loop_recovery_max" }},
+        {{ n:"max_tool_rounds", t:"int", l:"max_tool_rounds" }},
+        {{ n:"exec_max_output_chars", t:"int", l:"exec_max_output_chars" }},
+        {{ n:"prefs_max_chars", t:"int", l:"prefs_max_chars" }},
+        {{ n:"prefs_max_chars_per_file", t:"int", l:"prefs_max_chars_per_file" }},
+        {{ n:"respond_in_input_language", t:"bool", l:"respond_in_input_language" }},
+        {{ n:"doc_max_chars", t:"int", l:"doc_max_chars" }},
+        {{ n:"doc_max_pages_render", t:"int", l:"doc_max_pages_render" }},
+    ]}},
+  ];
+
+  // ---- Pfad-Helpers ----
+  function getPath(obj, path) {{
+    if (!path) return obj;
+    var parts = path.split("."); var cur = obj;
+    for (var i=0; i<parts.length; i++) {{
+      if (!cur || typeof cur !== "object") return undefined;
+      cur = cur[parts[i]];
+    }}
+    return cur;
+  }}
+  function setPath(obj, path, val) {{
+    if (!path) {{ Object.assign(obj, val || {{}}); return; }}
+    var parts = path.split("."); var cur = obj;
+    for (var i=0; i<parts.length-1; i++) {{
+      if (!cur[parts[i]] || typeof cur[parts[i]] !== "object") cur[parts[i]] = {{}};
+      cur = cur[parts[i]];
+    }}
+    cur[parts[parts.length-1]] = val;
+  }}
+
+  // ---- Renderer ----
+  // revealPathFn: optional function returning a string path; click on eye → fetch + show
+  function makeField(fd, value, secretSet, revealPathFn) {{
+    var wrap = document.createElement("div");
+    wrap.className = "field" + (fd.t === "bool" ? " bool" : "");
+    var id = "f_" + Math.random().toString(36).slice(2,9);
+    if (fd.t === "bool") {{
+      var cb = document.createElement("input"); cb.type = "checkbox"; cb.id = id;
+      cb.checked = !!value;
+      wrap.appendChild(cb);
+      var lab = document.createElement("label"); lab.htmlFor = id; lab.textContent = fd.l;
+      wrap.appendChild(lab);
+      wrap._get = function() {{ return cb.checked; }};
+      if (fd.desc) {{ var d0 = document.createElement("div"); d0.className = "desc"; d0.textContent = fd.desc; wrap.appendChild(d0); }}
+      return wrap;
+    }}
+    if (fd.t === "list_inline") {{
+      // Inline list-of-strings — Zeile pro Eintrag, +Add Button
+      var lab1 = document.createElement("label"); lab1.textContent = fd.l; wrap.appendChild(lab1);
+      var listHost = document.createElement("div"); wrap.appendChild(listHost);
+      var listGet = makeList(listHost, Array.isArray(value) ? value : []);
+      wrap._get = function() {{ return listGet(); }};
+      if (fd.desc) {{ var d1 = document.createElement("div"); d1.className = "desc"; d1.textContent = fd.desc; wrap.appendChild(d1); }}
+      return wrap;
+    }}
+    var lab2 = document.createElement("label"); lab2.htmlFor = id; lab2.textContent = fd.l;
+    if (fd.t === "password" && fd.secretFlag) {{
+      var badge = document.createElement("span");
+      badge.className = "secret-badge" + (secretSet ? "" : " unset");
+      badge.textContent = secretSet ? "gesetzt" : "nicht gesetzt";
+      lab2.appendChild(badge);
+    }}
+    wrap.appendChild(lab2);
+    var inp;
+    if (fd.t === "enum") {{
+      inp = document.createElement("select"); inp.id = id;
+      (fd.options || []).forEach(function(o) {{
+        var op = document.createElement("option"); op.value = o; op.textContent = o; inp.appendChild(op);
+      }});
+      if (value != null) inp.value = String(value);
+      wrap.appendChild(inp);
+    }} else {{
+      inp = document.createElement("input"); inp.id = id;
+      inp.type = (fd.t === "password") ? "password" : (fd.t === "int" || fd.t === "float") ? "number" : "text";
+      if (fd.t === "float") inp.step = "any";
+      if (fd.t === "password") inp.placeholder = secretSet ? "•••• (leer = unverändert)" : "";
+      if (value != null && fd.t !== "password") inp.value = String(value);
+      if (fd.t === "password" && revealPathFn) {{
+        // Eye-Toggle: zeigt aktuellen (oder gerade eingegebenen) Wert
+        var row = document.createElement("div");
+        row.className = "token-row";
+        row.style.cssText = "display:flex; gap:0.4em; align-items:center; max-width:540px;";
+        row.appendChild(inp);
+        var eye = document.createElement("button");
+        eye.type = "button"; eye.className = "eye-btn"; eye.textContent = "\\u{{1F441}}"; eye.title = "Wert anzeigen";
+        var revealed = false;
+        eye.addEventListener("click", function() {{
+          if (revealed) {{ inp.type = "password"; revealed = false; eye.textContent = "\\u{{1F441}}"; return; }}
+          if (inp.value === "" && secretSet) {{
+            var p = revealPathFn(); if (!p) return;
+            fetch("/api/config/reveal?path=" + encodeURIComponent(p) + (TOKEN ? "&token=" + encodeURIComponent(TOKEN) : ""), {{ credentials: "same-origin" }})
+              .then(function(r) {{ if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }})
+              .then(function(d) {{ inp.value = d.value || ""; inp.type = "text"; revealed = true; eye.textContent = "\\u{{1F576}}"; }})
+              .catch(function() {{ /* still leer lassen */ }});
+          }} else {{
+            inp.type = "text"; revealed = true; eye.textContent = "\\u{{1F576}}";
+          }}
+        }});
+        row.appendChild(eye);
+        wrap.appendChild(row);
+      }} else {{
+        wrap.appendChild(inp);
+      }}
+    }}
+    wrap._get = function() {{
+      var v = inp.value;
+      if (fd.t === "int") {{ if (v === "") return null; var n = parseInt(v, 10); return isNaN(n) ? null : n; }}
+      if (fd.t === "float") {{ if (v === "") return null; var f = parseFloat(v); return isNaN(f) ? null : f; }}
+      if (fd.t === "password") {{ return v; }}
+      return v;
+    }};
+    if (fd.desc) {{
+      var d = document.createElement("div"); d.className = "desc"; d.textContent = fd.desc; wrap.appendChild(d);
+    }}
+    return wrap;
+  }}
+
+  function makeDictKV(host, sec, data) {{
+    // dict<string, scalar/enum>
+    var dictVal = data || {{}};
+    var wrap = document.createElement("div");
+    var rows = document.createElement("div"); rows.className = "list-rows"; wrap.appendChild(rows);
+    function addRow(k, v) {{
+      var row = document.createElement("div"); row.className = "lrow";
+      var ki = document.createElement("input"); ki.type = "text"; ki.placeholder = sec.keyLabel || "Key"; ki.value = k || "";
+      var vi;
+      if (sec.t === "enum") {{
+        vi = document.createElement("select");
+        (sec.options || []).forEach(function(o) {{ var op = document.createElement("option"); op.value = o; op.textContent = o; vi.appendChild(op); }});
+        vi.value = v || (sec.options && sec.options[0]) || "";
+      }} else {{
+        vi = document.createElement("input"); vi.type = "text"; vi.value = v == null ? "" : String(v);
+      }}
+      var rm = document.createElement("button"); rm.type = "button"; rm.className = "btn btn-remove"; rm.textContent = "Entfernen";
+      rm.addEventListener("click", function() {{ rows.removeChild(row); }});
+      row.appendChild(ki); row.appendChild(vi); row.appendChild(rm);
+      rows.appendChild(row);
+    }}
+    Object.keys(dictVal).forEach(function(k) {{ addRow(k, dictVal[k]); }});
+    var addBtn = document.createElement("button"); addBtn.type = "button"; addBtn.className = "btn btn-add"; addBtn.textContent = "+ Hinzufügen";
+    addBtn.addEventListener("click", function() {{ addRow("", sec.t === "enum" ? (sec.options && sec.options[0]) : ""); }});
+    wrap.appendChild(addBtn);
+    host.appendChild(wrap);
+    return function() {{
+      var out = {{}};
+      rows.querySelectorAll(".lrow").forEach(function(r) {{
+        var ins = r.querySelectorAll("input, select");
+        var k = (ins[0].value || "").trim();
+        var v = ins[1].value;
+        if (k) out[k] = v;
+      }});
+      return out;
+    }};
+  }}
+
+  function makeList(host, data) {{
+    var arr = Array.isArray(data) ? data : [];
+    var wrap = document.createElement("div");
+    var rows = document.createElement("div"); rows.className = "list-rows"; wrap.appendChild(rows);
+    function addRow(v) {{
+      var row = document.createElement("div"); row.className = "lrow";
+      var inp = document.createElement("input"); inp.type = "text"; inp.value = v == null ? "" : String(v);
+      var rm = document.createElement("button"); rm.type = "button"; rm.className = "btn btn-remove"; rm.textContent = "Entfernen";
+      rm.addEventListener("click", function() {{ rows.removeChild(row); }});
+      row.appendChild(inp); row.appendChild(rm); rows.appendChild(row);
+    }}
+    arr.forEach(addRow);
+    var add = document.createElement("button"); add.type = "button"; add.className = "btn btn-add"; add.textContent = "+ Hinzufügen";
+    add.addEventListener("click", function() {{ addRow(""); }});
+    wrap.appendChild(add);
+    host.appendChild(wrap);
+    return function() {{
+      var out = [];
+      rows.querySelectorAll(".lrow input").forEach(function(i) {{ var v = i.value.trim(); if (v) out.push(v); }});
+      return out;
+    }};
+  }}
+
+  function makeDictObj(host, sec, data) {{
+    // dict<string, {{fields}}>
+    var dictVal = (data && typeof data === "object") ? data : {{}};
+    var wrap = document.createElement("div");
+    var items = document.createElement("div"); wrap.appendChild(items);
+    var getters = [];
+    function addItem(name, val) {{
+      val = val || {{}};
+      var box = document.createElement("div"); box.className = "dict-item";
+      var hdr = document.createElement("div"); hdr.className = "dict-item-header";
+      var nameInp = document.createElement("input"); nameInp.type = "text"; nameInp.placeholder = sec.keyLabel || "Name"; nameInp.value = name || "";
+      hdr.appendChild(nameInp);
+      var rm = document.createElement("button"); rm.type = "button"; rm.className = "btn btn-remove"; rm.textContent = "Entfernen";
+      rm.addEventListener("click", function() {{ items.removeChild(box); getters = getters.filter(function(g) {{ return g.box !== box; }}); }});
+      hdr.appendChild(rm);
+      box.appendChild(hdr);
+      var fieldGetters = [];
+      (sec.item || []).forEach(function(fd) {{
+        var v = val[fd.n];
+        var secretSet = fd.secretFlag ? !!val[fd.secretFlag] : false;
+        var revealFn = null;
+        if (fd.revealPath && fd.revealPath.indexOf("{{NAME}}") >= 0) {{
+          revealFn = function() {{ var nm = nameInp.value.trim(); if (!nm) return ""; return fd.revealPath.replace("{{NAME}}", nm); }};
+        }} else if (fd.revealPath) {{
+          revealFn = function() {{ return fd.revealPath; }};
+        }}
+        var fdNode = makeField(fd, v, secretSet, revealFn);
+        box.appendChild(fdNode);
+        fieldGetters.push({{ fd: fd, get: fdNode._get }});
+      }});
+      items.appendChild(box);
+      getters.push({{ box: box, name: function() {{ return nameInp.value.trim(); }}, fields: fieldGetters }});
+    }}
+    Object.keys(dictVal).forEach(function(k) {{ addItem(k, dictVal[k]); }});
+    var add = document.createElement("button"); add.type = "button"; add.className = "btn btn-add"; add.textContent = "+ Hinzufügen";
+    add.addEventListener("click", function() {{ addItem("", {{}}); }});
+    wrap.appendChild(add);
+    host.appendChild(wrap);
+    return function() {{
+      var out = {{}};
+      getters.forEach(function(g) {{
+        var n = g.name(); if (!n) return;
+        var obj = {{}};
+        g.fields.forEach(function(fg) {{ obj[fg.fd.n] = fg.get(); }});
+        out[n] = obj;
+      }});
+      return out;
+    }};
+  }}
+
+  function renderProvidersRO(host, cfg) {{
+    var p = document.createElement("p"); p.className = "desc";
+    p.textContent = "Provider werden im Raw-YAML-Editor bearbeitet (zu viele Sonderfälle: type, options, model_options, …). Vollständige Ansicht (api_keys maskiert):";
+    host.appendChild(p);
+    // Provider-Daten: api_key bleibt geleert (Sicherheit), aber _api_key_set:bool zeigt Stand.
+    var pre = document.createElement("pre");
+    pre.style.cssText = "background:var(--bg); padding:0.8em 1em; border-radius:var(--radius); overflow:auto; font-size:0.82em; max-height:540px; white-space:pre; margin:0; border:1px solid var(--border);";
+    // Zeige Klartext-JSON, ersetze api_key durch sichtbare Marker je nach _api_key_set
+    var view = {{}};
+    Object.keys(cfg.providers || {{}}).forEach(function(name) {{
+      var src = (cfg.providers || {{}})[name] || {{}};
+      var out = {{}};
+      Object.keys(src).forEach(function(k) {{
+        if (k === "_api_key_set") return;
+        if (k === "api_key") {{ out.api_key = src._api_key_set ? "<gesetzt>" : null; return; }}
+        out[k] = src[k];
+      }});
+      view[name] = out;
+    }});
+    pre.textContent = JSON.stringify(view, null, 2);
+    host.appendChild(pre);
+  }}
+
+  function renderSection(sec, cfg) {{
+    var box = document.createElement("div"); box.className = "section";
+    var hdr = document.createElement("div"); hdr.className = "sec-header";
+    var titleSpan = document.createElement("span"); titleSpan.textContent = sec.title;
+    if (sec.type === "providers_ro") {{
+      var tag = document.createElement("span"); tag.className = "ro-tag"; tag.textContent = "read-only"; titleSpan.appendChild(tag);
+    }}
+    hdr.appendChild(titleSpan);
+    var chev = document.createElement("span"); chev.className = "sec-chev"; chev.textContent = "▶"; hdr.appendChild(chev);
+    box.appendChild(hdr);
+    var body = document.createElement("div"); body.className = "sec-body";
+    box.appendChild(body);
+    hdr.addEventListener("click", function() {{ box.classList.toggle("open"); }});
+
+    var saver = null;
+
+    if (sec.type === "providers_ro") {{
+      renderProvidersRO(body, cfg);
+      box._save = function(out) {{ /* read-only — providers übernimmt der Server aus Original */ }};
+      return box;
+    }}
+    if (sec.type === "list") {{
+      var listGet = makeList(body, getPath(cfg, sec.path));
+      box._save = function(out) {{ setPath(out, sec.path, listGet()); }};
+      return box;
+    }}
+    if (sec.type === "dict_kv") {{
+      var kvGet = makeDictKV(body, sec, getPath(cfg, sec.path));
+      box._save = function(out) {{ setPath(out, sec.path, kvGet()); }};
+      return box;
+    }}
+    if (sec.type === "dict_obj_inline") {{
+      var objGet = makeDictObj(body, sec, getPath(cfg, sec.path));
+      box._save = function(out) {{ setPath(out, sec.path, objGet()); }};
+      return box;
+    }}
+
+    // form / falsy_or_form
+    var falsyTip = null;
+    if (sec.type === "falsy_or_form") {{
+      falsyTip = document.createElement("p"); falsyTip.className = "desc";
+      falsyTip.textContent = "Wenn 'Aktiv' deaktiviert ist, wird die Sektion als false gespeichert.";
+      body.appendChild(falsyTip);
+    }}
+    if (sec.desc) {{
+      var sd = document.createElement("p"); sd.className = "desc"; sd.textContent = sec.desc;
+      body.appendChild(sd);
+    }}
+    var data = getPath(cfg, sec.path);
+    if (data === true) data = {{ enabled: true }};
+    if (!data || typeof data !== "object" || Array.isArray(data)) data = {{}};
+    var fieldGetters = [];
+    (sec.fields || []).forEach(function(fd) {{
+      var val = data[fd.n];
+      var secretSet = fd.secretFlag ? !!data[fd.secretFlag] : false;
+      var revealFn = fd.revealPath ? (function(p) {{ return function() {{ return p; }}; }})(fd.revealPath) : null;
+      var node = makeField(fd, val, secretSet, revealFn);
+      body.appendChild(node);
+      fieldGetters.push({{ fd: fd, get: node._get }});
+    }});
+    if (sec.dict) {{
+      var sub = document.createElement("div"); sub.className = "subsec";
+      var h = document.createElement("h4"); h.textContent = sec.dict.title; sub.appendChild(h);
+      var dictData = data[sec.dict.key];
+      var dictGet = makeDictKV(sub, sec.dict, dictData);
+      body.appendChild(sub);
+      fieldGetters.push({{ dictKey: sec.dict.key, get: dictGet }});
+    }}
+    if (sec.dictObj) {{
+      var sub2 = document.createElement("div"); sub2.className = "subsec";
+      var h2 = document.createElement("h4"); h2.textContent = sec.dictObj.title; sub2.appendChild(h2);
+      var dictObjData = data[sec.dictObj.key];
+      var dictObjGet = makeDictObj(sub2, sec.dictObj, dictObjData);
+      body.appendChild(sub2);
+      fieldGetters.push({{ dictKey: sec.dictObj.key, get: dictObjGet }});
+    }}
+    box._save = function(out) {{
+      var collected = {{}};
+      fieldGetters.forEach(function(fg) {{
+        if (fg.dictKey) collected[fg.dictKey] = fg.get();
+        else collected[fg.fd.n] = fg.get();
+      }});
+      if (sec.type === "falsy_or_form") {{
+        if (!collected.enabled) {{ setPath(out, sec.path, false); return; }}
+      }}
+      if (sec.path === "") {{
+        // Top-level fields direkt mergen
+        Object.keys(collected).forEach(function(k) {{ out[k] = collected[k]; }});
+      }} else {{
+        var existing = getPath(out, sec.path);
+        if (existing && typeof existing === "object" && !Array.isArray(existing)) {{
+          Object.assign(existing, collected);
+        }} else {{
+          setPath(out, sec.path, collected);
+        }}
+      }}
+    }};
+    return box;
+  }}
+
+  var CFG = null; var ROOT = document.getElementById("config-form"); var SECTION_NODES = [];
+  function render(cfg) {{
+    CFG = cfg;
+    ROOT.innerHTML = "";
+    SECTION_NODES = [];
+    SCHEMA.forEach(function(sec) {{
+      var node = renderSection(sec, cfg);
+      ROOT.appendChild(node);
+      SECTION_NODES.push({{ sec: sec, node: node }});
+    }});
+  }}
+
+  function loadConfig() {{
+    var msg = document.getElementById("msg"); msg.textContent = "Lade…"; msg.className = "";
+    fetch("/api/config/form" + qs(), {{ credentials: "same-origin" }})
+      .then(function(r) {{ if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }})
+      .then(function(cfg) {{ render(cfg); msg.textContent = ""; }})
+      .catch(function(e) {{ msg.textContent = "Fehler: " + e.message; msg.className = "error"; }});
+  }}
+
+  function gatherAndSave() {{
+    var msg = document.getElementById("msg"); msg.textContent = ""; msg.className = "";
+    var out = {{}};
+    SECTION_NODES.forEach(function(s) {{ if (typeof s.node._save === "function") s.node._save(out); }});
+    fetch("/api/config/form" + qs(), {{
+      method: "POST",
+      headers: {{ "Content-Type": "application/json" }},
+      credentials: "same-origin",
+      body: JSON.stringify(out)
+    }}).then(function(r) {{
+      return r.json().then(function(data) {{
+        if (r.ok) {{
+          msg.innerHTML = "Gespeichert. <strong>Dienst neu starten</strong>, damit die Änderungen wirksam werden.";
+          msg.className = "success";
+          loadConfig();
+        }} else {{
+          msg.textContent = data.detail || data.error || "Fehler";
+          msg.className = "error";
+        }}
+      }}).catch(function() {{
+        if (r.ok) {{ msg.textContent = "Gespeichert."; msg.className = "success"; loadConfig(); }}
+        else {{ msg.textContent = "Fehler " + r.status; msg.className = "error"; }}
+      }});
+    }}).catch(function(e) {{
+      msg.textContent = "Netzwerk-Fehler: " + e.message; msg.className = "error";
+    }});
+  }}
+
+  function restartService() {{
+    var msg = document.getElementById("msg");
+    if (!confirm("Dienst wirklich neu starten? Laufende Chats und Streams werden abgebrochen.")) return;
+    var btn = document.getElementById("restart-btn");
+    btn.disabled = true; msg.className = ""; msg.textContent = "Restart wird ausgelöst…";
+    fetch("/api/restart" + qs(), {{ method: "POST", credentials: "same-origin" }})
+      .then(function(r) {{ return r.json().then(function(d) {{ return {{ok: r.ok, d: d}}; }}); }})
+      .then(function(res) {{
+        if (res.ok) {{
+          msg.className = "success";
+          msg.textContent = (res.d && res.d.message) || "Restart ausgelöst. Seite wird in 4s neu geladen…";
+          setTimeout(function() {{ window.location.reload(); }}, 4000);
+        }} else {{
+          msg.className = "error";
+          msg.textContent = (res.d && (res.d.detail || res.d.error)) || "Restart fehlgeschlagen";
+          btn.disabled = false;
+        }}
+      }})
+      .catch(function(e) {{ msg.className = "error"; msg.textContent = "Fehler: " + e.message; btn.disabled = false; }});
+  }}
+
+  document.getElementById("save-btn").addEventListener("click", gatherAndSave);
+  document.getElementById("reload-btn").addEventListener("click", loadConfig);
+  document.getElementById("restart-btn").addEventListener("click", restartService);
+  loadConfig();
+}})();
+</script>
+{_THEME_JS}
+</body></html>"""
     return HTMLResponse(html)
 
 
@@ -782,6 +1502,7 @@ async def schedules_page(request: Request):
     _require_token(request)
     token = request.query_params.get("token", "")
     tq = _token_query(token)
+    config = load_config()
     try:
         from miniassistant.scheduler import list_scheduled_jobs
         jobs = list_scheduled_jobs()
@@ -835,9 +1556,11 @@ async def schedules_page(request: Request):
             task = "<br>".join(task_parts) if task_parts else "?"
             client_str = j.get("client") or "alle"
             if j.get("room_id"):
-                client_str += f' <span style="font-size:0.8em;color:var(--muted);" title="{_escape(j["room_id"])}">📍Raum</span>'
+                _nm = _resolve_target_name(config, room_id=j["room_id"]) or "?"
+                client_str += f' <span style="font-size:0.85em;color:var(--muted);" title="{_escape(j["room_id"])}">📍 {_escape(_nm)}</span>'
             elif j.get("channel_id"):
-                client_str += f' <span style="font-size:0.8em;color:var(--muted);" title="{_escape(j["channel_id"])}">📍Channel</span>'
+                _nm = _resolve_target_name(config, channel_id=j["channel_id"]) or "?"
+                client_str += f' <span style="font-size:0.85em;color:var(--muted);" title="{_escape(j["channel_id"])}">📍 {_escape(_nm)}</span>'
             client = client_str
             model = _escape(j.get("model") or "default")
             once_tag = ' <span style="color:var(--muted);font-size:0.8em;">einmalig</span>' if j.get("once") else ""
@@ -850,6 +1573,8 @@ async def schedules_page(request: Request):
                 f' data-prompt="{_html.escape(j.get("prompt") or "", quote=True)}"'
                 f' data-when="{_html.escape(raw_when, quote=True)}"'
                 f' data-model="{_html.escape(j.get("model") or "", quote=True)}"'
+                f' data-room="{_html.escape(j.get("room_id") or "", quote=True)}"'
+                f' data-channel="{_html.escape(j.get("channel_id") or "", quote=True)}"'
                 f' title="Bearbeiten">&#9998;</button>'
             ) if (j.get("prompt") or trigger == "cron") and not j.get("watch") else ""
             rows += (
@@ -920,6 +1645,8 @@ async def schedules_page(request: Request):
         </div>
         <label for="editModelSelect">Modell</label>
         <select id="editModelSelect"><option value="">Standard</option></select>
+        <label for="editTargetSelect">Ziel (Raum / Channel)</label>
+        <select id="editTargetSelect">{_build_target_options(config)}</select>
         <label for="editPromptText">Prompt</label>
         <textarea id="editPromptText" rows="5"></textarea>
         <div class="modal-actions">
@@ -959,6 +1686,13 @@ async def schedules_page(request: Request):
           }}
           sel.value = model;
         }}
+        // Preselect target dropdown based on stored room/channel
+        var roomVal = this.getAttribute("data-room") || "";
+        var chanVal = this.getAttribute("data-channel") || "";
+        var tgtSel = document.getElementById("editTargetSelect");
+        if (roomVal) tgtSel.value = "matrix:" + roomVal;
+        else if (chanVal) tgtSel.value = "discord:" + chanVal;
+        else tgtSel.value = "";
         document.getElementById("editModal").classList.add("open");
         document.getElementById("editPromptText").focus();
       }});
@@ -971,11 +1705,20 @@ async def schedules_page(request: Request):
       var newWhen = document.getElementById("editWhenText").value.trim();
       var whenRow = document.getElementById("editWhenRow").style.display !== "none";
       var newModel = document.getElementById("editModelSelect").value;
-      if (!newPrompt && !newModel && !(whenRow && newWhen)) {{ alert("Bitte mindestens ein Feld ausfüllen."); return; }}
+      var tgt = document.getElementById("editTargetSelect").value || "";
+      if (!newPrompt && !newModel && !(whenRow && newWhen) && tgt === "") {{ alert("Bitte mindestens ein Feld ausfüllen."); return; }}
       var payload = {{}};
       if (newPrompt) payload.prompt = newPrompt;
       if (newModel !== undefined) payload.model = newModel;
       if (whenRow && newWhen) payload.when = newWhen;
+      // Target: explicit prefix-based split. Empty string clears both room_id and channel_id.
+      if (tgt === "") {{
+        payload.room_id = null; payload.channel_id = null; payload.client = null;
+      }} else if (tgt.indexOf("matrix:") === 0) {{
+        payload.room_id = tgt.substring(7); payload.channel_id = null; payload.client = "matrix";
+      }} else if (tgt.indexOf("discord:") === 0) {{
+        payload.channel_id = tgt.substring(8); payload.room_id = null; payload.client = "discord";
+      }}
       fetch("/api/schedule/" + encodeURIComponent(_editJobId) + (token ? "?token=" + encodeURIComponent(token) : ""), {{
         method: "PATCH",
         headers: {{"Content-Type": "application/json"}},
@@ -1035,6 +1778,7 @@ def _js_escape(s: str) -> str:
 async def chat_page(request: Request):
     """Chat-Seite: Markdown, Thinking optional in Spoiler, aufgehuebschtes Design."""
     from fastapi.responses import RedirectResponse
+    _require_token(request)  # 401 wenn Token konfiguriert aber fehlt/ungültig (first-run: kein Token → durchgelassen)
     token = request.query_params.get("token", "")
     token_q = f"?token={token}" if token else ""
     show_onboarding = not _onboarding_complete()
@@ -1703,6 +2447,224 @@ async def api_config_save(request: Request):
     return JSONResponse({"ok": True})
 
 
+# ===== Form-basierte Config (/config) =================================
+#
+# /api/config/form GET   → liefert die Config als JSON; alle bekannten
+#                          Secret-Felder werden geleert und durch ein paralleles
+#                          Flag _<name>_set:bool ergänzt, damit die UI anzeigen
+#                          kann ob ein Wert gesetzt ist.
+# /api/config/form POST  → nimmt JSON, restauriert leere Secret-Felder aus dem
+#                          aktuellen Stand, schreibt mit save_config().
+#
+# Secrets werden NIE als Klartext zurückgeschickt; ein leeres Feld bedeutet
+# "Wert unverändert lassen". Providers sind hier readonly: was im POST-Body
+# unter "providers" steht, wird verworfen — providers werden weiter via Raw-YAML
+# editiert (zu viele Sonderfälle: type, options, model_options, …).
+
+def _config_has_value(v: Any) -> bool:
+    if v is None:
+        return False
+    if isinstance(v, str):
+        return v.strip() != ""
+    return True
+
+
+def _mask_config_for_form(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Deep-Copy + Secrets geleert. Pro Secret-Pfad ein Flag _<name>_set:bool."""
+    import copy as _copy
+    out = _copy.deepcopy(cfg)
+    out.pop("_config_dir", None)
+    # server.token
+    srv = out.setdefault("server", {})
+    srv["_token_set"] = _config_has_value(srv.get("token"))
+    srv["token"] = ""
+    # top-level github_token
+    out["_github_token_set"] = _config_has_value(out.get("github_token"))
+    out["github_token"] = ""
+    # raw_proxy.token
+    rp = out.setdefault("raw_proxy", {})
+    rp["_token_set"] = _config_has_value(rp.get("token"))
+    rp["token"] = ""
+    # chat_clients.matrix.token / discord.bot_token
+    cc = out.get("chat_clients") or {}
+    if isinstance(cc, dict):
+        mx = cc.get("matrix")
+        if isinstance(mx, dict):
+            mx["_token_set"] = _config_has_value(mx.get("token"))
+            mx["token"] = ""
+        dc = cc.get("discord")
+        if isinstance(dc, dict):
+            dc["_bot_token_set"] = _config_has_value(dc.get("bot_token"))
+            dc["bot_token"] = ""
+    # providers.*.api_key (read-only display, aber Klartext nie ausliefern)
+    provs = out.get("providers") or {}
+    if isinstance(provs, dict):
+        for _pn, pv in provs.items():
+            if isinstance(pv, dict):
+                pv["_api_key_set"] = _config_has_value(pv.get("api_key"))
+                pv["api_key"] = ""
+    # email.accounts.*.password
+    em = out.get("email") or {}
+    if isinstance(em, dict):
+        accs = em.get("accounts") or {}
+        if isinstance(accs, dict):
+            for _an, av in accs.items():
+                if isinstance(av, dict):
+                    av["_password_set"] = _config_has_value(av.get("password"))
+                    av["password"] = ""
+    return out
+
+
+def _strip_meta_fields(obj: Any) -> Any:
+    """Entfernt rekursiv alle Keys mit Unterstrich-Prefix (UI-Hilfsfelder)."""
+    if isinstance(obj, dict):
+        return {k: _strip_meta_fields(v) for k, v in obj.items() if not (isinstance(k, str) and k.startswith("_"))}
+    if isinstance(obj, list):
+        return [_strip_meta_fields(v) for v in obj]
+    return obj
+
+
+def _restore_config_secrets(new_cfg: dict[str, Any], original: dict[str, Any]) -> None:
+    """Wenn ein Secret-Feld im neuen Config leer ist, Original übernehmen.
+    Mutiert new_cfg in-place."""
+    def _restore_at(target: dict, source: dict, path: list[str]) -> None:
+        n = target
+        o = source
+        for p in path[:-1]:
+            if not isinstance(n, dict) or p not in n or not isinstance(n[p], dict):
+                return
+            if not isinstance(o, dict) or p not in o or not isinstance(o[p], dict):
+                return
+            n = n[p]
+            o = o[p]
+        if not isinstance(n, dict) or not isinstance(o, dict):
+            return
+        last = path[-1]
+        new_v = n.get(last)
+        if not _config_has_value(new_v):
+            orig_v = o.get(last)
+            if _config_has_value(orig_v):
+                n[last] = orig_v
+
+    for path in (
+        ["server", "token"],
+        ["github_token"],
+        ["raw_proxy", "token"],
+        ["chat_clients", "matrix", "token"],
+        ["chat_clients", "discord", "bot_token"],
+    ):
+        _restore_at(new_cfg, original, path)
+    # providers.*.api_key (auch wenn UI sie nicht editiert: defensiv restaurieren)
+    new_provs = new_cfg.get("providers") or {}
+    orig_provs = original.get("providers") or {}
+    if isinstance(new_provs, dict) and isinstance(orig_provs, dict):
+        for pn, pv in new_provs.items():
+            if not isinstance(pv, dict):
+                continue
+            if not _config_has_value(pv.get("api_key")):
+                orig_pv = orig_provs.get(pn)
+                if isinstance(orig_pv, dict) and _config_has_value(orig_pv.get("api_key")):
+                    pv["api_key"] = orig_pv["api_key"]
+    # email.accounts.*.password
+    new_em = new_cfg.get("email") or {}
+    orig_em = original.get("email") or {}
+    if isinstance(new_em, dict) and isinstance(orig_em, dict):
+        new_accs = new_em.get("accounts") or {}
+        orig_accs = orig_em.get("accounts") or {}
+        if isinstance(new_accs, dict) and isinstance(orig_accs, dict):
+            for an, av in new_accs.items():
+                if not isinstance(av, dict):
+                    continue
+                if not _config_has_value(av.get("password")):
+                    orig_av = orig_accs.get(an)
+                    if isinstance(orig_av, dict) and _config_has_value(orig_av.get("password")):
+                        av["password"] = orig_av["password"]
+
+
+@app.get("/api/config/form")
+async def api_config_form_get(request: Request):
+    """Config für Form-Editor: Secrets geleert + _<name>_set Flags."""
+    _require_token(request)
+    cfg = load_config()
+    return JSONResponse(_mask_config_for_form(cfg))
+
+
+@app.get("/api/config/reveal")
+async def api_config_reveal(request: Request):
+    """Auf Anfrage einen Secret-Wert zurückgeben (für Eye-Toggle). Whitelisted Pfade."""
+    _require_token(request)
+    path = (request.query_params.get("path") or "").strip()
+    if not path or len(path) > 200:
+        raise HTTPException(status_code=400, detail="path required")
+    parts = path.split(".")
+    allowed = False
+    if path in ("server.token", "github_token", "raw_proxy.token",
+                "chat_clients.matrix.token", "chat_clients.discord.bot_token"):
+        allowed = True
+    elif len(parts) == 3 and parts[0] == "providers" and parts[2] == "api_key":
+        allowed = True
+    elif len(parts) == 4 and parts[0] == "email" and parts[1] == "accounts" and parts[3] == "password":
+        allowed = True
+    if not allowed:
+        raise HTTPException(status_code=400, detail="path not allowed")
+    cfg = load_config()
+    cur = cfg
+    for p in parts:
+        if not isinstance(cur, dict):
+            return JSONResponse({"value": ""})
+        cur = cur.get(p)
+        if cur is None:
+            return JSONResponse({"value": ""})
+    return JSONResponse({"value": "" if cur is None else str(cur)})
+
+
+def _deep_merge_form(original: dict, new: dict) -> dict:
+    """Deep-merge `new` into `original` für Form-Save.
+    Regeln:
+      - dicts: rekursiv mergen (neue Keys überschreiben, fehlende behalten)
+      - lists: REPLACE (sonst kann User nie etwas aus einer Liste entfernen)
+      - andere Typen: REPLACE
+    Damit bleibt onboarding_complete + nicht-form-erfasste Sub-Felder erhalten,
+    aber Listen-Edits (tools_allow uncheck etc.) greifen normal.
+    """
+    out = dict(original)
+    for k, v in new.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge_form(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+@app.post("/api/config/form")
+async def api_config_form_save(request: Request):
+    """Form-Save: deep-merge in Original um nicht-form-erfasste Felder (onboarding_complete,
+    room_settings sub-keys etc.) nicht zu verlieren. providers read-only. Secrets aus Original."""
+    _require_token(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="JSON-Objekt erwartet")
+    new_cfg = _strip_meta_fields(body)
+    if not isinstance(new_cfg, dict):
+        raise HTTPException(status_code=400, detail="Ungültiger Body")
+    with _config_save_lock:
+        original = load_config()
+        # _config_dir nicht persistieren (wird beim Laden gesetzt)
+        original_copy = {k: v for k, v in original.items() if k != "_config_dir"}
+        # Deep-merge: erhält Felder die Form nicht kennt (onboarding_complete, room_settings details, …)
+        merged = _deep_merge_form(original_copy, new_cfg)
+        # providers: read-only — Original immer behalten, egal was die UI schickt
+        merged["providers"] = original_copy.get("providers") or {}
+        # leere Secrets aus Original übernehmen
+        _restore_config_secrets(merged, original_copy)
+        try:
+            save_config(merged)
+        except Exception as e:
+            _log.error("Config-Form konnte nicht gespeichert werden: %s", e)
+            raise HTTPException(status_code=500, detail=f"Config konnte nicht gespeichert werden: {e}")
+    return JSONResponse({"ok": True})
+
+
 @app.get("/api/token")
 async def api_show_token(request: Request):
     """Token anzeigen (nur wenn bereits gesetzt; sonst 204). Erfordert gültiges Token."""
@@ -1779,17 +2741,36 @@ async def api_auth_platform(request: Request, platform: str):
 
 @app.patch("/api/schedule/{job_id}")
 async def api_schedule_update(request: Request, job_id: str):
-    """Schedule-Prompt, -Modell und/oder -Zeitplan aktualisieren. Token erforderlich."""
+    """Schedule-Felder aktualisieren: prompt, model, when, room_id, channel_id, client.
+    Felder die NICHT im Body sind = unverändert. Feld = null = löschen."""
     _require_token(request)
     body = await request.json()
     new_prompt = (body.get("prompt") or "").strip() or None
-    new_model = body.get("model")  # None = nicht ändern, "" = auf Standard zurücksetzen
+    new_model = body.get("model")
     new_when = (body.get("when") or "").strip() or None
-    if new_prompt is None and new_model is None and not new_when:
-        raise HTTPException(status_code=400, detail="Mindestens 'prompt', 'model' oder 'when' erforderlich")
+    def _opt(key: str):
+        if key not in body:
+            return ...
+        v = body[key]
+        if v is None:
+            return None
+        if isinstance(v, str):
+            s = v.strip()
+            return s if s else None
+        return None
+    new_room = _opt("room_id")
+    new_channel = _opt("channel_id")
+    new_client = _opt("client")
+    if (new_prompt is None and new_model is None and not new_when
+            and new_room is ... and new_channel is ... and new_client is ...):
+        raise HTTPException(status_code=400, detail="Mindestens ein Feld erforderlich")
     try:
         from miniassistant.scheduler import update_schedule_prompt
-        ok, msg = update_schedule_prompt(job_id, new_prompt, new_model=new_model, new_when=new_when)
+        ok, msg = update_schedule_prompt(
+            job_id, new_prompt,
+            new_model=new_model, new_when=new_when,
+            new_room_id=new_room, new_channel_id=new_channel, new_client=new_client,
+        )
         if ok:
             return JSONResponse({"ok": True, "message": msg})
         raise HTTPException(status_code=404, detail=msg)
@@ -2278,6 +3259,7 @@ async def api_chat(request: Request):
 @app.get("/onboarding", response_class=HTMLResponse)
 async def onboarding_page(request: Request):
     """Onboarding-Seite: geführter Dialog für SOUL/IDENTITY/TOOLS/USER. Gleiches Design wie Chat."""
+    _require_token(request)  # first-run: kein Token gesetzt → durchgelassen. Sonst Token erforderlich.
     token = request.query_params.get("token", "")
     token_q = f"?token={token}" if token else ""
     html = f"""
@@ -2645,7 +3627,52 @@ async def api_logs_list(request: Request):
                 memory_files.append({"id": "memory_last_summary", "label": "last_summary.json", "path": str(mem_dir / "last_summary.json")})
     except Exception:
         pass
-    return JSONResponse({"logs": logs, "memory": memory_files})
+    # Per-room group logs (logs/agent_actions_groups/*.log) — nur wenn vorhanden
+    groups = []
+    try:
+        groups_dir = Path(config_dir) / "logs" / "agent_actions_groups"
+        if groups_dir.is_dir():
+            # Mapping: sanitized subdir → (room_name, platform). Aus aktuell geladenen Räumen/Channels.
+            from miniassistant.group_rooms import sanitize_workspace_subdir
+            stem_to_name: dict[str, tuple[str, str]] = {}
+            try:
+                from miniassistant.matrix_bot import list_joined_rooms as _lr
+                for r in _lr() or []:
+                    sub = sanitize_workspace_subdir(r.get("id") or "")
+                    if sub and r.get("name"):
+                        stem_to_name[sub] = (str(r["name"]), "matrix")
+            except Exception:
+                pass
+            try:
+                from miniassistant.discord_bot import list_channels as _lc
+                for c in _lc() or []:
+                    sub = sanitize_workspace_subdir(c.get("id") or "")
+                    if sub and c.get("name"):
+                        guild = c.get("guild") or ""
+                        label = f"{c['name']} ({guild})" if guild else c["name"]
+                        stem_to_name[sub] = (label, "discord")
+            except Exception:
+                pass
+            for gf in sorted(groups_dir.iterdir()):
+                if gf.is_file() and gf.suffix == ".log":
+                    stem = gf.stem  # sanitized subdir name (no traversal possible)
+                    name_plat = stem_to_name.get(stem)
+                    if name_plat:
+                        name, plat = name_plat
+                        label = f"{name} [{plat}]"
+                    else:
+                        # Bot ist nicht mehr im Raum oder offline — zeig stem als fallback
+                        label = f"{stem} (offline/left)"
+                    groups.append({
+                        "id": f"group_{stem}",
+                        "label": label,
+                        "stem": stem,
+                        "path": str(gf),
+                        "size_kb": round(gf.stat().st_size / 1024, 1),
+                    })
+    except Exception:
+        pass
+    return JSONResponse({"logs": logs, "memory": memory_files, "groups": groups})
 
 
 @app.get("/api/logs/{log_id}")
@@ -2670,15 +3697,27 @@ async def api_logs_read(request: Request, log_id: str):
         if sys_path.exists():
             log_map["system"] = sys_path
             break
+    # Per-room group logs (group_<sanitized_subdir>)
+    if log_id.startswith("group_"):
+        stem = log_id[6:]  # nach "group_"
+        import re as _re_grp
+        # Whitelist: nur sanitisierte Subdir-Namen (gleiche Regex wie sanitize_workspace_subdir).
+        if _re_grp.fullmatch(r"[a-zA-Z0-9_-]{1,40}", stem):
+            gp = Path(config_dir) / "logs" / "agent_actions_groups" / f"{stem}.log"
+            if gp.exists():
+                log_map[log_id] = gp
     # Memory-Dateien (memory_YYYY-MM-DD, memory_last_summary)
     if log_id.startswith("memory_"):
         try:
             from miniassistant.memory import memory_dir as _memory_dir
             mem_dir = _memory_dir(getattr(app.state, "project_dir", None))
             suffix = log_id[7:]  # nach "memory_"
+            # Whitelist: nur Datums-Stems (YYYY-MM-DD) oder last_summary.
+            # Verhindert Path-Traversal via log_id=memory_../../foo.
+            import re as _re_mem
             if suffix == "last_summary":
                 log_map[log_id] = mem_dir / "last_summary.json"
-            else:
+            elif _re_mem.fullmatch(r"\d{4}-\d{2}-\d{2}", suffix):
                 log_map[log_id] = mem_dir / f"{suffix}.md"
         except Exception:
             pass
@@ -2762,6 +3801,7 @@ async def logs_page(request: Request):
         <h1>Logs</h1>
         <div class="logs-controls">
           <select id="log-select"><option value="">——— Log wählen ———</option></select>
+          <select id="group-select" style="display:none;"><option value="">——— Raum wählen ———</option></select>
           <label><input type="checkbox" id="live-toggle" checked> Live</label>
           <label><input type="checkbox" id="scroll-toggle" checked> Auto-Scroll</label>
           <a href="/" class="btn btn-outline" style="padding:0.35em 0.8em;font-size:0.85em;">Startseite</a>
@@ -2776,6 +3816,7 @@ async def logs_page(request: Request):
     <script>
     (function() {{
       var select = document.getElementById("log-select");
+      var groupSelect = document.getElementById("group-select");
       var box = document.getElementById("log-box");
       var liveToggle = document.getElementById("live-toggle");
       var scrollToggle = document.getElementById("scroll-toggle");
@@ -2785,6 +3826,7 @@ async def logs_page(request: Request):
       var offset = 0;
       var pollTimer = null;
       var pollInterval = 2000;
+      var groupLogs = [];
 
       // Cookie wird automatisch mitgeschickt (credentials: same-origin ist default bei fetch)
       // Kein manuelles Token-Handling nötig
@@ -2797,6 +3839,25 @@ async def logs_page(request: Request):
           opt.textContent = l.label;
           select.appendChild(opt);
         }});
+        // Groups-Eintrag nur wenn Per-Room-Logs existieren
+        groupLogs = data.groups || [];
+        if (groupLogs.length > 0) {{
+          var sepG = document.createElement("option");
+          sepG.disabled = true;
+          sepG.textContent = "——— Groups ———";
+          select.appendChild(sepG);
+          var gopt = document.createElement("option");
+          gopt.value = "__groups__";
+          gopt.textContent = "Group-Räume (" + groupLogs.length + ")";
+          select.appendChild(gopt);
+          // Sub-Dropdown befüllen
+          groupLogs.forEach(function(g) {{
+            var o = document.createElement("option");
+            o.value = g.id;
+            o.textContent = g.label + " (" + g.size_kb + " KB)";
+            groupSelect.appendChild(o);
+          }});
+        }}
         // Memory-Dateien mit Separator
         var memFiles = data.memory || [];
         if (memFiles.length > 0) {{
@@ -2855,6 +3916,29 @@ async def logs_page(request: Request):
       }}
 
       select.addEventListener("change", function() {{
+        var v = this.value;
+        if (v === "__groups__") {{
+          // Pseudo-Auswahl: zeigt Sub-Dropdown, lädt nichts bis Raum gewählt
+          groupSelect.style.display = "";
+          if (!groupSelect.value) {{
+            box.innerHTML = '<div class="empty-hint">Wähle einen Raum aus dem zweiten Dropdown.</div>';
+            statusText.textContent = "—";
+            if (pollTimer) clearInterval(pollTimer);
+            return;
+          }}
+          currentLog = groupSelect.value;
+        }} else {{
+          groupSelect.style.display = "none";
+          groupSelect.value = "";
+          currentLog = v;
+        }}
+        offset = 0;
+        loadLog(currentLog, false);
+        restartPoll();
+      }});
+
+      groupSelect.addEventListener("change", function() {{
+        if (!this.value) return;
         currentLog = this.value;
         offset = 0;
         loadLog(currentLog, false);
@@ -3079,6 +4163,7 @@ async def nutzung_page(request: Request):
         <div class="summary-card"><div class="label">Gesamtzeit</div><div class="value" id="sum-time">—</div></div>
         <div class="summary-card"><div class="label">Anfragen</div><div class="value" id="sum-requests">—</div></div>
         <div class="summary-card"><div class="label">Modelle</div><div class="value" id="sum-models">—</div></div>
+        <div class="summary-card" id="sum-group-card" style="display:none;background:rgba(168,85,247,0.08);border-color:rgba(168,85,247,0.3);"><div class="label">Davon Gruppen</div><div class="value" id="sum-group-time">—</div><div style="font-size:0.75em;color:var(--muted);margin-top:0.2em;" id="sum-group-req"></div></div>
       </div>
       <div class="chart-container"><canvas id="usage-chart"></canvas></div>
       <div class="tables-row">
@@ -3149,6 +4234,17 @@ async def nutzung_page(request: Request):
             document.getElementById("sum-time").textContent = data.summary.formatted || "0s";
             document.getElementById("sum-requests").textContent = data.summary.total_requests;
             document.getElementById("sum-models").textContent = (data.by_model || []).length;
+            // Gruppen-Card nur wenn group_seconds > 0 (nicht jeder hat Gruppen konfiguriert)
+            var grpCard = document.getElementById("sum-group-card");
+            var grpSec = data.summary.group_seconds || 0;
+            if (grpSec > 0) {{
+              grpCard.style.display = "";
+              document.getElementById("sum-group-time").textContent = data.summary.group_formatted || "0s";
+              var pct = data.summary.total_seconds > 0 ? Math.round(grpSec / data.summary.total_seconds * 100) : 0;
+              document.getElementById("sum-group-req").textContent = (data.summary.group_requests || 0) + " Anfragen · " + pct + "% Gesamt";
+            }} else {{
+              grpCard.style.display = "none";
+            }}
 
             // Chart
             var labels = (data.by_time || []).map(function(d) {{
@@ -3156,8 +4252,11 @@ async def nutzung_page(request: Request):
               if (l.length > 10) l = l.slice(5);  // kürze "2026-" weg
               return l;
             }});
-            var values = (data.by_time || []).map(function(d) {{ return d.seconds; }});
+            var totalsArr = (data.by_time || []).map(function(d) {{ return d.seconds; }});
+            var groupArr = (data.by_time || []).map(function(d) {{ return d.group_seconds || 0; }});
+            var ownerArr = (data.by_time || []).map(function(d, i) {{ return Math.max(0, totalsArr[i] - groupArr[i]); }});
             var counts = (data.by_time || []).map(function(d) {{ return d.requests; }});
+            var anyGroupTime = groupArr.some(function(v) {{ return v > 0; }});
 
             if (chart) chart.destroy();
             var isDark = document.documentElement.getAttribute("data-theme") === "dark"
@@ -3165,19 +4264,46 @@ async def nutzung_page(request: Request):
             var gridColor = isDark ? "rgba(255,255,255,0.1)" : "rgba(0,0,0,0.08)";
             var textColor = isDark ? "#aaa" : "#666";
 
+            // Wenn Group-Daten vorhanden: stacked bar (Owner unten blau + Group oben lila).
+            // Sonst: single blue bar wie vorher.
+            var barDatasets;
+            if (anyGroupTime) {{
+              barDatasets = [{{
+                label: "Owner",
+                data: ownerArr,
+                backgroundColor: "rgba(59, 130, 246, 0.6)",
+                borderColor: "rgba(59, 130, 246, 1)",
+                borderWidth: 1,
+                borderRadius: 4,
+                stack: "time",
+                yAxisID: "y"
+              }}, {{
+                label: "Gruppe",
+                data: groupArr,
+                backgroundColor: "rgba(168, 85, 247, 0.7)",
+                borderColor: "rgba(168, 85, 247, 1)",
+                borderWidth: 1,
+                borderRadius: 4,
+                stack: "time",
+                yAxisID: "y"
+              }}];
+            }} else {{
+              barDatasets = [{{
+                label: "Sekunden",
+                data: totalsArr,
+                backgroundColor: "rgba(59, 130, 246, 0.6)",
+                borderColor: "rgba(59, 130, 246, 1)",
+                borderWidth: 1,
+                borderRadius: 4,
+                yAxisID: "y"
+              }}];
+            }}
+
             chart = new Chart(ctx, {{
               type: "bar",
               data: {{
                 labels: labels,
-                datasets: [{{
-                  label: "Sekunden",
-                  data: values,
-                  backgroundColor: "rgba(59, 130, 246, 0.6)",
-                  borderColor: "rgba(59, 130, 246, 1)",
-                  borderWidth: 1,
-                  borderRadius: 4,
-                  yAxisID: "y"
-                }}, {{
+                datasets: barDatasets.concat([{{
                   label: "Anfragen",
                   data: counts,
                   type: "line",
@@ -3187,7 +4313,7 @@ async def nutzung_page(request: Request):
                   pointRadius: 3,
                   fill: true,
                   yAxisID: "y1"
-                }}]
+                }}])
               }},
               options: {{
                 responsive: true,
@@ -3198,19 +4324,20 @@ async def nutzung_page(request: Request):
                   tooltip: {{
                     callbacks: {{
                       label: function(ctx) {{
-                        if (ctx.dataset.label === "Sekunden") return "Zeit: " + fmtSec(ctx.raw);
-                        return "Anfragen: " + ctx.raw;
+                        if (ctx.dataset.label === "Anfragen") return "Anfragen: " + ctx.raw;
+                        return ctx.dataset.label + ": " + fmtSec(ctx.raw);
                       }}
                     }}
                   }}
                 }},
                 scales: {{
-                  x: {{ ticks: {{ color: textColor, font: {{ size: 11 }} }}, grid: {{ color: gridColor }} }},
+                  x: {{ ticks: {{ color: textColor, font: {{ size: 11 }} }}, grid: {{ color: gridColor }}, stacked: anyGroupTime }},
                   y: {{
                     type: "linear", position: "left",
                     title: {{ display: true, text: "Sekunden", color: textColor }},
                     ticks: {{ color: textColor }}, grid: {{ color: gridColor }},
-                    beginAtZero: true
+                    beginAtZero: true,
+                    stacked: anyGroupTime
                   }},
                   y1: {{
                     type: "linear", position: "right",
@@ -3222,11 +4349,14 @@ async def nutzung_page(request: Request):
               }}
             }});
 
-            // Tables
-            document.getElementById("table-model").innerHTML = buildTable(
-              data.by_model,
-              [{{key: "model", label: "Modell"}}, {{key: "seconds", label: "Zeit", fmt: "sec"}}, {{key: "requests", label: "Anfragen"}}]
-            );
+            // Tables — by_model: Gruppen-Spalte nur wenn irgendein Modell Group-Usage hat
+            var hasGroup = (data.by_model || []).some(function(r) {{ return (r.group_seconds || 0) > 0; }});
+            var modelCols = [{{key: "model", label: "Modell"}}, {{key: "seconds", label: "Zeit", fmt: "sec"}}, {{key: "requests", label: "Anfragen"}}];
+            if (hasGroup) {{
+              modelCols.push({{key: "group_seconds", label: "Gruppen-Zeit", fmt: "sec"}});
+              modelCols.push({{key: "group_requests", label: "Gruppen-Anfragen"}});
+            }}
+            document.getElementById("table-model").innerHTML = buildTable(data.by_model, modelCols);
             document.getElementById("table-type").innerHTML = buildTable(
               data.by_type,
               [{{key: "type", label: "Typ"}}, {{key: "seconds", label: "Zeit", fmt: "sec"}}, {{key: "requests", label: "Anfragen"}}]
@@ -4214,9 +5344,111 @@ def _wh_extract_token(request: Request, path_token: str) -> str:
     return (hdr or path_token or "").strip()
 
 
+# Body keys we treat as control fields. Anything else in a JSON body counts as payload.
+_WH_CONTROL_KEYS = {
+    "prompt", "extra_context", "client", "room_id", "channel_id",
+    "silent", "save_output", "output_name", "model",
+}
+
+# Headers we forward to the prompt — useful metadata from senders (GitHub, Slack, etc.).
+_WH_FORWARD_HEADER_PREFIXES = ("x-", "user-agent")
+_WH_HEADER_SKIP = {"x-webhook-token", "x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "x-real-ip"}
+_WH_MAX_PAYLOAD_CHARS = 20_000
+
+
+async def _build_incoming_context(request: Request) -> tuple[dict, str]:
+    """Parse webhook body for control fields + payload.
+    Returns (control_dict, extra_context_str).
+    Body kinds handled:
+      - application/json with our control keys + arbitrary other fields → controls separated, rest as payload
+      - application/json with foreign schema (GitHub, Discord, ...) → whole body becomes payload
+      - application/x-www-form-urlencoded → fields as JSON payload
+      - text/plain or anything else → raw body bytes decoded as payload
+    Forwarded HTTP headers (X-*, User-Agent) are prepended so prompts can read event type, source, etc.
+    """
+    ctype = (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+    controls: dict = {}
+    payload_block: str = ""
+
+    if ctype == "application/json":
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        if isinstance(body, dict):
+            controls = {k: body[k] for k in _WH_CONTROL_KEYS if k in body}
+            rest = {k: v for k, v in body.items() if k not in _WH_CONTROL_KEYS}
+            if rest:
+                try:
+                    payload_block = json.dumps(rest, indent=2, ensure_ascii=False)
+                except Exception:
+                    payload_block = repr(rest)
+        elif body is not None:
+            try:
+                payload_block = json.dumps(body, indent=2, ensure_ascii=False)
+            except Exception:
+                payload_block = repr(body)
+    elif ctype == "application/x-www-form-urlencoded":
+        try:
+            form = await request.form()
+            form_dict = {k: form[k] for k in form.keys()}
+            controls = {k: form_dict[k] for k in _WH_CONTROL_KEYS if k in form_dict}
+            rest = {k: v for k, v in form_dict.items() if k not in _WH_CONTROL_KEYS}
+            if rest:
+                payload_block = json.dumps(rest, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+    else:
+        try:
+            raw = await request.body()
+            if raw:
+                payload_block = raw.decode("utf-8", errors="replace")
+        except Exception:
+            pass
+
+    if len(payload_block) > _WH_MAX_PAYLOAD_CHARS:
+        payload_block = payload_block[:_WH_MAX_PAYLOAD_CHARS] + f"\n…[truncated, original {len(payload_block)} chars]"
+
+    # Forward relevant headers (event type, signatures, user-agent — sender's clues)
+    fwd_headers: list[tuple[str, str]] = []
+    for k, v in request.headers.items():
+        lk = k.lower()
+        if lk in _WH_HEADER_SKIP:
+            continue
+        if any(lk.startswith(p) for p in _WH_FORWARD_HEADER_PREFIXES):
+            fwd_headers.append((k, v))
+
+    explicit_extra = str(controls.get("extra_context") or "").strip()
+    if explicit_extra:
+        # Caller set extra_context themselves — respect it, don't overwrite.
+        return controls, explicit_extra
+
+    if not payload_block and not fwd_headers:
+        return controls, ""
+
+    parts = ["[INCOMING WEBHOOK PAYLOAD]"]
+    if fwd_headers:
+        parts.append("Headers:")
+        for k, v in fwd_headers:
+            parts.append(f"  {k}: {v}")
+    if payload_block:
+        parts.append("")
+        parts.append(f"Body ({ctype or 'unknown'}):")
+        parts.append(payload_block)
+    controls["extra_context"] = "\n".join(parts)
+    return controls, controls["extra_context"]
+
+
 @app.post("/webhook/{token}")
 async def webhook_fire(request: Request, token: str):
-    """Fire a webhook by token. Body: JSON with optional extra_context, prompt, client, room_id, channel_id, silent, save_output, output_name, model."""
+    """Fire a webhook by token.
+    Body handling:
+      - JSON with our control keys (prompt, extra_context, client, room_id, channel_id, silent,
+        save_output, output_name, model) → keys are honored, any remaining JSON fields become payload.
+      - JSON from foreign senders (GitHub, Discord, ...) → whole body becomes payload.
+      - form-encoded / text / raw bytes → body becomes payload.
+      X-* headers and User-Agent are forwarded so prompts can read event type, signature, source.
+    """
     from miniassistant import webhooks as _wh
     if not _wh.is_enabled():
         _wh_disabled_response()
@@ -4226,16 +5458,11 @@ async def webhook_fire(request: Request, token: str):
         _wh_disabled_response()
     if not _wh.rate_check(item["id"]):
         raise HTTPException(status_code=429, detail="rate limit exceeded")
-    try:
-        body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
-    except Exception:
-        body = {}
-    if not isinstance(body, dict):
-        body = {}
+    body, extra_context = await _build_incoming_context(request)
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(_chat_executor, lambda: _wh.fire(
         item,
-        extra_context=str(body.get("extra_context") or ""),
+        extra_context=extra_context,
         prompt_override=str(body.get("prompt") or ""),
         client_override=body.get("client"),
         room_id_override=body.get("room_id"),
@@ -4401,6 +5628,7 @@ async def webhooks_page(request: Request):
     _require_token(request)
     token = request.query_params.get("token", "")
     tq = _token_query(token)
+    _host_base = f"{request.url.scheme}://{request.url.netloc}"
     from miniassistant import webhooks as _wh
     enabled = _wh.is_enabled()
     items = _wh.list_webhooks() if enabled else []
@@ -4425,9 +5653,11 @@ async def webhooks_page(request: Request):
                 tok_masked = ""
             cli = _escape(w.get("client") or "default")
             if w.get("room_id"):
-                cli += f' <span style="font-size:0.8em;color:var(--muted);" title="{_escape(w["room_id"])}">📍Raum</span>'
+                _nm = _resolve_target_name(load_config(), room_id=w["room_id"]) or "?"
+                cli += f' <span style="font-size:0.85em;color:var(--muted);" title="{_escape(w["room_id"])}">📍 {_escape(_nm)}</span>'
             elif w.get("channel_id"):
-                cli += f' <span style="font-size:0.8em;color:var(--muted);" title="{_escape(w["channel_id"])}">📍Channel</span>'
+                _nm = _resolve_target_name(load_config(), channel_id=w["channel_id"]) or "?"
+                cli += f' <span style="font-size:0.85em;color:var(--muted);" title="{_escape(w["channel_id"])}">📍 {_escape(_nm)}</span>'
             silent = ' <span style="color:var(--muted);font-size:0.8em;">silent</span>' if w.get("silent") else ""
             err = ' <span style="color:var(--danger);" title="last error">●</span>' if w.get("last_error") else ""
             last = (w.get("last_fired") or "never")[:16].replace("T", " ")
@@ -4448,13 +5678,14 @@ async def webhooks_page(request: Request):
                 f' data-silent="{"1" if w.get("silent") else "0"}"'
                 f' title="Bearbeiten">&#9998;</button>'
             )
+            _has_default = "1" if (w.get("prompt") or "").strip() else "0"
             rows += (
                 f'<tr><td><strong>{handle}</strong>{silent}{err}</td>'
                 f'<td>{task}</td><td>{cli}</td>'
                 f'<td><code class="tok-masked">{tok_masked}</code> '
                 f'<button class="btn-reveal" data-id="{full_id}" title="Token anzeigen / kopieren">&#128065;</button></td>'
                 f'<td>{last}</td>'
-                f'<td><code>{wid}</code> <button class="btn-run" data-id="{full_id}" title="Jetzt ausführen">&#9654;</button>{edit_btn}<button class="btn-del" data-id="{full_id}" title="Loeschen">&#10005;</button></td></tr>'
+                f'<td><code>{wid}</code> <button class="btn-run" data-id="{full_id}" data-has-default="{_has_default}" data-name="{_html.escape(w.get("name") or "", quote=True)}" title="Jetzt ausführen">&#9654;</button>{edit_btn}<button class="btn-del" data-id="{full_id}" title="Loeschen">&#10005;</button></td></tr>'
             )
     enabled_form = "" if not enabled else (
         '<details class="card wh-create" style="margin-bottom:1em;">'
@@ -4464,10 +5695,8 @@ async def webhooks_page(request: Request):
         '<input type="text" id="newName" placeholder="daily-report">'
         '<label for="newPrompt">Default Prompt <span class="hint">(optional — leer = Caller muss prompt im POST mitschicken)</span></label>'
         '<textarea id="newPrompt" rows="4" placeholder="z.B. Summarize the incoming data as a short bullet list. (Antwort wird automatisch zum Chat-Push — keine send_*-Tools nötig.)"></textarea>'
-        '<label for="newClient">Client</label>'
-        '<select id="newClient"><option value="">default (keiner)</option><option>matrix</option><option>discord</option><option>both</option><option>none</option></select>'
-        '<label for="newRoom">Room / Channel <span class="hint">(optional)</span></label>'
-        '<input type="text" id="newRoom" placeholder="!abc:server  oder  Discord-Channel-ID">'
+        '<label for="newTarget">Ziel (Raum / Channel) <span class="hint">(optional — leer = an alle authed User)</span></label>'
+        f'<select id="newTarget">{_build_target_options(load_config())}</select>'
         '<label for="newModel">Modell <span class="hint">(optional)</span></label>'
         '<input type="text" id="newModel" placeholder="alias oder name">'
         '<label for="newSilent">Silent</label>'
@@ -4540,6 +5769,131 @@ async def webhooks_page(request: Request):
         <h1>Webhooks</h1>
       </div>
       {enabled_form}
+      <details class="card" style="margin-bottom:1em;">
+        <summary style="font-size:1.0em;font-weight:600;cursor:pointer;">📖 Beispiele</summary>
+        <div style="padding:0.6em 0 0;">
+          <p style="margin:0.2em 0 0.6em;color:var(--muted);font-size:0.9em;">
+            Beispiele nutzen <code>ADRESSE:PORT</code> als Platzhalter. Deine aktuelle Adresse ist: <code>{_host_base}</code> (kopieren und ersetzen oder anpassen je nach Reverse-Proxy/Domain).<br>
+            <code>&lt;TOKEN&gt;</code> = der Token des Webhooks (Reveal-Button 👁 in der Tabelle).
+            Body-Felder sind <strong>optional</strong> ausser markiert.
+          </p>
+
+          <h3 style="margin:1em 0 0.3em;font-size:0.95em;">① Webhook <em>mit</em> Default Prompt</h3>
+          <p style="margin:0 0 0.3em;font-size:0.88em;color:var(--muted);">Default Prompt im Webhook gespeichert → kein Body nötig. Einfachster Fall, z.B. cron-getriggerte Reports.</p>
+          <pre style="background:var(--bg);padding:0.6em;border-radius:4px;overflow-x:auto;font-size:0.85em;"><code># Minimal — feuert mit dem gespeicherten Default-Prompt
+curl -X POST ADRESSE:PORT/webhook/&lt;TOKEN&gt;
+
+# Mit zusätzlichem Kontext (z.B. CI-Payload, Sensorwert, …)
+curl -X POST ADRESSE:PORT/webhook/&lt;TOKEN&gt; \\
+  -H "Content-Type: application/json" \\
+  -d '{{"extra_context":"build #4231 failed on commit abc123"}}'
+
+# Default-Prompt für DIESEN Lauf einmalig überschreiben
+curl -X POST ADRESSE:PORT/webhook/&lt;TOKEN&gt; \\
+  -H "Content-Type: application/json" \\
+  -d '{{"prompt":"Fasse das Folgende in 2 Sätzen zusammen","extra_context":"…lange Logdatei…"}}'</code></pre>
+
+          <h3 style="margin:1.2em 0 0.3em;font-size:0.95em;">② Webhook <em>ohne</em> Default Prompt (open)</h3>
+          <p style="margin:0 0 0.3em;font-size:0.88em;color:var(--muted);"><strong>Pflicht:</strong> <code>prompt</code> im Body. Sonst tut der Webhook nichts. Nutze das wenn jeder Aufruf eine andere Frage stellt.</p>
+          <pre style="background:var(--bg);padding:0.6em;border-radius:4px;overflow-x:auto;font-size:0.85em;"><code># Pflicht-Body: prompt
+curl -X POST ADRESSE:PORT/webhook/&lt;TOKEN&gt; \\
+  -H "Content-Type: application/json" \\
+  -d '{{"prompt":"Welches Wetter ist heute in Wien?"}}'
+
+# Mit allen optionalen Feldern
+curl -X POST ADRESSE:PORT/webhook/&lt;TOKEN&gt; \\
+  -H "Content-Type: application/json" \\
+  -d '{{
+    "prompt":      "Analysiere die Daten und antworte als JSON",
+    "extra_context": "raw_payload_or_data_here",
+    "silent":       false,
+    "save_output":  true,
+    "output_name":  "analyse-2026-05-16.txt",
+    "model":        "qwen3"
+  }}'</code></pre>
+
+          <h3 style="margin:1.2em 0 0.3em;font-size:0.95em;">Felder-Referenz</h3>
+          <table style="font-size:0.85em;">
+            <thead><tr><th>Feld</th><th>Pflicht</th><th>Bedeutung</th></tr></thead>
+            <tbody>
+              <tr><td><code>prompt</code></td><td>nur wenn kein Default</td><td>Was das Modell tun soll (Plain Language). Überschreibt Default falls beides gesetzt.</td></tr>
+              <tr><td><code>extra_context</code></td><td>optional</td><td>Zusätzliche Daten (Payload, Logs, Status) — wird vor den Prompt gestellt.</td></tr>
+              <tr><td><code>silent</code></td><td>optional</td><td><code>true</code> = nicht in Chat pushen, nur als Datei speichern. Default: wie Webhook-Setting.</td></tr>
+              <tr><td><code>save_output</code></td><td>optional</td><td><code>false</code> = Output nicht persistieren. Default: <code>true</code>.</td></tr>
+              <tr><td><code>output_name</code></td><td>optional</td><td>Dateiname für gespeicherten Output. Default: Timestamp.</td></tr>
+              <tr><td><code>model</code></td><td>optional</td><td>Modell-Alias/Name nur für diesen Lauf. Default: das im Webhook gespeicherte.</td></tr>
+            </tbody>
+          </table>
+
+          <h3 style="margin:1.2em 0 0.3em;font-size:0.95em;">③ Externe Services — Foreign Payloads</h3>
+          <p style="margin:0 0 0.3em;font-size:0.88em;color:var(--muted);">
+            Externe Services (GitHub, Slack, IoT, CI) kennen <em>unser</em> Body-Schema nicht — sie schicken ihr eigenes JSON / Form-encoded / raw Text.
+            <strong>Mechanik:</strong> Setze einen Default-Prompt à la „Parse Payload und schicke Summary“. Der ganze Body + alle <code>X-*</code>/<code>User-Agent</code>-Header werden automatisch als <code>extra_context</code> reingereicht. Für externe Services ist Default-Prompt <strong>de facto Pflicht</strong>, da sie nie <code>prompt</code> mitschicken.
+          </p>
+
+          <h4 style="margin:0.8em 0 0.2em;font-size:0.92em;">GitHub Webhook → Matrix</h4>
+          <p style="margin:0 0 0.3em;font-size:0.85em;color:var(--muted);">Repo Settings → Webhooks → Add Webhook. Content type <code>application/json</code>.</p>
+          <pre style="background:var(--bg);padding:0.6em;border-radius:4px;overflow-x:auto;font-size:0.85em;"><code># Webhook anlegen:
+# Default Prompt: "Fasse das GitHub-Event in 1 Zeile (Event-Typ aus X-GitHub-Event).
+#                  Bei pull_request: '&lt;action&gt;: &lt;title&gt; von &lt;user.login&gt;'.
+#                  Bei push: '&lt;n&gt; commits to &lt;ref&gt; von &lt;pusher.name&gt;'.
+#                  Bei ping: still bleiben — antworte exakt [NO_MESSAGE]."
+# Client: matrix, Room: !abc:server, Silent: aus
+#
+# Payload URL für GitHub: ADRESSE:PORT/webhook/&lt;TOKEN&gt;
+#
+# GitHub schickt automatisch bei jedem Event:
+#   POST ADRESSE:PORT/webhook/&lt;TOKEN&gt;
+#   Headers: X-GitHub-Event: pull_request, X-GitHub-Delivery: &lt;uuid&gt;, X-Hub-Signature-256: …
+#   Body: {{"action":"opened","pull_request":{{"title":"Fix bug","user":{{"login":"alice"}}, …}}, …}}
+# → Modell schreibt z.B. "opened: 'Fix bug' von alice" in Matrix.</code></pre>
+
+          <h4 style="margin:0.8em 0 0.2em;font-size:0.92em;">Slack Outgoing Webhook → Matrix (form-encoded)</h4>
+          <p style="margin:0 0 0.3em;font-size:0.85em;color:var(--muted);">Slack App → Outgoing Webhooks → Trigger Word + URL. Slack POSTet <code>application/x-www-form-urlencoded</code>.</p>
+          <pre style="background:var(--bg);padding:0.6em;border-radius:4px;overflow-x:auto;font-size:0.85em;"><code># Default Prompt: "Slack-Nachricht. Wenn 'urgent' im text oder trigger_word=alarm
+#                  → in Matrix posten als '@&lt;user_name&gt;: &lt;text&gt;'.
+#                  Sonst antworte exakt [NO_MESSAGE]."
+# Client: matrix, Room: !abc:server
+#
+# Slack schickt z.B.:
+#   POST ADRESSE:PORT/webhook/&lt;TOKEN&gt;
+#   Content-Type: application/x-www-form-urlencoded
+#   text=urgent+server+down&user_name=alice&trigger_word=alarm&channel_name=ops
+# → Modell pushed nach Matrix wenn Bedingung passt.
+
+# Manueller Test (Slack-ähnlich simulieren):
+curl -X POST ADRESSE:PORT/webhook/&lt;TOKEN&gt; \\
+  -H "Content-Type: application/x-www-form-urlencoded" \\
+  -d 'text=urgent+server+down&user_name=alice&trigger_word=alarm'</code></pre>
+
+          <h4 style="margin:0.8em 0 0.2em;font-size:0.92em;">Discord Bot Interaction Forwarding</h4>
+          <p style="margin:0 0 0.3em;font-size:0.85em;color:var(--muted);">Discord hat keine klassischen „Outgoing Webhooks“. Stattdessen: dein Discord-Bot/Slash-Command-Handler POSTet zu uns weiter (z.B. via discord-interactions library mit eigenem Proxy-Bot).</p>
+          <pre style="background:var(--bg);padding:0.6em;border-radius:4px;overflow-x:auto;font-size:0.85em;"><code># Mit JSON-Forwarder, der Discord-Interaction payload weitergibt:
+curl -X POST ADRESSE:PORT/webhook/&lt;TOKEN&gt; \\
+  -H "Content-Type: application/json" \\
+  -d '{{"type":2,"data":{{"name":"summarize","options":[]}},"member":{{"user":{{"username":"alice"}}}},"channel_id":"123"}}'
+# → Modell liest type/data/options aus Payload, antwortet entsprechend.</code></pre>
+
+          <h4 style="margin:0.8em 0 0.2em;font-size:0.92em;">IoT-Sensor mit bedingtem Alert</h4>
+          <pre style="background:var(--bg);padding:0.6em;border-radius:4px;overflow-x:auto;font-size:0.85em;"><code># Default Prompt: "Wenn temp &gt; 30 → 'ALARM: &lt;sensor&gt; bei &lt;temp&gt;°C'.
+#                  Sonst antworte exakt [NO_MESSAGE]."
+# Client: matrix, Room: !home:server, save_output: true (Log behalten)
+#
+curl -X POST ADRESSE:PORT/webhook/&lt;TOKEN&gt; \\
+  -H "Content-Type: application/json" \\
+  -d '{{"sensor":"livingroom","temp":24.7,"ts":1715856000}}'
+# → temp &lt;= 30: Modell antwortet [NO_MESSAGE] → kein Chat-Push, nur in Datei.
+# → temp &gt; 30: Modell pusht Alarm nach Matrix.</code></pre>
+
+          <p style="margin:0.8em 0 0;font-size:0.85em;color:var(--muted);">
+            <strong>[NO_MESSAGE] Pattern:</strong> Wenn Modell exakt <code>[NO_MESSAGE]</code> antwortet, wird kein Chat-Push gemacht (Sentinel). Output wird trotzdem als Datei gespeichert wenn <code>save_output=true</code>. Nutze das für „nur posten bei Bedingung X“-Logik.
+          </p>
+
+          <p style="margin:1em 0 0;font-size:0.85em;color:var(--muted);">
+            <strong>Antwort-Routing:</strong> Wenn Webhook ein <code>client</code>/<code>room_id</code>/<code>channel_id</code> hat → Output geht dort hin (Matrix/Discord). Sonst kommt der Output direkt im HTTP-Response-Body (gut für CI-Skripte die auf das Ergebnis warten).
+          </p>
+        </div>
+      </details>
       <div class="card">
         <table>
           <thead><tr><th>Name</th><th>Default Prompt</th><th>Ziel</th><th>Token</th><th>Letzter Lauf</th><th>ID</th></tr></thead>
@@ -4551,6 +5905,48 @@ async def webhooks_page(request: Request):
         <span class="text-muted" style="margin-left:1em;">▶ ausführen · ✎ bearbeiten · ✕ löschen · POST <code>/webhook/&lt;token&gt;</code> + JSON <code>{{"extra_context":"..."}}</code> · Chat: <code>/webhook &lt;text&gt;</code> für Folgefragen</span>
       </div>
     </div>
+    <div class="modal-overlay" id="confirmModal">
+      <div class="modal-box" style="max-width:480px;">
+        <h2 id="confirmTitle" style="margin:0 0 0.6em;"></h2>
+        <div id="confirmBody" style="font-size:0.92em;line-height:1.45;white-space:pre-wrap;"></div>
+        <div class="modal-actions">
+          <button class="btn btn-outline" id="confirmCancel">Abbrechen</button>
+          <button class="btn btn-primary" id="confirmOk">OK</button>
+        </div>
+      </div>
+    </div>
+    <div id="toastWrap" style="position:fixed;bottom:1.2em;right:1.2em;display:flex;flex-direction:column;gap:0.5em;z-index:2000;pointer-events:none;"></div>
+    <div class="modal-overlay" id="tokenModal">
+      <div class="modal-box">
+        <h2 id="tokenTitle">Token</h2>
+        <p id="tokenHint" style="margin:0 0 0.5em;color:var(--muted);font-size:0.88em;"></p>
+        <div style="display:flex;gap:0.4em;align-items:stretch;">
+          <input type="text" id="tokenValue" readonly style="flex:1;font-family:monospace;font-size:0.92em;padding:0.5em;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--text);" onclick="this.select()">
+          <button class="btn btn-outline" id="tokenCopy" style="white-space:nowrap;">📋 Kopieren</button>
+        </div>
+        <p id="tokenCopyStatus" style="margin:0.4em 0 0;font-size:0.82em;color:var(--muted);min-height:1em;"></p>
+        <div class="modal-actions">
+          <button class="btn btn-primary" id="tokenClose">Schließen</button>
+        </div>
+      </div>
+    </div>
+    <div class="modal-overlay" id="runModal">
+      <div class="modal-box">
+        <h2>Webhook ausführen — <span id="runName"></span></h2>
+        <p style="margin:0 0 0.5em;color:var(--muted);font-size:0.9em;">Dieser Webhook hat keinen Default Prompt. Gib einen Prompt ein, der einmalig für diesen Lauf verwendet wird.</p>
+        <div class="wh-form">
+          <label for="runPrompt">Prompt <span class="hint">(Pflicht — was soll das Modell tun?)</span></label>
+          <textarea id="runPrompt" rows="5" placeholder="z.B. Fasse die aktuellen Nachrichten von example.com als 3 Bullets zusammen."></textarea>
+          <label for="runExtra">Extra Context <span class="hint">(optional — zusätzliche Daten z.B. Payload)</span></label>
+          <textarea id="runExtra" rows="3" placeholder=""></textarea>
+        </div>
+        <p id="runError" style="margin:0.4em 0 0;font-size:0.85em;color:var(--danger);min-height:1em;"></p>
+        <div class="modal-actions">
+          <button class="btn btn-outline" id="runCancel">Abbrechen</button>
+          <button class="btn btn-primary" id="runFire">Starten</button>
+        </div>
+      </div>
+    </div>
     <div class="modal-overlay" id="editModal">
       <div class="modal-box">
         <h2>Webhook bearbeiten</h2>
@@ -4559,10 +5955,8 @@ async def webhooks_page(request: Request):
           <input type="text" id="editName">
           <label for="editPrompt">Default Prompt</label>
           <textarea id="editPrompt" rows="5"></textarea>
-          <label for="editClient">Client</label>
-          <select id="editClient"><option value="">default</option><option>matrix</option><option>discord</option><option>both</option><option>none</option></select>
-          <label for="editRoom">Room / Channel</label>
-          <input type="text" id="editRoom" placeholder="!abc:server  oder  Discord-Channel-ID">
+          <label for="editTarget">Ziel (Raum / Channel)</label>
+          <select id="editTarget">{_build_target_options(load_config())}</select>
           <label for="editModel">Modell</label>
           <input type="text" id="editModel">
           <label for="editSilent">Silent</label>
@@ -4578,33 +5972,119 @@ async def webhooks_page(request: Request):
     var _editId = null;
     var token = new URLSearchParams(window.location.search).get("token") || "";
     function tq() {{ return token ? "?token=" + encodeURIComponent(token) : ""; }}
-    var btnCreate = document.getElementById("btnCreate");
-    if (btnCreate) btnCreate.addEventListener("click", function() {{
-      var body = {{
-        name: document.getElementById("newName").value.trim(),
-        prompt: document.getElementById("newPrompt").value.trim(),
-        client: document.getElementById("newClient").value || null,
-        model: document.getElementById("newModel").value.trim() || null,
-        silent: document.getElementById("newSilent").checked,
-        save_output: document.getElementById("newSaveOutput").checked,
-      }};
-      var room = document.getElementById("newRoom").value.trim();
-      if (room) {{
-        if (room.startsWith("!")) body.room_id = room; else body.channel_id = room;
+    /* === In-Page Confirm Modal (replaces window.confirm) === */
+    var _confirmResolve = null;
+    function appConfirm(title, body, opts) {{
+      opts = opts || {{}};
+      document.getElementById("confirmTitle").textContent = title || "";
+      var bodyEl = document.getElementById("confirmBody");
+      bodyEl.textContent = body || "";
+      document.getElementById("confirmOk").textContent = opts.okLabel || "OK";
+      document.getElementById("confirmCancel").textContent = opts.cancelLabel || "Abbrechen";
+      document.getElementById("confirmModal").classList.add("open");
+      return new Promise(function(resolve){{ _confirmResolve = resolve; }});
+    }}
+    function _confirmDone(result) {{
+      document.getElementById("confirmModal").classList.remove("open");
+      var r = _confirmResolve; _confirmResolve = null;
+      if (r) r(result);
+    }}
+    document.getElementById("confirmOk").addEventListener("click", function(){{ _confirmDone(true); }});
+    document.getElementById("confirmCancel").addEventListener("click", function(){{ _confirmDone(false); }});
+    document.getElementById("confirmModal").addEventListener("click", function(e){{ if (e.target === this) _confirmDone(false); }});
+    /* === Toast notifications (replaces window.alert for errors/status) === */
+    function appToast(msg, kind) {{
+      kind = kind || "info";
+      var wrap = document.getElementById("toastWrap");
+      var t = document.createElement("div");
+      var bg = kind === "error" ? "#c53030" : (kind === "success" ? "#2d8a4e" : "#2a2a4a");
+      t.style.cssText = "pointer-events:auto;background:" + bg + ";color:#fff;padding:0.6em 0.9em;border-radius:6px;box-shadow:0 4px 16px rgba(0,0,0,0.25);font-size:0.9em;max-width:380px;cursor:pointer;opacity:0;transition:opacity 0.2s;";
+      t.textContent = msg;
+      t.addEventListener("click", function(){{ t.remove(); }});
+      wrap.appendChild(t);
+      setTimeout(function(){{ t.style.opacity = "1"; }}, 10);
+      setTimeout(function(){{ t.style.opacity = "0"; setTimeout(function(){{ if (t.parentNode) t.remove(); }}, 300); }}, kind === "error" ? 6000 : 3500);
+    }}
+    var _tokenReloadOnClose = false;
+    function showToken(tok, opts) {{
+      opts = opts || {{}};
+      _tokenReloadOnClose = !!opts.reloadOnClose;
+      document.getElementById("tokenTitle").textContent = opts.title || "Token";
+      document.getElementById("tokenHint").textContent = opts.hint || "";
+      var inp = document.getElementById("tokenValue");
+      inp.value = tok;
+      document.getElementById("tokenCopyStatus").textContent = "";
+      document.getElementById("tokenModal").classList.add("open");
+      setTimeout(function(){{ inp.focus(); inp.select(); }}, 50);
+    }}
+    function _closeTokenModal() {{
+      document.getElementById("tokenModal").classList.remove("open");
+      if (_tokenReloadOnClose) {{ _tokenReloadOnClose = false; location.reload(); }}
+    }}
+    document.getElementById("tokenClose").addEventListener("click", _closeTokenModal);
+    document.getElementById("tokenModal").addEventListener("click", function(e){{ if (e.target === this) _closeTokenModal(); }});
+    document.getElementById("tokenCopy").addEventListener("click", function(){{
+      var v = document.getElementById("tokenValue").value;
+      var status = document.getElementById("tokenCopyStatus");
+      function ok(){{ status.textContent = "✓ Kopiert"; status.style.color = "var(--success, #2d8a4e)"; }}
+      function fail(){{
+        status.textContent = "Auto-Kopieren fehlgeschlagen — manuell mit Strg+C";
+        status.style.color = "var(--muted)";
+        document.getElementById("tokenValue").select();
       }}
-      if (!body.prompt && !confirm("Kein Default Prompt gesetzt — der Caller muss dann bei jedem POST 'prompt' mitschicken. Trotzdem anlegen?")) return;
+      if (navigator.clipboard && navigator.clipboard.writeText) {{
+        navigator.clipboard.writeText(v).then(ok, fail);
+      }} else {{
+        try {{ document.getElementById("tokenValue").select(); document.execCommand("copy"); ok(); }} catch (e) {{ fail(); }}
+      }}
+    }});
+    var btnCreate = document.getElementById("btnCreate");
+    function _doCreate(body) {{
       fetch("/api/webhook" + tq(), {{
         method:"POST", headers:{{"Content-Type":"application/json"}}, body: JSON.stringify(body)
       }}).then(function(r){{
         return r.json().then(function(d){{
           if (r.ok && d.item && d.item.token) {{
-            // Token nur EINMAL plaintext zeigen — danach im UI maskiert + on-demand via Reveal-Button
-            alert("Webhook angelegt.\\n\\nToken (jetzt kopieren — wird danach maskiert):\\n\\n" + d.item.token);
+            showToken(d.item.token, {{
+              title: "Webhook angelegt",
+              hint: "Token jetzt kopieren — danach wird er im UI nur noch maskiert angezeigt. Schließen lädt die Liste neu.",
+              reloadOnClose: true
+            }});
+          }} else if (r.ok) {{
+            location.reload();
+          }} else {{
+            appToast(d.detail || d.error || "Fehler", "error");
           }}
-          if (r.ok) location.reload();
-          else alert(d.detail || d.error || "Fehler");
         }});
-      }});
+      }}).catch(function(e){{ appToast("Fehler: " + e, "error"); }});
+    }}
+    if (btnCreate) btnCreate.addEventListener("click", function() {{
+      var body = {{
+        name: document.getElementById("newName").value.trim(),
+        prompt: document.getElementById("newPrompt").value.trim(),
+        model: document.getElementById("newModel").value.trim() || null,
+        silent: document.getElementById("newSilent").checked,
+        save_output: document.getElementById("newSaveOutput").checked,
+      }};
+      var tgt = document.getElementById("newTarget").value || "";
+      if (tgt.indexOf("matrix:") === 0) {{
+        body.room_id = tgt.substring(7); body.client = "matrix";
+      }} else if (tgt.indexOf("discord:") === 0) {{
+        body.channel_id = tgt.substring(8); body.client = "discord";
+      }} else {{
+        body.client = null;
+      }}
+      if (!body.prompt) {{
+        appConfirm(
+          "Kein Default Prompt gesetzt",
+          "• Funktioniert nur wenn der Caller bei JEDEM POST ein 'prompt' Feld mitschickt (eigene Skripte, eigene Apps).\\n\\n" +
+          "• Externe Services (GitHub, Discord, Slack, Sensoren …) schicken niemals 'prompt' — für die brauchst du einen Default Prompt.\\n\\n" +
+          "Trotzdem ohne Default anlegen?",
+          {{ okLabel: "Ohne Default anlegen" }}
+        ).then(function(ok){{ if (ok) _doCreate(body); }});
+      }} else {{
+        _doCreate(body);
+      }}
     }});
     document.querySelectorAll(".btn-reveal").forEach(function(btn) {{
       btn.addEventListener("click", function() {{
@@ -4612,17 +6092,10 @@ async def webhooks_page(request: Request):
         fetch("/api/webhook/" + encodeURIComponent(id) + "/token" + tq(), {{credentials:"same-origin"}})
           .then(function(r){{ return r.json().then(function(d){{ return {{ok: r.ok, data: d}}; }}); }})
           .then(function(res) {{
-            if (!res.ok) {{ alert(res.data.detail || "Fehler"); return; }}
-            var t = res.data.token || "";
-            if (navigator.clipboard && navigator.clipboard.writeText) {{
-              navigator.clipboard.writeText(t).then(function() {{
-                alert("Token in Zwischenablage kopiert:\\n\\n" + t);
-              }}, function() {{ alert("Token:\\n\\n" + t); }});
-            }} else {{
-              alert("Token:\\n\\n" + t);
-            }}
+            if (!res.ok) {{ appToast(res.data.detail || "Fehler", "error"); return; }}
+            showToken(res.data.token || "", {{ title: "Token", hint: "Kopier-Button benutzen oder Textfeld auswählen und Strg+C." }});
           }})
-          .catch(function(e){{ alert("Fehler: " + e); }});
+          .catch(function(e){{ appToast("Fehler: " + e, "error"); }});
       }});
     }});
     document.querySelectorAll(".btn-edit").forEach(function(btn) {{
@@ -4630,10 +6103,12 @@ async def webhooks_page(request: Request):
         _editId = this.getAttribute("data-id");
         document.getElementById("editName").value = this.getAttribute("data-name") || "";
         document.getElementById("editPrompt").value = this.getAttribute("data-prompt") || "";
-        document.getElementById("editClient").value = this.getAttribute("data-client") || "";
         var room = this.getAttribute("data-room") || "";
         var channel = this.getAttribute("data-channel") || "";
-        document.getElementById("editRoom").value = room || channel;
+        var tgtSel = document.getElementById("editTarget");
+        if (room) tgtSel.value = "matrix:" + room;
+        else if (channel) tgtSel.value = "discord:" + channel;
+        else tgtSel.value = "";
         document.getElementById("editModel").value = this.getAttribute("data-model") || "";
         document.getElementById("editSilent").checked = this.getAttribute("data-silent") === "1";
         document.getElementById("editModal").classList.add("open");
@@ -4644,38 +6119,877 @@ async def webhooks_page(request: Request):
       var body = {{
         name: document.getElementById("editName").value.trim(),
         prompt: document.getElementById("editPrompt").value.trim(),
-        client: document.getElementById("editClient").value || null,
         model: document.getElementById("editModel").value.trim() || null,
         silent: document.getElementById("editSilent").checked,
       }};
-      var room = document.getElementById("editRoom").value.trim();
-      body.room_id = room.startsWith("!") ? room : null;
-      body.channel_id = (!room.startsWith("!") && room) ? room : null;
+      var tgt = document.getElementById("editTarget").value || "";
+      if (tgt.indexOf("matrix:") === 0) {{
+        body.room_id = tgt.substring(7); body.channel_id = null; body.client = "matrix";
+      }} else if (tgt.indexOf("discord:") === 0) {{
+        body.channel_id = tgt.substring(8); body.room_id = null; body.client = "discord";
+      }} else {{
+        body.room_id = null; body.channel_id = null; body.client = null;
+      }}
       fetch("/api/webhook/" + encodeURIComponent(_editId) + tq(), {{
         method:"PATCH", headers:{{"Content-Type":"application/json"}}, body: JSON.stringify(body)
       }}).then(function(r){{
         if (r.ok) location.reload();
-        else r.json().then(function(d){{ alert(d.detail || "Fehler"); }});
-      }});
+        else r.json().then(function(d){{ appToast(d.detail || "Fehler", "error"); }});
+      }}).catch(function(e){{ appToast("Fehler: " + e, "error"); }});
     }});
     document.getElementById("editModal").addEventListener("click", function(e){{ if (e.target === this) this.classList.remove("open"); }});
+    var _runId = null;
+    var _runBtn = null;
+    function _doFire(id, body, btn) {{
+      btn.disabled = true; btn.textContent = "…";
+      var opts = {{ method: "POST" }};
+      if (body) {{
+        opts.headers = {{ "Content-Type": "application/json" }};
+        opts.body = JSON.stringify(body);
+      }}
+      fetch("/api/webhook/" + encodeURIComponent(id) + "/run" + tq(), opts).then(function(r){{
+        if (r.ok) {{ btn.textContent = "✓"; appToast("Webhook gestartet", "success"); setTimeout(function(){{ btn.disabled = false; btn.innerHTML = "&#9654;"; }}, 2000); }}
+        else r.json().then(function(d){{ appToast(d.detail || "Fehler", "error"); btn.disabled = false; btn.innerHTML = "&#9654;"; }});
+      }}).catch(function(e){{ appToast("Fehler: " + e, "error"); btn.disabled = false; btn.innerHTML = "&#9654;"; }});
+    }}
     document.querySelectorAll(".btn-run").forEach(function(btn) {{
       btn.addEventListener("click", function() {{
         var id = this.getAttribute("data-id");
-        var b = this; b.disabled = true; b.textContent = "…";
-        fetch("/api/webhook/" + encodeURIComponent(id) + "/run" + tq(), {{ method:"POST" }}).then(function(r){{
-          if (r.ok) {{ b.textContent = "✓"; setTimeout(function(){{ b.disabled = false; b.innerHTML = "&#9654;"; }}, 2000); }}
-          else r.json().then(function(d){{ alert(d.detail || "Fehler"); b.disabled = false; b.innerHTML = "&#9654;"; }});
-        }}).catch(function(){{ b.disabled = false; b.innerHTML = "&#9654;"; }});
+        var hasDefault = this.getAttribute("data-has-default") === "1";
+        if (hasDefault) {{
+          _doFire(id, null, this);
+          return;
+        }}
+        _runId = id;
+        _runBtn = this;
+        document.getElementById("runName").textContent = this.getAttribute("data-name") || id.slice(0,8);
+        document.getElementById("runPrompt").value = "";
+        document.getElementById("runExtra").value = "";
+        document.getElementById("runError").textContent = "";
+        document.getElementById("runModal").classList.add("open");
+        setTimeout(function(){{ document.getElementById("runPrompt").focus(); }}, 50);
       }});
+    }});
+    document.getElementById("runCancel").addEventListener("click", function() {{ document.getElementById("runModal").classList.remove("open"); }});
+    document.getElementById("runModal").addEventListener("click", function(e){{ if (e.target === this) this.classList.remove("open"); }});
+    document.getElementById("runFire").addEventListener("click", function() {{
+      var p = document.getElementById("runPrompt").value.trim();
+      var err = document.getElementById("runError");
+      if (!p) {{
+        err.textContent = "Prompt ist Pflicht — dieser Webhook hat keinen Default.";
+        document.getElementById("runPrompt").focus();
+        return;
+      }}
+      err.textContent = "";
+      var body = {{ prompt: p }};
+      var ex = document.getElementById("runExtra").value.trim();
+      if (ex) body.extra_context = ex;
+      document.getElementById("runModal").classList.remove("open");
+      if (_runId && _runBtn) _doFire(_runId, body, _runBtn);
     }});
     document.querySelectorAll(".btn-del").forEach(function(btn) {{
       btn.addEventListener("click", function() {{
         var id = this.getAttribute("data-id");
-        if (!confirm("Webhook " + id.slice(0,8) + " loeschen? (Outputs bleiben erhalten)")) return;
-        fetch("/api/webhook/" + encodeURIComponent(id) + tq(), {{ method:"DELETE" }}).then(function(r){{
-          if (r.ok) location.reload();
-          else r.json().then(function(d){{ alert(d.detail || "Fehler"); }});
+        appConfirm(
+          "Webhook löschen?",
+          "ID: " + id.slice(0,8) + "\\n\\nOutputs (gespeicherte Dateien) bleiben erhalten.",
+          {{ okLabel: "Löschen" }}
+        ).then(function(ok){{
+          if (!ok) return;
+          fetch("/api/webhook/" + encodeURIComponent(id) + tq(), {{ method:"DELETE" }}).then(function(r){{
+            if (r.ok) location.reload();
+            else r.json().then(function(d){{ appToast(d.detail || "Fehler", "error"); }});
+          }}).catch(function(e){{ appToast("Fehler: " + e, "error"); }});
+        }});
+      }});
+    }});
+    </script>
+    {_THEME_JS}
+    </body></html>
+    """
+    return HTMLResponse(html)
+
+
+# ---------------------------------------------------------------------------
+# Rooms / Channels page (Matrix + Discord per-room response modes)
+# ---------------------------------------------------------------------------
+
+def _build_target_options(config: dict, *, selected_matrix: str = "", selected_discord: str = "") -> str:
+    """Build <option> list HTML for the room/channel select used in /schedules and /webhooks.
+    Value format: '' (none), 'matrix:<room_id>' or 'discord:<channel_id>'.
+    Only includes clients that are enabled. Adds 'kein expliziter Raum' as default option."""
+    data = _collect_rooms_and_channels(config)
+    parts = ['<option value="">— kein expliziter Raum (an alle authed User) —</option>']
+    if data["matrix_enabled"]:
+        if data["matrix_rooms"]:
+            parts.append('<optgroup label="Matrix">')
+            for r in data["matrix_rooms"]:
+                if r.get("offline"):
+                    continue
+                rid = r["id"]
+                sel = " selected" if rid == selected_matrix else ""
+                label = f'{r["name"]} ({rid})'
+                parts.append(f'<option value="matrix:{_escape(rid)}"{sel}>{_escape(label)}</option>')
+            parts.append('</optgroup>')
+        else:
+            parts.append('<optgroup label="Matrix"><option disabled>(Bot in keinem Raum oder noch nicht verbunden)</option></optgroup>')
+    if data["discord_enabled"]:
+        if data["discord_channels"]:
+            parts.append('<optgroup label="Discord">')
+            for c in data["discord_channels"]:
+                if c.get("offline"):
+                    continue
+                cid = c["id"]
+                sel = " selected" if cid == selected_discord else ""
+                guild = c.get("guild") or ""
+                label = f'#{c["name"]} ({guild}) [{cid}]' if guild else f'#{c["name"]} [{cid}]'
+                parts.append(f'<option value="discord:{_escape(cid)}"{sel}>{_escape(label)}</option>')
+            parts.append('</optgroup>')
+        else:
+            parts.append('<optgroup label="Discord"><option disabled>(Bot in keinem Channel oder noch nicht verbunden)</option></optgroup>')
+    return "\n".join(parts)
+
+
+def _resolve_target_name(config: dict, *, room_id: str = "", channel_id: str = "") -> str:
+    """Returns the human-friendly name for a stored room_id/channel_id, or empty string if not resolvable."""
+    if not room_id and not channel_id:
+        return ""
+    data = _collect_rooms_and_channels(config)
+    if room_id:
+        for r in data["matrix_rooms"]:
+            if r["id"] == room_id:
+                return r["name"]
+    if channel_id:
+        for c in data["discord_channels"]:
+            if c["id"] == channel_id:
+                return f'#{c["name"]}'
+    return ""
+
+
+def _collect_rooms_and_channels(config: dict) -> dict:
+    """Pull joined Matrix rooms + Discord channels, merge with saved modes from config."""
+    matrix_cfg = (config.get("chat_clients") or {}).get("matrix") or {}
+    discord_cfg = (config.get("chat_clients") or {}).get("discord") or {}
+    room_modes = matrix_cfg.get("room_modes") or {}
+    channel_modes = discord_cfg.get("channel_modes") or {}
+    room_settings = matrix_cfg.get("room_settings") or {}
+    channel_settings = discord_cfg.get("channel_settings") or {}
+
+    def _settings_for(rs: dict, rid: str, members: int) -> dict:
+        s = rs.get(rid) or {}
+        ctx_mode = (s.get("context") or "").strip().lower()
+        if ctx_mode not in ("agent", "group"):
+            # Default: group für Räume mit >2 Mitgliedern, sonst agent (DM)
+            ctx_mode = "group" if (members or 0) > 2 else "agent"
+        return {
+            "context": ctx_mode,
+            "language": (s.get("language") or "auto").strip().lower(),
+            "tools_allow": list(s.get("tools_allow") or []),
+            "workspace_subdir": (s.get("workspace_subdir") or "").strip(),
+            "auto_context_count": int(s.get("auto_context_count")) if s.get("auto_context_count") is not None else 3,
+            "auto_context_max_chars": int(s.get("auto_context_max_chars")) if s.get("auto_context_max_chars") is not None else 200,
+            "docs_in_sandbox": bool(s.get("docs_in_sandbox")),
+            "search_chat_history_max": int(s.get("search_chat_history_max")) if s.get("search_chat_history_max") is not None else 200,
+            "is_default_settings": rid not in rs,
+        }
+
+    matrix_rooms: list[dict] = []
+    discord_channels: list[dict] = []
+    try:
+        from miniassistant.matrix_bot import list_joined_rooms
+        for r in list_joined_rooms():
+            mode = (room_modes.get(r["id"]) or "").strip().lower()
+            if mode not in ("always", "mention", "off"):
+                mode = "always" if r.get("members") == 2 else "mention"
+            matrix_rooms.append({**r, "mode": mode, "is_default": not room_modes.get(r["id"]),
+                                 "settings": _settings_for(room_settings, r["id"], r.get("members", 0))})
+    except Exception as e:
+        logger.warning("list_joined_rooms failed: %s", e)
+    try:
+        from miniassistant.discord_bot import list_channels
+        for c in list_channels():
+            mode = (channel_modes.get(c["id"]) or "").strip().lower()
+            if mode not in ("always", "mention", "off"):
+                mode = "always" if c.get("kind") == "dm" else "mention"
+            members_proxy = 2 if c.get("kind") == "dm" else 3  # DM=agent default, text-channel=group default
+            discord_channels.append({**c, "mode": mode, "is_default": not channel_modes.get(c["id"]),
+                                     "settings": _settings_for(channel_settings, c["id"], members_proxy)})
+    except Exception as e:
+        logger.warning("list_channels failed: %s", e)
+
+    seen_matrix = {r["id"] for r in matrix_rooms}
+    for rid, mode in room_modes.items():
+        if rid not in seen_matrix:
+            matrix_rooms.append({"id": rid, "name": "(nicht verbunden)", "members": 0, "encrypted": False,
+                                 "mode": mode, "is_default": False, "offline": True,
+                                 "settings": _settings_for(room_settings, rid, 0)})
+    seen_discord = {c["id"] for c in discord_channels}
+    for cid, mode in channel_modes.items():
+        if cid not in seen_discord:
+            discord_channels.append({"id": cid, "name": "(nicht verbunden)", "guild": "", "kind": "text",
+                                     "mode": mode, "is_default": False, "offline": True,
+                                     "settings": _settings_for(channel_settings, cid, 3)})
+    return {
+        "matrix_enabled": bool(matrix_cfg.get("enabled")),
+        "discord_enabled": bool(discord_cfg.get("enabled")),
+        "matrix_rooms": matrix_rooms,
+        "discord_channels": discord_channels,
+    }
+
+
+@app.get("/api/rooms")
+async def api_rooms_get(request: Request):
+    _require_token(request)
+    config = load_config()
+    return JSONResponse(_collect_rooms_and_channels(config))
+
+
+@app.post("/api/rooms/leave")
+async def api_rooms_leave(request: Request):
+    """Body: {"kind": "matrix"|"discord_guild", "id": "<room_id_or_guild_id>"}.
+    Matrix: bot leaves the room. Discord: bot leaves the entire guild (no per-channel leave exists)."""
+    _require_token(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="body must be an object")
+    kind = (body.get("kind") or "").strip().lower()
+    target_id = (body.get("id") or "").strip()
+    if not target_id:
+        raise HTTPException(status_code=400, detail="id required")
+    loop = asyncio.get_event_loop()
+    if kind == "matrix":
+        try:
+            from miniassistant.matrix_bot import leave_room
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"matrix_bot import failed: {e}")
+        # leave_room is sync + blocks up to 30s on future.result — offload to thread pool
+        ok, msg = await loop.run_in_executor(_chat_executor, leave_room, target_id)
+        if ok:
+            try:
+                config = load_config()
+                section = ((config.get("chat_clients") or {}).get("matrix") or {})
+                modes = section.get("room_modes") or {}
+                if target_id in modes:
+                    modes.pop(target_id, None)
+                    if not modes:
+                        section.pop("room_modes", None)
+                    save_config(config)
+            except Exception as e:
+                logger.warning("leave: mode cleanup failed: %s", e)
+        return JSONResponse({"ok": ok, "message": msg or ("ok" if ok else "leave failed (no detail from matrix server)")})
+    if kind == "discord_guild":
+        try:
+            from miniassistant.discord_bot import leave_guild
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"discord_bot import failed: {e}")
+        ok, msg = await loop.run_in_executor(_chat_executor, leave_guild, target_id)
+        return JSONResponse({"ok": ok, "message": msg or ("ok" if ok else "leave failed")})
+    raise HTTPException(status_code=400, detail="kind must be 'matrix' or 'discord_guild'")
+
+
+@app.patch("/api/rooms")
+async def api_rooms_patch(request: Request):
+    """Body: {"matrix": {"<room_id>": "always|mention|off"}, "discord": {"<channel_id>": "..."}}.
+    Setting value to null/empty string removes override (falls back to default)."""
+    _require_token(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="body must be an object")
+    valid = {"always", "mention", "off"}
+    counts = {"m": 0, "d": 0}
+
+    def _apply_one(cc: dict, client_key: str, modes_key: str, payload_key: str) -> int:
+        section = cc.get(client_key)
+        if not isinstance(section, dict):
+            return 0
+        current = section.get(modes_key) or {}
+        if not isinstance(current, dict):
+            current = {}
+        incoming = body.get(payload_key) or {}
+        if not isinstance(incoming, dict):
+            return 0
+        changed = 0
+        for k, v in incoming.items():
+            if not isinstance(k, str) or not k:
+                continue
+            if v in (None, ""):
+                if k in current:
+                    current.pop(k, None); changed += 1
+                continue
+            v2 = str(v).strip().lower()
+            if v2 not in valid:
+                continue
+            if current.get(k) != v2:
+                current[k] = v2; changed += 1
+        if current:
+            section[modes_key] = current
+        elif modes_key in section:
+            section.pop(modes_key, None)
+        return changed
+
+    def _updater(config: dict) -> None:
+        cc = config.setdefault("chat_clients", {})
+        counts["m"] = _apply_one(cc, "matrix", "room_modes", "matrix")
+        counts["d"] = _apply_one(cc, "discord", "channel_modes", "discord")
+
+    from miniassistant.config import save_config_atomic
+    save_config_atomic(_updater)
+    return JSONResponse({"ok": True, "matrix_changes": counts["m"], "discord_changes": counts["d"]})
+
+
+@app.patch("/api/rooms/settings")
+async def api_rooms_settings_patch(request: Request):
+    """Body: {"matrix": {"<room_id>": {context, language, tools_allow[], workspace_subdir} | null}, "discord": {...}}.
+    null = Eintrag entfernen (fällt auf Defaults zurück). Per-Room Group-Mode-Konfiguration."""
+    _require_token(request)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="body must be an object")
+    from miniassistant.group_rooms import GROUP_ALLOWED_TOOLS, sanitize_workspace_subdir
+    import re as _re
+    valid_ctx = {"agent", "group"}
+    valid_lang = _re.compile(r"^(auto|[a-z]{2}(-[A-Z]{2})?)$")
+
+    def _norm_entry(entry: Any) -> dict | None:
+        if not isinstance(entry, dict):
+            return None
+        ctx_m = str(entry.get("context") or "").strip().lower()
+        if ctx_m not in valid_ctx:
+            ctx_m = "agent"
+        lang = str(entry.get("language") or "auto").strip().lower()
+        if not valid_lang.match(lang):
+            lang = "auto"
+        raw_tools = entry.get("tools_allow") or []
+        if not isinstance(raw_tools, list):
+            raw_tools = []
+        tools = sorted({str(t).strip() for t in raw_tools if isinstance(t, str)} & GROUP_ALLOWED_TOOLS)
+        sub = str(entry.get("workspace_subdir") or "").strip()
+        if sub:
+            sub = sanitize_workspace_subdir(sub)
+        out: dict[str, Any] = {"context": ctx_m, "language": lang, "tools_allow": tools}
+        if sub:
+            out["workspace_subdir"] = sub
+        # Auto-context per-room knobs (clamped to safe ranges)
+        if "auto_context_count" in entry:
+            try:
+                out["auto_context_count"] = max(0, min(int(entry.get("auto_context_count") or 0), 20))
+            except (TypeError, ValueError):
+                pass
+        if "auto_context_max_chars" in entry:
+            try:
+                from miniassistant.group_rooms import AUTO_CONTEXT_MAX_CHARS_CAP
+                out["auto_context_max_chars"] = max(20, min(int(entry.get("auto_context_max_chars") or 200), AUTO_CONTEXT_MAX_CHARS_CAP))
+            except (TypeError, ValueError):
+                pass
+        # Docs read-only mount toggle
+        if "docs_in_sandbox" in entry:
+            out["docs_in_sandbox"] = bool(entry.get("docs_in_sandbox"))
+        # search_chat_history max scan limit per room (10-500)
+        if "search_chat_history_max" in entry:
+            try:
+                out["search_chat_history_max"] = max(10, min(int(entry.get("search_chat_history_max") or 200), 500))
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    counts = {"m": 0, "d": 0}
+
+    def _apply_one(cc: dict, client_key: str, store_key: str, payload_key: str) -> int:
+        section = cc.get(client_key)
+        if not isinstance(section, dict):
+            section = {}
+            cc[client_key] = section
+        current = section.get(store_key) or {}
+        if not isinstance(current, dict):
+            current = {}
+        incoming = body.get(payload_key) or {}
+        if not isinstance(incoming, dict):
+            return 0
+        changed = 0
+        for k, v in incoming.items():
+            if not isinstance(k, str) or not k:
+                continue
+            if v is None:
+                if k in current:
+                    current.pop(k, None); changed += 1
+                continue
+            normed = _norm_entry(v)
+            if normed is None:
+                continue
+            if current.get(k) != normed:
+                current[k] = normed; changed += 1
+        if current:
+            section[store_key] = current
+        elif store_key in section:
+            section.pop(store_key, None)
+        return changed
+
+    def _updater(config: dict) -> None:
+        cc = config.setdefault("chat_clients", {})
+        counts["m"] = _apply_one(cc, "matrix", "room_settings", "matrix")
+        counts["d"] = _apply_one(cc, "discord", "channel_settings", "discord")
+
+    from miniassistant.config import save_config_atomic
+    save_config_atomic(_updater)
+    return JSONResponse({"ok": True, "matrix_changes": counts["m"], "discord_changes": counts["d"]})
+
+
+@app.get("/rooms", response_class=HTMLResponse)
+async def rooms_page(request: Request):
+    _require_token(request)
+    token = request.query_params.get("token", "")
+    tq = _token_query(token)
+    config = load_config()
+    data = _collect_rooms_and_channels(config)
+
+    def _mode_select(prefix: str, id_: str, current: str) -> str:
+        opts = []
+        for v, label in [("always", "Immer antworten"), ("mention", "Nur auf Erwähnung"), ("off", "Aus (nur Tools)")]:
+            sel = " selected" if v == current else ""
+            opts.append(f'<option value="{v}"{sel}>{label}</option>')
+        return f'<select class="mode-sel" data-kind="{prefix}" data-id="{_escape(id_)}">{"".join(opts)}</select>'
+
+    _GROUP_TOOLS_ALL = ("web_search", "read_url", "check_url", "send_image", "send_audio", "exec", "read_recent_messages", "search_chat_history", "invoke_model")
+
+    def _settings_row(prefix: str, target_id: str, s: dict, colspan: int) -> str:
+        """Ausklappbare Detailzeile für Group-Mode-Settings (context/language/tools/workspace)."""
+        if not s:
+            return ""
+        ctx_m = s.get("context", "agent")
+        lang = s.get("language", "auto")
+        allow = set(s.get("tools_allow") or [])
+        sub = s.get("workspace_subdir", "")
+        ac_count = int(s.get("auto_context_count", 3))
+        ac_max = int(s.get("auto_context_max_chars", 200))
+        sch_max = int(s.get("search_chat_history_max", 200))
+        docs_mount = bool(s.get("docs_in_sandbox"))
+        is_def = s.get("is_default_settings")
+        ctx_opts = "".join(
+            f'<option value="{v}"{" selected" if v == ctx_m else ""}>{lbl}</option>'
+            for v, lbl in (("agent", "Agent (voller persönlicher Kontext)"), ("group", "Group (slim, sandboxed)"))
+        )
+        lang_choices = [("auto", "auto (Sprache des Inputs)"), ("de", "Deutsch"), ("en", "English"),
+                        ("fr", "Français"), ("es", "Español"), ("it", "Italiano"), ("nl", "Nederlands"), ("pt", "Português")]
+        lang_opts = "".join(
+            f'<option value="{v}"{" selected" if v == lang else ""}>{lbl}</option>'
+            for v, lbl in lang_choices
+        )
+        tool_checks = ""
+        for t in _GROUP_TOOLS_ALL:
+            checked = " checked" if t in allow else ""
+            label = t + (" (sandboxed via bwrap)" if t == "exec" else "")
+            tool_checks += (
+                f'<label style="display:inline-flex;align-items:center;gap:0.3em;margin-right:0.9em;font-weight:normal;">'
+                f'<input type="checkbox" class="grp-tool" data-tool="{t}"{checked}> <code>{t}</code><span style="font-size:0.78em;color:var(--muted);">{" sandboxed" if t == "exec" else ""}</span></label>'
+            )
+        hint = " <em>(Standardwerte — noch nicht explizit gespeichert)</em>" if is_def else ""
+        return (
+            f'<tr class="grp-settings-row" data-kind="{prefix}" data-id="{_escape(target_id)}" style="display:none;background:rgba(0,0,0,0.02);">'
+            f'<td colspan="{colspan}" style="padding:0.7em 1em;">'
+            f'<div style="display:grid;grid-template-columns:200px 1fr;gap:0.5em 1em;align-items:center;font-size:0.9em;">'
+            f'<label>Kontext-Modus</label>'
+            f'<select class="grp-ctx">{ctx_opts}</select>'
+            f'<label>Sprache</label>'
+            f'<select class="grp-lang">{lang_opts}</select>'
+            f'<label>Tools (Whitelist)</label>'
+            f'<div class="grp-tools">{tool_checks}</div>'
+            f'<label>Workspace-Subdir</label>'
+            f'<input type="text" class="grp-sub" value="{_escape(sub)}" placeholder="(automatisch aus Room-ID)" style="padding:0.25em 0.4em;font-size:0.9em;">'
+            f'<label>Auto-Context: Nachrichten</label>'
+            f'<div style="display:flex;align-items:center;gap:0.6em;"><span style="font-size:0.82em;color:var(--muted);flex:1;">vorherige Raum-Nachrichten automatisch prependen (0 = aus, default 3)</span><input type="number" class="grp-ac-count" value="{ac_count}" min="0" max="20" step="1" style="padding:0.25em 0.4em;font-size:0.9em;width:6em;" title="0 = aus, max 20"></div>'
+            f'<label>Auto-Context: Zeichen/Nachricht</label>'
+            f'<div style="display:flex;align-items:center;gap:0.6em;"><span style="font-size:0.82em;color:var(--muted);flex:1;">truncate jede Nachricht (default 200, max 5000)</span><input type="number" class="grp-ac-max" value="{ac_max}" min="20" max="5000" step="10" style="padding:0.25em 0.4em;font-size:0.9em;width:6em;" title="20–5000"></div>'
+            f'<label>Chat-Suche: Max Scan</label>'
+            f'<div style="display:flex;align-items:center;gap:0.6em;"><span style="font-size:0.82em;color:var(--muted);flex:1;">obergrenze für <code>search_chat_history</code> (default 200)</span><input type="number" class="grp-sch-max" value="{sch_max}" min="10" max="500" step="10" style="padding:0.25em 0.4em;font-size:0.9em;width:6em;" title="10–500"></div>'
+            f'<label>Docs in Sandbox</label>'
+            f'<label style="display:inline-flex;align-items:center;gap:0.4em;font-weight:normal;"><input type="checkbox" class="grp-docs"{" checked" if docs_mount else ""}> <span style="font-size:0.82em;color:var(--muted);">mountet <code>/docs/</code> read-only (Bot kann via <code>exec cat /docs/FILE</code> Doku lesen)</span></label>'
+            f'</div>'
+            f'<div style="margin-top:0.6em;font-size:0.82em;color:var(--muted);">'
+            f'Group-Mode lädt slimen System-Prompt (keine SOUL/USER/Memory/Palace). '
+            f'<code>exec</code> läuft in bwrap-Sandbox, sieht nur <code>&lt;workspace&gt;/groups/&lt;subdir&gt;/</code> + Systembinaries.{hint}'
+            f'</div>'
+            f'</td></tr>'
+        )
+
+    def _auth_badge(r: dict) -> str:
+        others = r.get("others") or []
+        if not others:
+            return '<span style="color:var(--muted);font-size:0.85em;">—</span>'
+        if r.get("room_trusted"):
+            inv = _escape(r.get("inviter") or "")
+            tip = f"Bot wurde von {inv} (authed) eingeladen — alle {len(others)} Mitglieder dürfen den Bot benutzen"
+            return f'<span title="{tip}" style="color:#2d8a4e;">✅ Raum vertraut</span>'
+        if r.get("members") == 2 and len(others) == 1:
+            o = others[0]
+            uid = _escape(o["user_id"])
+            if o["authed"]:
+                return f'<span title="{uid} hat Auth" style="color:#2d8a4e;">✅ Auth</span>'
+            return f'<span title="{uid} hat KEIN Auth — User muss /auth Code einlösen, oder Bot neu vom authed User einladen lassen" style="color:#c87000;">⚠️ kein Auth</span>'
+        # Group room, kein Raum-Trust
+        ac = r.get("auth_count", 0)
+        tot = len(others)
+        color = "#2d8a4e" if ac == tot else ("#c87000" if ac == 0 else "var(--text)")
+        inv = r.get("inviter") or "?"
+        inv_hint = f" (Inviter: {_escape(inv)} ⚠ nicht authed)" if r.get("inviter") else " (Inviter unbekannt — Bot neu einladen für Raum-Trust)"
+        return f'<span style="color:{color};font-size:0.9em;" title="{ac} von {tot} Mitgliedern haben Auth{inv_hint}">👥 {ac}/{tot} mit Auth</span>'
+
+    matrix_rows = ""
+    if not data["matrix_enabled"]:
+        matrix_rows = '<tr><td colspan="6" style="text-align:center;color:var(--muted);font-style:italic;">Matrix-Client nicht aktiviert.</td></tr>'
+    elif not data["matrix_rooms"]:
+        matrix_rows = '<tr><td colspan="6" style="text-align:center;color:var(--muted);font-style:italic;">Keine Räume gefunden (Bot noch nicht verbunden oder in keinem Raum).</td></tr>'
+    else:
+        for r in data["matrix_rooms"]:
+            offline = '<span style="color:var(--muted);font-size:0.8em;"> (offline)</span>' if r.get("offline") else ""
+            enc = ' <span title="E2EE" style="font-size:0.8em;color:var(--muted);">🔒</span>' if r.get("encrypted") else ""
+            dm = ' <span title="DM" style="font-size:0.78em;color:var(--muted);">DM</span>' if r.get("members") == 2 else ""
+            members = f'<span style="color:var(--muted);font-size:0.85em;">{r.get("members", "?")} Mitg.</span>'
+            default_hint = ' <span style="color:var(--muted);font-size:0.78em;" title="kein expliziter Mode — automatischer Default">(default)</span>' if r.get("is_default") else ""
+            leave_btn = '' if r.get("offline") else f'<button class="btn-leave" data-kind="matrix" data-id="{_escape(r["id"])}" data-name="{_escape(r["name"])}" title="Bot aus diesem Raum entfernen">Verlassen</button>'
+            # DMs (2 Mitglieder) sind immer owner-mode → keine Group-Settings nötig
+            is_dm = r.get("members") == 2
+            adv_btn = "" if is_dm else f'<button class="btn-adv" data-target-kind="matrix" data-target-id="{_escape(r["id"])}" title="Group-Mode-Einstellungen für diesen Raum">⚙</button>'
+            matrix_rows += (
+                f'<tr><td><strong>{_escape(r["name"])}</strong>{enc}{dm}{offline}</td>'
+                f'<td><code style="font-size:0.78em;">{_escape(r["id"])}</code></td>'
+                f'<td>{members}</td>'
+                f'<td>{_auth_badge(r)}</td>'
+                f'<td>{_mode_select("matrix", r["id"], r["mode"])}{default_hint}</td>'
+                f'<td>{adv_btn} {leave_btn}</td></tr>'
+            )
+            if not is_dm:
+                matrix_rows += _settings_row("matrix", r["id"], r.get("settings") or {}, colspan=6)
+
+    # Discord: group by guild for leave-button context
+    discord_rows = ""
+    if not data["discord_enabled"]:
+        discord_rows = '<tr><td colspan="5" style="text-align:center;color:var(--muted);font-style:italic;">Discord-Client nicht aktiviert.</td></tr>'
+    elif not data["discord_channels"]:
+        discord_rows = '<tr><td colspan="5" style="text-align:center;color:var(--muted);font-style:italic;">Keine Channels gefunden (Bot noch nicht verbunden oder in keinem Server/DM).</td></tr>'
+    else:
+        # Find unique guilds with guild_id for leave button
+        seen_guilds: dict[str, str] = {}
+        for c in data["discord_channels"]:
+            gid = c.get("guild_id") or ""
+            gname = c.get("guild") or ""
+            if gid and gid not in seen_guilds:
+                seen_guilds[gid] = gname
+        for c in data["discord_channels"]:
+            offline = '<span style="color:var(--muted);font-size:0.8em;"> (offline)</span>' if c.get("offline") else ""
+            kind = ' <span title="Direct Message" style="font-size:0.78em;color:var(--muted);">DM</span>' if c.get("kind") == "dm" else ""
+            gname = c.get("guild") or ""
+            trust_badge = ""
+            if c.get("guild_trusted"):
+                inv = _escape(c.get("inviter") or "")
+                trust_badge = f' <span title="Bot in Guild eingeladen von User-ID {inv} (authed) — alle Guild-Mitglieder vertraut" style="color:#2d8a4e;font-size:0.78em;">✅ vertraut</span>'
+            elif c.get("inviter"):
+                inv = _escape(c.get("inviter") or "")
+                trust_badge = f' <span title="Inviter User-ID {inv} ist NICHT authed — Guild nicht vertraut, jeder User braucht eigenes Auth" style="color:#c87000;font-size:0.78em;">⚠ Inviter nicht authed</span>'
+            elif c.get("kind") == "text":
+                trust_badge = ' <span title="Kein bot_add Audit-Log gefunden — vermutlich keine VIEW_AUDIT_LOG Permission, kein Guild-Trust möglich" style="color:var(--muted);font-size:0.78em;">? kein Audit-Log</span>'
+            guild = f'<span style="color:var(--muted);font-size:0.85em;">{_escape(gname)}</span>{trust_badge}'
+            default_hint = ' <span style="color:var(--muted);font-size:0.78em;" title="kein expliziter Mode — automatischer Default">(default)</span>' if c.get("is_default") else ""
+            # DMs sind immer owner-mode → keine Group-Settings nötig
+            is_dm_c = c.get("kind") == "dm"
+            adv_btn = "" if is_dm_c else f'<button class="btn-adv" data-target-kind="discord" data-target-id="{_escape(c["id"])}" title="Group-Mode-Einstellungen für diesen Channel">⚙</button>'
+            discord_rows += (
+                f'<tr><td><strong>{_escape(c["name"])}</strong>{kind}{offline}</td>'
+                f'<td><code style="font-size:0.78em;">{_escape(c["id"])}</code></td>'
+                f'<td>{guild}</td>'
+                f'<td>{_mode_select("discord", c["id"], c["mode"])}{default_hint}</td>'
+                f'<td>{adv_btn}</td></tr>'
+            )
+            if not is_dm_c:
+                discord_rows += _settings_row("discord", c["id"], c.get("settings") or {}, colspan=5)
+        if seen_guilds:
+            for gid, gname in seen_guilds.items():
+                discord_rows += (
+                    f'<tr style="background:rgba(200,112,0,0.05);"><td colspan="4" style="font-size:0.88em;color:var(--muted);">'
+                    f'Server <strong>{_escape(gname)}</strong> komplett verlassen (Bot wird aus allen Channels entfernt)</td>'
+                    f'<td><button class="btn-leave" data-kind="discord_guild" data-id="{_escape(gid)}" data-name="{_escape(gname)}" title="Bot aus diesem Server entfernen">Server verlassen</button></td></tr>'
+                )
+
+    html = f"""
+    <!DOCTYPE html><html><head><meta charset="utf-8"><title>Räume – MiniAssistant</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" href="/favicon.ico">
+    <style>
+    {_COMMON_CSS}
+    .sched-wrap {{ max-width: 1100px; margin: 0 auto; padding: 1.2em 1em; }}
+    .sched-header {{ display: flex; align-items: center; gap: 0.6em; margin-bottom: 1em; }}
+    .sched-header img {{ width: 40px; height: 40px; border-radius: 8px; }}
+    .sched-header h1 {{ margin: 0; font-size: 1.4em; }}
+    h2.sect {{ margin: 1.4em 0 0.5em; font-size: 1.1em; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 0.92em; }}
+    th {{ text-align: left; padding: 0.5em; border-bottom: 2px solid var(--border); color: var(--muted); font-weight: 600; }}
+    td {{ padding: 0.5em; border-bottom: 1px solid var(--border); vertical-align: middle; }}
+    code {{ background: #f0f0f0; padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.85em; word-break: break-all; }}
+    [data-theme="dark"] code {{ background: #2a2a4a; }}
+    .mode-sel {{ padding: 0.25em 0.5em; font-size: 0.9em; }}
+    .modes-help {{ background: var(--card); border-radius: 6px; padding: 0.7em 0.9em; margin: 0 0 1em; font-size: 0.88em; line-height: 1.5; }}
+    .modes-help b {{ color: var(--text); }}
+    .btn-leave {{ background: none; border: 1.5px solid var(--danger); color: var(--danger); border-radius: 4px;
+      cursor: pointer; padding: 0.2em 0.6em; font-size: 0.85em; line-height: 1.2; transition: background 0.15s; }}
+    .btn-leave:hover {{ background: var(--danger); color: #fff; }}
+    .btn-adv {{ background: none; border: 1px solid var(--border); color: var(--text); border-radius: 4px;
+      cursor: pointer; padding: 0.2em 0.5em; font-size: 0.95em; line-height: 1.2; }}
+    .btn-adv:hover {{ background: var(--border); }}
+    .grp-settings-row select, .grp-settings-row input[type=text] {{ width: 100%; max-width: 360px; }}
+    .modal-overlay {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,0.45); z-index:1000; align-items:center; justify-content:center; }}
+    .modal-overlay.open {{ display:flex; }}
+    .modal-box {{ background:var(--card); border-radius:8px; padding:1.4em; max-width:480px; width:90%; box-shadow:0 4px 24px rgba(0,0,0,0.18); }}
+    .modal-box h2 {{ margin:0 0 0.6em; font-size:1.1em; }}
+    .modal-actions {{ display:flex; gap:0.6em; justify-content:flex-end; margin-top:0.8em; }}
+    #toastWrap {{ position:fixed;bottom:1.2em;right:1.2em;display:flex;flex-direction:column;gap:0.5em;z-index:2000;pointer-events:none; }}
+    </style>
+    </head><body>
+    <div class="sched-wrap">
+      <div class="sched-header">
+        <img src="/static/miniassistant.png" alt="Logo">
+        <h1>Räume &amp; Channels</h1>
+      </div>
+      <div class="modes-help">
+        Pro Raum/Channel festlegen, wie der Assistent reagiert:
+        <ul style="margin:0.4em 0 0 1.2em;padding:0;">
+          <li><b>Immer antworten</b> — auf jede Nachricht antworten (typisch für DMs / 1:1-Räume).</li>
+          <li><b>Nur auf Erwähnung</b> — Bot antwortet nur wenn du ihn @-erwähnst (typisch für Gruppen).</li>
+          <li><b>Aus</b> — kein automatisches Antworten. Schedules &amp; Webhooks können trotzdem in den Raum posten.</li>
+        </ul>
+        Änderungen werden gesammelt und mit dem <b>Speichern</b>-Button unten persistiert. <em>(default)</em> = kein expliziter Mode gesetzt, automatische Heuristik (DM=always, Gruppe=mention).
+      </div>
+      <div class="modes-help">
+        <b>Auth &amp; Raum-Trust:</b>
+        <ul style="margin:0.4em 0 0 1.2em;padding:0;">
+          <li><b>✅ Raum vertraut</b> — Bot wurde von einem authentifizierten User in den Raum eingeladen → <em>alle</em> Mitglieder dürfen den Bot benutzen (gemäss Antwort-Mode).</li>
+          <li><b>✅ Auth</b> (DM) — der andere User hat sich selbst per <code>/auth</code> freigeschaltet.</li>
+          <li><b>⚠️ kein Auth</b> — User noch nicht freigeschaltet UND Bot nicht von authed User eingeladen. Bot antwortet nur mit Auth-Code-Hinweis.</li>
+        </ul>
+        Für Bestandsräume ohne erkannten Inviter: einfach <em>Verlassen</em> drücken und vom Matrix-Client neu einladen — dann wird der Inviter korrekt erfasst.
+      </div>
+
+      <h2 class="sect">Matrix</h2>
+      <div class="card">
+        <table>
+          <thead><tr><th>Raumname</th><th>Room ID</th><th>Mitglieder</th><th>Auth</th><th>Antwort-Mode</th><th></th></tr></thead>
+          <tbody>{matrix_rows}</tbody>
+        </table>
+      </div>
+
+      <h2 class="sect">Discord</h2>
+      <div class="card">
+        <table>
+          <thead><tr><th>Channel</th><th>Channel ID</th><th>Server</th><th>Antwort-Mode</th><th></th></tr></thead>
+          <tbody>{discord_rows}</tbody>
+        </table>
+        <div style="margin-top:0.6em;padding:0.5em 0.7em;background:var(--bg);border-radius:4px;font-size:0.82em;color:var(--muted);">
+          ℹ️ Discord-Bots können einzelne Channels nicht verlassen — nur ganze Server. Wenn du den Bot nur aus einem Channel haben willst, entzieh seine Permissions im Channel oder setze Antwort-Mode auf <em>Aus</em>.
+        </div>
+      </div>
+
+      <div style="margin-top:1.2em;display:flex;gap:0.6em;align-items:center;flex-wrap:wrap;">
+        <a href="/{tq}" class="btn btn-outline">Startseite</a>
+        <button id="saveBtn" class="btn btn-primary" disabled>Speichern</button>
+        <button id="discardBtn" class="btn btn-outline" disabled>Verwerfen</button>
+        <span id="dirtyHint" style="color:var(--muted);font-size:0.88em;"></span>
+      </div>
+    </div>
+    <div class="modal-overlay" id="confirmModal">
+      <div class="modal-box">
+        <h2 id="confirmTitle"></h2>
+        <div id="confirmBody" style="font-size:0.92em;line-height:1.5;white-space:pre-wrap;"></div>
+        <div class="modal-actions">
+          <button class="btn btn-outline" id="confirmCancel">Abbrechen</button>
+          <button class="btn btn-primary" id="confirmOk">OK</button>
+        </div>
+      </div>
+    </div>
+    <div id="toastWrap"></div>
+    <script>
+    var token = new URLSearchParams(window.location.search).get("token") || "";
+    function tq() {{ return token ? "?token=" + encodeURIComponent(token) : ""; }}
+    var _cR = null;
+    function appConfirm(title, body, opts) {{
+      opts = opts || {{}};
+      document.getElementById("confirmTitle").textContent = title || "";
+      document.getElementById("confirmBody").textContent = body || "";
+      document.getElementById("confirmOk").textContent = opts.okLabel || "OK";
+      document.getElementById("confirmCancel").textContent = opts.cancelLabel || "Abbrechen";
+      document.getElementById("confirmModal").classList.add("open");
+      return new Promise(function(resolve){{ _cR = resolve; }});
+    }}
+    function _cD(v) {{ document.getElementById("confirmModal").classList.remove("open"); var r = _cR; _cR = null; if (r) r(v); }}
+    document.getElementById("confirmOk").addEventListener("click", function(){{ _cD(true); }});
+    document.getElementById("confirmCancel").addEventListener("click", function(){{ _cD(false); }});
+    document.getElementById("confirmModal").addEventListener("click", function(e){{ if (e.target === this) _cD(false); }});
+    function appToast(msg, kind) {{
+      kind = kind || "info";
+      var wrap = document.getElementById("toastWrap");
+      var t = document.createElement("div");
+      var bg = kind === "error" ? "#c53030" : (kind === "success" ? "#2d8a4e" : "#2a2a4a");
+      t.style.cssText = "pointer-events:auto;background:" + bg + ";color:#fff;padding:0.5em 0.8em;border-radius:6px;box-shadow:0 4px 16px rgba(0,0,0,0.25);font-size:0.88em;max-width:360px;cursor:pointer;opacity:0;transition:opacity 0.2s;";
+      t.textContent = msg;
+      t.addEventListener("click", function(){{ t.remove(); }});
+      wrap.appendChild(t);
+      setTimeout(function(){{ t.style.opacity = "1"; }}, 10);
+      setTimeout(function(){{ t.style.opacity = "0"; setTimeout(function(){{ if (t.parentNode) t.remove(); }}, 300); }}, kind === "error" ? 5000 : 2500);
+    }}
+    // Dirty-State: zwei Buckets (modes + settings). Speichern-Button flusht beide.
+    var _pending = {{matrix: {{}}, discord: {{}}}};
+    var _settingsPending = {{matrix: {{}}, discord: {{}}}};  // referenced in _flushSettings/_queueSettingsFromRow below
+    function _dirtyCount() {{
+      return Object.keys(_pending.matrix).length + Object.keys(_pending.discord).length
+           + Object.keys(_settingsPending.matrix).length + Object.keys(_settingsPending.discord).length;
+    }}
+    function _updateDirtyUi() {{
+      var n = _dirtyCount();
+      var btn = document.getElementById("saveBtn");
+      var disc = document.getElementById("discardBtn");
+      var hint = document.getElementById("dirtyHint");
+      if (btn) btn.disabled = (n === 0);
+      if (disc) disc.disabled = (n === 0);
+      if (hint) hint.textContent = n === 0 ? "Keine ungespeicherten Änderungen." : ("Ungespeicherte Änderungen: " + n);
+    }}
+    function _flushModes() {{
+      var body = {{}};
+      if (Object.keys(_pending.matrix).length) body.matrix = _pending.matrix;
+      if (Object.keys(_pending.discord).length) body.discord = _pending.discord;
+      if (!body.matrix && !body.discord) return Promise.resolve({{ok: true, skipped: true}});
+      return fetch("/api/rooms" + tq(), {{
+        method: "PATCH",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify(body),
+      }}).then(function(r){{
+        if (r.ok) {{ _pending = {{matrix: {{}}, discord: {{}}}}; return {{ok: true}}; }}
+        return r.json().then(function(d){{ throw new Error(d.detail || "Fehler beim Speichern (modes)"); }});
+      }});
+    }}
+    function _flushAll() {{
+      var btn = document.getElementById("saveBtn");
+      if (btn) btn.disabled = true;
+      Promise.all([_flushModes(), _flushSettings()]).then(function(){{
+        _updateDirtyUi();
+        appToast("Gespeichert", "success");
+      }}).catch(function(e){{
+        appToast(e.message || String(e), "error");
+        _updateDirtyUi();
+      }});
+    }}
+    function _discardAll() {{
+      if (_dirtyCount() === 0) return;
+      appConfirm("Änderungen verwerfen?", "Alle ungespeicherten Änderungen werden zurückgesetzt (Seite wird neu geladen).", {{okLabel: "Verwerfen"}}).then(function(ok){{
+        if (ok) location.reload();
+      }});
+    }}
+    document.querySelectorAll(".mode-sel").forEach(function(sel) {{
+      sel.addEventListener("change", function() {{
+        var kind = this.getAttribute("data-kind");
+        var id = this.getAttribute("data-id");
+        _pending[kind][id] = this.value;
+        var hint = this.parentNode.querySelector('span[title*="default"]');
+        if (hint) hint.remove();
+        _updateDirtyUi();
+      }});
+    }});
+    window.addEventListener("beforeunload", function(e){{
+      if (_dirtyCount() > 0) {{ e.preventDefault(); e.returnValue = ""; return ""; }}
+    }});
+    document.getElementById("saveBtn").addEventListener("click", _flushAll);
+    document.getElementById("discardBtn").addEventListener("click", _discardAll);
+    _updateDirtyUi();
+    // Ctrl/Cmd+S → Speichern (Browser-Speichern unterdrücken)
+    window.addEventListener("keydown", function(e){{
+      if ((e.ctrlKey || e.metaKey) && (e.key === "s" || e.key === "S")) {{
+        e.preventDefault();
+        if (_dirtyCount() > 0) _flushAll();
+      }}
+    }});
+
+    // Group-Mode Settings: Toggle + Save
+    document.querySelectorAll(".btn-adv").forEach(function(btn) {{
+      btn.addEventListener("click", function() {{
+        var kind = this.getAttribute("data-target-kind");
+        var id = this.getAttribute("data-target-id");
+        var rows = document.querySelectorAll('tr.grp-settings-row[data-kind="' + kind + '"][data-id="' + CSS.escape(id) + '"]');
+        rows.forEach(function(r){{ r.style.display = (r.style.display === "none" ? "table-row" : "none"); }});
+      }});
+    }});
+
+    function _readSettingsFromRow(row) {{
+      var ctx = row.querySelector(".grp-ctx").value;
+      var lang = row.querySelector(".grp-lang").value;
+      var sub = (row.querySelector(".grp-sub").value || "").trim();
+      var tools = [];
+      row.querySelectorAll(".grp-tool:checked").forEach(function(cb){{ tools.push(cb.getAttribute("data-tool")); }});
+      var ac_count = parseInt((row.querySelector(".grp-ac-count") || {{value: "3"}}).value, 10);
+      var ac_max = parseInt((row.querySelector(".grp-ac-max") || {{value: "200"}}).value, 10);
+      var sch_max = parseInt((row.querySelector(".grp-sch-max") || {{value: "200"}}).value, 10);
+      var docs_mount = !!(row.querySelector(".grp-docs") || {{checked: false}}).checked;
+      var out = {{context: ctx, language: lang, tools_allow: tools,
+                  auto_context_count: isNaN(ac_count) ? 3 : ac_count,
+                  auto_context_max_chars: isNaN(ac_max) ? 200 : ac_max,
+                  search_chat_history_max: isNaN(sch_max) ? 200 : sch_max,
+                  docs_in_sandbox: docs_mount}};
+      if (sub) out.workspace_subdir = sub;
+      return out;
+    }}
+    function _flushSettings() {{
+      var body = {{}};
+      if (Object.keys(_settingsPending.matrix).length) body.matrix = _settingsPending.matrix;
+      if (Object.keys(_settingsPending.discord).length) body.discord = _settingsPending.discord;
+      if (!body.matrix && !body.discord) return Promise.resolve({{ok: true, skipped: true}});
+      return fetch("/api/rooms/settings" + tq(), {{
+        method: "PATCH",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify(body),
+      }}).then(function(r){{
+        if (r.ok) {{ _settingsPending = {{matrix: {{}}, discord: {{}}}}; return {{ok: true}}; }}
+        return r.json().then(function(d){{ throw new Error(d.detail || "Fehler beim Speichern (settings)"); }});
+      }});
+    }}
+    function _queueSettingsFromRow(row) {{
+      var kind = row.getAttribute("data-kind");
+      var id = row.getAttribute("data-id");
+      _settingsPending[kind][id] = _readSettingsFromRow(row);
+      _updateDirtyUi();
+    }}
+    document.querySelectorAll("tr.grp-settings-row").forEach(function(row) {{
+      row.querySelectorAll(".grp-ctx, .grp-lang, .grp-sub, .grp-tool, .grp-ac-count, .grp-ac-max, .grp-sch-max, .grp-docs").forEach(function(el){{
+        var evt = (el.tagName === "INPUT" && (el.type === "text" || el.type === "number")) ? "input" : "change";
+        el.addEventListener(evt, function(){{ _queueSettingsFromRow(row); }});
+      }});
+    }});
+    document.querySelectorAll(".btn-leave").forEach(function(btn) {{
+      btn.addEventListener("click", function() {{
+        var kind = this.getAttribute("data-kind");
+        var id = this.getAttribute("data-id");
+        var name = this.getAttribute("data-name") || id;
+        console.log("btn-leave click", kind, id, name);
+        var title = kind === "matrix" ? "Matrix-Raum verlassen?" : "Discord-Server verlassen?";
+        var body = kind === "matrix"
+          ? "Der Bot verlässt den Raum '" + name + "'. Nachrichten werden danach nicht mehr empfangen — Schedules/Webhooks für diesen Raum funktionieren auch nicht mehr (kein Mitglied → keine Sendeerlaubnis)."
+          : "Der Bot verlässt den ganzen Discord-Server '" + name + "'. ALLE Channels dieses Servers werden für den Bot unerreichbar. Re-Invite nur über Server-Owner mit OAuth-Link.";
+        appConfirm(title, body, {{okLabel: "Verlassen"}}).then(function(ok){{
+          console.log("appConfirm result:", ok);
+          if (!ok) return;
+          var url = "/api/rooms/leave" + tq();
+          console.log("POST", url, {{kind: kind, id: id}});
+          fetch(url, {{
+            method: "POST",
+            credentials: "same-origin",
+            headers: {{"Content-Type": "application/json"}},
+            body: JSON.stringify({{kind: kind, id: id}})
+          }}).then(function(r){{
+            console.log("response", r.status);
+            return r.json().then(function(d){{
+              console.log("data", d);
+              if (r.ok && d.ok) {{
+                appToast("Verlassen — Liste wird neu geladen", "success");
+                setTimeout(function(){{ location.reload(); }}, 1200);
+              }} else {{
+                appToast(d.message || d.detail || "Fehler", "error");
+              }}
+            }});
+          }}).catch(function(e){{ console.error("fetch failed", e); appToast("Fehler: " + e.message, "error"); }});
         }});
       }});
     }});

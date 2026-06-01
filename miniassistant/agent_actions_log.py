@@ -15,17 +15,33 @@ from typing import Any
 _lock = threading.Lock()
 
 
-def _log_path(config: dict[str, Any]) -> Path | None:
-    """Gibt den Pfad zur agent_actions.log zurück, oder None wenn deaktiviert."""
+def _log_paths(config: dict[str, Any]) -> list[Path]:
+    """Gibt alle Log-Pfade zurück (leer wenn deaktiviert).
+    - Owner-Mode: nur `agent_actions.log`.
+    - Group-Mode: BEIDE — main `agent_actions.log` UND `logs/agent_actions_groups/<subdir>.log`
+      (forensische Per-Room-Datei plus zentraler Audit-Stream)."""
     if not (config.get("server") or {}).get("log_agent_actions"):
-        return None
+        return []
     config_dir = config.get("_config_dir") or ""
     if not config_dir:
         from miniassistant.config import get_config_dir
         config_dir = get_config_dir()
     log_dir = Path(config_dir) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    return log_dir / "agent_actions.log"
+    paths = [log_dir / "agent_actions.log"]
+    chat_ctx = config.get("_chat_context") or {}
+    if chat_ctx.get("group_mode"):
+        sub = chat_ctx.get("workspace_subdir") or "default"
+        groups_dir = log_dir / "agent_actions_groups"
+        groups_dir.mkdir(parents=True, exist_ok=True)
+        paths.append(groups_dir / f"{sub}.log")
+    return paths
+
+
+def _log_path(config: dict[str, Any]) -> Path | None:
+    """Deprecated: legacy helper. Returns main log only (group-room tee handled by _log_paths)."""
+    paths = _log_paths(config)
+    return paths[0] if paths else None
 
 
 def _write(path: Path, text: str) -> None:
@@ -34,30 +50,43 @@ def _write(path: Path, text: str) -> None:
             f.write(text)
 
 
+def _write_all(paths: list[Path], text: str) -> None:
+    """Schreibt denselben Text in alle Pfade (Tee). Lock einmal halten für atomare Reihenfolge."""
+    if not paths:
+        return
+    with _lock:
+        for p in paths:
+            try:
+                with open(p, "a", encoding="utf-8") as f:
+                    f.write(text)
+            except Exception:
+                pass
+
+
 def _ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def log_prompt(config: dict[str, Any], model: str, user_content: str, system_prompt_len: int, messages_count: int) -> None:
     """Loggt den User-Prompt und Kontext-Info."""
-    path = _log_path(config)
-    if not path:
+    paths = _log_paths(config)
+    if not paths:
         return
     lines = [
         f"\n---\n",
         f"[{_ts()}] PROMPT  model={model}  system_chars={system_prompt_len}  history={messages_count} msgs\n",
         f"User: {user_content}\n",
     ]
-    _write(path, "".join(lines))
+    _write_all(paths, "".join(lines))
 
 
 def log_thinking(config: dict[str, Any], thinking: str) -> None:
     """Loggt das Thinking der KI (final, nach Stream-Ende)."""
-    path = _log_path(config)
-    if not path or not thinking:
+    paths = _log_paths(config)
+    if not paths or not thinking:
         return
     t = thinking if len(thinking) <= 2000 else thinking[:2000] + "…"
-    _write(path, f"[{_ts()}] THINKING\n{t}\n")
+    _write_all(paths, f"[{_ts()}] THINKING\n{t}\n")
 
 
 class StreamLogger:
@@ -65,7 +94,7 @@ class StreamLogger:
     Verhindert Disk-Thrashing bei schnellem Token-Stream."""
 
     def __init__(self, config: dict[str, Any], flush_interval: float = 2.0):
-        self._path = _log_path(config)
+        self._paths = _log_paths(config)
         self._flush_interval = flush_interval
         self._thinking_buf = ""
         self._content_buf = ""
@@ -85,7 +114,7 @@ class StreamLogger:
         return f"  {' '.join(parts)}" if parts else ""
 
     def _maybe_flush(self, force: bool = False) -> None:
-        if not self._path:
+        if not self._paths:
             return
         now = self._time.monotonic()
         if not force and (now - self._last_flush) < self._flush_interval:
@@ -101,15 +130,15 @@ class StreamLogger:
             parts.append(f"[{_ts()}] STREAM_CONTENT{lbl}\n{c}\n")
             self._content_buf = ""
         if parts:
-            _write(self._path, "".join(parts))
+            _write_all(self._paths, "".join(parts))
         self._last_flush = now
 
     def start(self, model: str, role: str = "orchestrator") -> None:
-        if not self._path:
+        if not self._paths:
             return
         self._model = model
         self._role = role
-        _write(self._path, f"[{_ts()}] STREAM_START  {role} model={model}\n")
+        _write_all(self._paths, f"[{_ts()}] STREAM_START  {role} model={model}\n")
         self._started = True
         self._last_flush = self._time.monotonic()
 
@@ -123,13 +152,13 @@ class StreamLogger:
 
     def finish(self, tps: tuple[float, bool] | None = None) -> None:
         self._maybe_flush(force=True)
-        if self._path and self._started:
+        if self._paths and self._started:
             if tps is not None:
                 value, exact = tps
                 tps_str = f"  ({value:.1f} t/s)" if exact else f"  (~{value:.1f} t/s)"
             else:
                 tps_str = ""
-            _write(self._path, f"[{_ts()}] STREAM_END{tps_str}\n")
+            _write_all(self._paths, f"[{_ts()}] STREAM_END{tps_str}\n")
 
 
 def extract_tps(response: dict[str, Any], elapsed_s: float, content: str = "", thinking: str = "") -> tuple[float, bool] | None:
@@ -176,8 +205,8 @@ def extract_tps(response: dict[str, Any], elapsed_s: float, content: str = "", t
 
 def log_response(config: dict[str, Any], content: str, tps: tuple[float, bool] | None = None) -> None:
     """Loggt die Antwort der KI."""
-    path = _log_path(config)
-    if not path or not content:
+    paths = _log_paths(config)
+    if not paths or not content:
         return
     c = content if len(content) <= 3000 else content[:3000] + "…"
     if tps is not None:
@@ -185,13 +214,13 @@ def log_response(config: dict[str, Any], content: str, tps: tuple[float, bool] |
         tps_str = f"  ({value:.1f} t/s)" if exact else f"  (~{value:.1f} t/s)"
     else:
         tps_str = ""
-    _write(path, f"[{_ts()}] RESPONSE{tps_str}\n{c}\n")
+    _write_all(paths, f"[{_ts()}] RESPONSE{tps_str}\n{c}\n")
 
 
 def log_tool_call(config: dict[str, Any], tool_name: str, arguments: dict[str, Any], result: str) -> None:
     """Loggt einen Tool-Call (exec, web_search, schedule, etc.) — Start + Result zusammen (Legacy)."""
-    path = _log_path(config)
-    if not path:
+    paths = _log_paths(config)
+    if not paths:
         return
     import json
     args_str = json.dumps(arguments, ensure_ascii=False, indent=None)
@@ -203,49 +232,49 @@ def log_tool_call(config: dict[str, Any], tool_name: str, arguments: dict[str, A
         f"  args: {args_str}\n",
         f"  result: {res_str}\n",
     ]
-    _write(path, "".join(lines))
+    _write_all(paths, "".join(lines))
 
 
 def log_tool_start(config: dict[str, Any], tool_name: str, arguments: dict[str, Any]) -> None:
     """Loggt den START eines Tool-Calls sofort (vor Execution)."""
-    path = _log_path(config)
-    if not path:
+    paths = _log_paths(config)
+    if not paths:
         return
     import json
     args_str = json.dumps(arguments, ensure_ascii=False, indent=None)
     if len(args_str) > 1000:
         args_str = args_str[:1000] + "…"
-    _write(path, f"[{_ts()}] TOOL_START  {tool_name}\n  args: {args_str}\n")
+    _write_all(paths, f"[{_ts()}] TOOL_START  {tool_name}\n  args: {args_str}\n")
 
 
 def log_tool_result(config: dict[str, Any], tool_name: str, result: str, elapsed_s: float = 0) -> None:
     """Loggt das ERGEBNIS eines Tool-Calls (nach Execution)."""
-    path = _log_path(config)
-    if not path:
+    paths = _log_paths(config)
+    if not paths:
         return
     res_str = result if len(result) <= 1000 else result[:1000] + "…"
     elapsed_str = f"  ({elapsed_s:.1f}s)" if elapsed_s else ""
-    _write(path, f"[{_ts()}] TOOL_DONE  {tool_name}{elapsed_str}\n  result: {res_str}\n")
+    _write_all(paths, f"[{_ts()}] TOOL_DONE  {tool_name}{elapsed_str}\n  result: {res_str}\n")
 
 
 def log_image_received(config: dict[str, Any], num_images: int, mime_types: list[str], vision_model: str = "") -> None:
     """Loggt den Empfang von Bildern und ggf. den Vision-Modell-Wechsel."""
-    path = _log_path(config)
-    if not path:
+    paths = _log_paths(config)
+    if not paths:
         return
     mimes = ", ".join(mime_types) if mime_types else "?"
     lines = [f"[{_ts()}] IMAGE_RECEIVED  count={num_images}  mime={mimes}\n"]
     if vision_model:
         lines.append(f"  vision_model: {vision_model}\n")
-    _write(path, "".join(lines))
+    _write_all(paths, "".join(lines))
 
 
 def log_debate_start(config: dict[str, Any], topic: str, perspective_a: str, perspective_b: str, model_a: str, model_b: str, rounds: int) -> None:
     """Loggt den Start einer Debatte."""
-    path = _log_path(config)
-    if not path:
+    paths = _log_paths(config)
+    if not paths:
         return
-    _write(path, (
+    _write_all(paths, (
         f"\n---\n[{_ts()}] DEBATE_START  topic={topic[:200]}\n"
         f"  A: {perspective_a[:100]} (model={model_a})\n"
         f"  B: {perspective_b[:100]} (model={model_b})\n"
@@ -255,55 +284,55 @@ def log_debate_start(config: dict[str, Any], topic: str, perspective_a: str, per
 
 def log_debate_round(config: dict[str, Any], round_num: int, side: str, model: str, argument: str) -> None:
     """Loggt eine einzelne Debattenrunde (Seite A oder B)."""
-    path = _log_path(config)
-    if not path:
+    paths = _log_paths(config)
+    if not paths:
         return
     arg = argument if len(argument) <= 1500 else argument[:1500] + "…"
-    _write(path, f"[{_ts()}] DEBATE_ROUND {round_num} side={side} model={model}\n  {arg}\n")
+    _write_all(paths, f"[{_ts()}] DEBATE_ROUND {round_num} side={side} model={model}\n  {arg}\n")
 
 
 def log_debate_end(config: dict[str, Any], topic: str, rounds_completed: int, file_path: str) -> None:
     """Loggt das Ende einer Debatte."""
-    path = _log_path(config)
-    if not path:
+    paths = _log_paths(config)
+    if not paths:
         return
-    _write(path, f"[{_ts()}] DEBATE_END  topic={topic[:200]}  rounds={rounds_completed}  file={file_path}\n")
+    _write_all(paths, f"[{_ts()}] DEBATE_END  topic={topic[:200]}  rounds={rounds_completed}  file={file_path}\n")
 
 
 def log_voice_sent(config: dict[str, Any], chars: int, voice: str = "", bytes_sent: int = 0) -> None:
     """Loggt das Senden einer Sprachantwort via TTS."""
-    path = _log_path(config)
-    if not path:
+    paths = _log_paths(config)
+    if not paths:
         return
     parts = [f"chars={chars}"]
     if voice:
         parts.append(f"voice={voice}")
     if bytes_sent:
         parts.append(f"bytes={bytes_sent}")
-    _write(path, f"[{_ts()}] VOICE_SENT  {'  '.join(parts)}\n")
+    _write_all(paths, f"[{_ts()}] VOICE_SENT  {'  '.join(parts)}\n")
 
 
 def log_compact(config: dict[str, Any], old_count: int, summary_tokens: int, recent_count: int, budget: int) -> None:
     """Loggt eine Chat-History-Komprimierung."""
-    path = _log_path(config)
-    if not path:
+    paths = _log_paths(config)
+    if not paths:
         return
-    _write(path, f"[{_ts()}] COMPACT  {old_count} msgs → summary ({summary_tokens} tokens) + {recent_count} recent  budget={budget}\n")
+    _write_all(paths, f"[{_ts()}] COMPACT  {old_count} msgs → summary ({summary_tokens} tokens) + {recent_count} recent  budget={budget}\n")
 
 
 def log_subagent_start(config: dict[str, Any], model: str, message: str) -> None:
     """Loggt den Start eines Subagent-Aufrufs."""
-    path = _log_path(config)
-    if not path:
+    paths = _log_paths(config)
+    if not paths:
         return
     msg = message if len(message) <= 1000 else message[:1000] + "…"
-    _write(path, f"[{_ts()}] SUBAGENT  model={model}\n  prompt: {msg}\n")
+    _write_all(paths, f"[{_ts()}] SUBAGENT  model={model}\n  prompt: {msg}\n")
 
 
 def log_subagent_result(config: dict[str, Any], model: str, result: str, thinking: str = "") -> None:
     """Loggt das Ergebnis eines Subagent-Aufrufs inkl. Thinking."""
-    path = _log_path(config)
-    if not path:
+    paths = _log_paths(config)
+    if not paths:
         return
     lines = []
     if thinking:
@@ -311,4 +340,4 @@ def log_subagent_result(config: dict[str, Any], model: str, result: str, thinkin
         lines.append(f"[{_ts()}] SUBAGENT_THINKING  model={model}\n{t}\n")
     res = result if len(result) <= 2000 else result[:2000] + "…"
     lines.append(f"[{_ts()}] SUBAGENT_RESULT  model={model}\n  result: {res}\n")
-    _write(path, "".join(lines))
+    _write_all(paths, "".join(lines))

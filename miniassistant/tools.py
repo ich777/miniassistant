@@ -444,6 +444,157 @@ def web_search(searxng_url: str, query: str, max_results: int = 5, categories: s
     return {"results": out}
 
 
+_RR_LOCK = __import__("threading").Lock()
+_RR_INDEX = 0  # global round-robin counter (in-process)
+
+
+def web_search_multi(
+    config: dict[str, Any],
+    query: str,
+    categories: str | None = None,
+    engine_id: str | None = None,
+    max_results: int = 5,
+) -> dict[str, Any]:
+    """Multi-Engine Web-Search mit konfigurierbarer Strategie.
+
+    config.search_engine_strategy:
+      'first'      (default) — Default-Engine, bei error/empty Fallback zu zufälliger anderer
+      'specific'   — nur Default-Engine, KEIN Fallback
+      'random'     — zufällige Engine
+      'roundrobin' — Engines rotieren über Queries (jede sieht 1/N der Requests). Fallback bei Fehler.
+      'fallback'   — alle Engines sequenziell durchgehen, erste mit Ergebnissen wins
+
+    engine_id: expliziter Override — überspringt Strategie, nutzt nur diese Engine (kein Fallback).
+
+    Returns: {results: [...], used_engines: [eid, ...], errors: {eid: msg}}
+    """
+    engines = config.get("search_engines") or {}
+    if not engines:
+        return {"error": "no search_engines configured", "results": [], "used_engines": [], "errors": {}}
+
+    # Engine-Override: nutze nur diese, kein Fallback
+    if engine_id:
+        url = (engines.get(engine_id, {}).get("url") or "").strip()
+        if not url:
+            return {"error": f"engine '{engine_id}' not found or has no url", "results": [], "used_engines": [], "errors": {}}
+        r = web_search(url, query, max_results=max_results, categories=categories)
+        return {
+            "results": r.get("results") or [],
+            "used_engines": [engine_id],
+            "errors": {engine_id: r["error"]} if r.get("error") else {},
+        }
+
+    strategy = (config.get("search_engine_strategy") or "first").strip().lower()
+    default_eid = config.get("default_search_engine") or next(iter(engines), None)
+
+    if strategy == "specific":
+        # Nur Default-Engine, kein Fallback
+        if not default_eid or default_eid not in engines:
+            return {"error": "default engine not configured", "results": [], "used_engines": [], "errors": {}}
+        url = (engines[default_eid].get("url") or "").strip()
+        r = web_search(url, query, max_results=max_results, categories=categories)
+        return {
+            "results": r.get("results") or [],
+            "used_engines": [default_eid],
+            "errors": {default_eid: r["error"]} if r.get("error") else {},
+        }
+
+    if strategy == "random":
+        import random as _r
+        eid = _r.choice(list(engines.keys()))
+        url = (engines[eid].get("url") or "").strip()
+        r = web_search(url, query, max_results=max_results, categories=categories)
+        return {
+            "results": r.get("results") or [],
+            "used_engines": [eid],
+            "errors": {eid: r["error"]} if r.get("error") else {},
+        }
+
+    if strategy == "roundrobin":
+        # Spread Load: jede Query trifft genau EINE Engine, die nächste die NÄCHSTE Engine, usw.
+        # In-Process Counter (threadsafe). Bei Error/empty → sequenzieller Fallback zu anderen.
+        global _RR_INDEX
+        valid = [(eid, (ec.get("url") or "").strip()) for eid, ec in engines.items() if (ec.get("url") or "").strip()]
+        if not valid:
+            return {"error": "no valid engine urls", "results": [], "used_engines": [], "errors": {}}
+        with _RR_LOCK:
+            idx = _RR_INDEX % len(valid)
+            _RR_INDEX = (_RR_INDEX + 1) % (len(valid) * 1000)
+        # Reihenfolge: gewählte Engine first, danach restliche als Fallback-Order
+        order = [valid[idx]] + valid[idx + 1:] + valid[:idx]
+        used: list[str] = []
+        errors: dict[str, str] = {}
+        for eid, url in order:
+            used.append(eid)
+            r = web_search(url, query, max_results=max_results, categories=categories)
+            if r.get("error"):
+                errors[eid] = r["error"]
+                continue
+            if r.get("results"):
+                return {"results": r["results"], "used_engines": used, "errors": errors}
+            # leer aber kein error → nächste probieren
+        return {"results": [], "used_engines": used, "errors": errors}
+
+    if strategy == "fallback":
+        # Sequenziell: Default zuerst, dann andere in Reihenfolge. Erste mit Ergebnissen wins.
+        order = [default_eid] + [e for e in engines.keys() if e != default_eid]
+        errors: dict[str, str] = {}
+        used: list[str] = []
+        for eid in order:
+            if not eid or eid not in engines:
+                continue
+            url = (engines[eid].get("url") or "").strip()
+            if not url:
+                continue
+            used.append(eid)
+            r = web_search(url, query, max_results=max_results, categories=categories)
+            if r.get("error"):
+                errors[eid] = r["error"]
+                continue
+            if r.get("results"):
+                return {"results": r["results"], "used_engines": used, "errors": errors}
+        return {"results": [], "used_engines": used, "errors": errors}
+
+    # 'first' (default behavior): Default-Engine + Fallback bei leerem Ergebnis zu zufälliger anderer
+    if not default_eid or default_eid not in engines:
+        return {"error": "default engine not configured", "results": [], "used_engines": [], "errors": {}}
+    url = (engines[default_eid].get("url") or "").strip()
+    r = web_search(url, query, max_results=max_results, categories=categories)
+    if r.get("error"):
+        # Bei harten Errors auf Default → fallback wie früher (alte Logik war "nur bei empty")
+        errors = {default_eid: r["error"]}
+        used = [default_eid]
+        import random as _r
+        others = [eid for eid in engines if eid != default_eid and (engines[eid].get("url") or "").strip()]
+        _r.shuffle(others)
+        for alt_eid in others:
+            alt_url = (engines[alt_eid].get("url") or "").strip()
+            used.append(alt_eid)
+            alt = web_search(alt_url, query, max_results=max_results, categories=categories)
+            if alt.get("error"):
+                errors[alt_eid] = alt["error"]
+                continue
+            return {"results": alt.get("results") or [], "used_engines": used, "errors": errors}
+        return {"results": [], "used_engines": used, "errors": errors}
+    if r.get("results"):
+        return {"results": r["results"], "used_engines": [default_eid], "errors": {}}
+    # Empty: fallback zu zufälliger anderer Engine (alte Logik beibehalten)
+    used = [default_eid]
+    errors: dict[str, str] = {}
+    import random as _r
+    others = [eid for eid in engines if eid != default_eid and (engines[eid].get("url") or "").strip()]
+    _r.shuffle(others)
+    if others:
+        alt_eid = others[0]
+        alt_url = (engines[alt_eid].get("url") or "").strip()
+        used.append(alt_eid)
+        alt = web_search(alt_url, query, max_results=max_results, categories=categories)
+        if not alt.get("error"):
+            return {"results": alt.get("results") or [], "used_engines": used, "errors": errors}
+        errors[alt_eid] = alt["error"]
+    return {"results": [], "used_engines": used, "errors": errors}
+
+
 def check_url(url: str, timeout: float = 10.0) -> dict[str, Any]:
     """
     Prüft, ob eine URL erreichbar ist (HTTP/HTTPS, folgt Redirects).
@@ -560,12 +711,18 @@ _GITHUB_RAW_FILE_RE = re.compile(
 )
 
 
-def _trunc_marker(raw: str, shown: int) -> str:
-    """Informativer Truncation-Marker mit Rest-Länge + Handlungsanweisung."""
+def _trunc_marker(raw: str, shown: int, offset: int = 0) -> str:
+    """Offset-basierter Truncation-Marker. Weist NICHT an, das ganze Dokument zu holen
+    (würde bei großen Docs den Kontext sprengen) — sondern den NÄCHSTEN Abschnitt via offset.
+    `shown` = tatsächlich ausgegebene Zeichen dieses Abschnitts."""
     total = len(raw)
-    remaining = total - shown
-    return (f"\n\n[... truncated: {shown:,} of {total:,} chars shown, {remaining:,} chars cut. "
-            f"Re-call read_url with max_chars={total} to get full content. ...]")
+    end = offset + shown
+    remaining = total - end
+    if remaining <= 0:
+        return ""
+    return (f"\n\n[... {shown:,} chars shown (chars {offset:,}–{end:,} of {total:,}); {remaining:,} remain. "
+            f"To read the next part, re-call read_url with the SAME url and offset={end} (keep max_chars moderate). "
+            f"Read only as much as the task needs — do NOT fetch the whole document at once. ...]")
 
 
 def _try_github_api(url: str, gh_token: str | None, max_chars: int, timeout: float) -> dict[str, Any] | None:
@@ -603,10 +760,8 @@ def _try_github_api(url: str, gh_token: str | None, max_chars: int, timeout: flo
                     pass
             elif comments_count > 20:
                 parts.append(f"\n({comments_count} comments — showing first page only)")
-            text = "\n".join(parts)
-            if len(text) > max_chars:
-                text = text[:max_chars] + _trunc_marker(text, max_chars)
-            return {"ok": True, "content": text}
+            # Ungekürzt zurück — read_url() macht das Windowing (offset/max_chars) zentral.
+            return {"ok": True, "content": "\n".join(parts)}
         except Exception as e:
             _log.warning("GitHub API fallback failed for %s: %s", url, e)
             return None  # Fallback auf normalen HTTP-Abruf
@@ -622,10 +777,8 @@ def _try_github_api(url: str, gh_token: str | None, max_chars: int, timeout: flo
         try:
             r = httpx.get(raw_url, headers=headers, timeout=timeout, follow_redirects=True)
             r.raise_for_status()
-            text = r.text
-            if len(text) > max_chars:
-                text = text[:max_chars] + _trunc_marker(text, max_chars)
-            return {"ok": True, "content": text}
+            # Ungekürzt zurück — read_url() macht das Windowing (offset/max_chars) zentral.
+            return {"ok": True, "content": r.text}
         except Exception as e:
             _log.warning("GitHub raw fallback failed for %s: %s", url, e)
             return None
@@ -648,13 +801,14 @@ def _playwright_read_url(url: str, timeout: float = 30.0) -> str:
     return _html_to_text(html)
 
 
-def read_url(url: str, max_chars: int | None = 8000, timeout: float = 15.0, config: dict[str, Any] | None = None, proxy: str | None = None, js: bool = False, use_cache: bool = True) -> dict[str, Any]:
+def read_url(url: str, max_chars: int | None = 8000, timeout: float = 15.0, config: dict[str, Any] | None = None, proxy: str | None = None, js: bool = False, use_cache: bool = True, offset: int = 0) -> dict[str, Any]:
     """
     Liest den Inhalt einer URL und gibt ihn als bereinigten Text zurück.
     Nutzt einen Browser-User-Agent um Bot-Detection/Anubis-Checks zu vermeiden.
     HTML wird automatisch in Text konvertiert.
     GitHub-URLs (Issues, PRs, Dateien) werden automatisch über die API gelesen.
     max_chars=None liefert ungekürzten Rohtext (für compress-callers).
+    offset: Zeichen-Offset für Pagination großer Dokumente (Default 0).
     use_cache=True nutzt session-cache (miniassistant.url_cache) — hits liefern ungekürzt.
     """
     u = (url or "").strip()
@@ -667,6 +821,23 @@ def read_url(url: str, max_chars: int | None = 8000, timeout: float = 15.0, conf
     if _is_ssrf_target(u):
         return {"ok": False, "content": "", "error": "Access to internal/private networks is blocked"}
 
+    try:
+        offset = max(0, int(offset or 0))
+    except (TypeError, ValueError):
+        offset = 0
+
+    def _apply_window(raw: str) -> str:
+        """Schneidet das Fenster [offset : offset+max_chars] aus und hängt bei Rest einen
+        offset-basierten Truncation-Marker an. max_chars=None → ungekürzt ab offset."""
+        if not raw:
+            return raw
+        if max_chars is None:
+            return raw[offset:] if offset else raw
+        seg = raw[offset:offset + max_chars]
+        if len(raw) > offset + max_chars:
+            seg += _trunc_marker(raw, len(seg), offset)
+        return seg
+
     _cache = None
     if use_cache and config is not None:
         try:
@@ -675,10 +846,7 @@ def read_url(url: str, max_chars: int | None = 8000, timeout: float = 15.0, conf
             _hit = _cache.get(u)
             if _hit is not None:
                 _log.info("read_url: cache hit for %s (%d tokens, %d entries total)", u, _hit.tokens, _cache.stats()["entries"])
-                _txt = _hit.raw
-                if max_chars is not None and len(_txt) > max_chars:
-                    _txt = _txt[:max_chars] + _trunc_marker(_hit.raw, max_chars)
-                return {"ok": True, "content": _txt, "connection": "cache", "from_cache": True}
+                return {"ok": True, "content": _apply_window(_hit.raw), "connection": "cache", "from_cache": True}
         except Exception as e:
             _log.debug("read_url: cache lookup failed for %s: %s", u, e)
             _cache = None
@@ -695,9 +863,7 @@ def read_url(url: str, max_chars: int | None = 8000, timeout: float = 15.0, conf
                 _cache.put(u, raw, _tok)
             except Exception as _e:
                 _log.debug("read_url: cache put failed: %s", _e)
-        if max_chars is not None and len(raw) > max_chars:
-            return raw[:max_chars] + _trunc_marker(raw, max_chars)
-        return raw
+        return _apply_window(raw)
 
     # In-flight dedup: if another thread already fetches this URL, wait for its cache put instead of re-fetching
     _is_leader = True
@@ -709,10 +875,7 @@ def read_url(url: str, max_chars: int | None = 8000, timeout: float = 15.0, conf
             _hit2 = _cache.get(u) if _got else None
             if _hit2 is not None:
                 _log.info("read_url: in-flight dedup hit for %s (%d tokens)", u, _hit2.tokens)
-                _txt = _hit2.raw
-                if max_chars is not None and len(_txt) > max_chars:
-                    _txt = _txt[:max_chars] + _trunc_marker(_hit2.raw, max_chars)
-                return {"ok": True, "content": _txt, "connection": "cache", "from_cache": True, "deduped": True}
+                return {"ok": True, "content": _apply_window(_hit2.raw), "connection": "cache", "from_cache": True, "deduped": True}
             # Waiter timed out OR leader finished without caching (fetch failed) → become leader ourselves
             _is_leader, _evt = _cache.begin_fetch(u)
 
@@ -740,6 +903,9 @@ def read_url(url: str, max_chars: int | None = 8000, timeout: float = 15.0, conf
         gh_token = ((config or {}).get("github_token") or "").strip() or None
         gh_result = _try_github_api(u, gh_token, max_chars, timeout)
         if gh_result is not None:
+            if gh_result.get("ok"):
+                # GitHub-Content im session-cache ablegen + windowing (offset/max_chars) anwenden
+                gh_result["content"] = _cache_and_trim(gh_result.get("content") or "")
             return gh_result
         try:
             proxy_url, connection_name = _get_proxy_for_request(config, proxy_name=proxy)

@@ -575,11 +575,23 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
         _ma_root.addHandler(_sh)
     _ma_root.setLevel(logging.INFO)
     # Log-Polling von /api/logs/ aus dem Access-Log filtern (Noise bei Live-Log-Viewer)
+    # + Token-Werte aus URLs maskieren bevor sie ins Access-Log + Reverse-Proxy-Log wandern.
+    import re as _re_cli
+    _TOKEN_QS_RE = _re_cli.compile(r"([?&])token=[^&\s\"']+")
     class _LogPollFilter(logging.Filter):
         def filter(self, record: logging.LogRecord) -> bool:
             msg = record.getMessage()
             if "/api/logs/" in msg and "GET" in msg:
                 return False
+            # token=... in URL maskieren (auch in args, damit das gerenderte Format-Resultat passt)
+            if "token=" in msg:
+                if record.args:
+                    record.args = tuple(
+                        _TOKEN_QS_RE.sub(r"\1token=***", a) if isinstance(a, str) else a
+                        for a in record.args
+                    )
+                else:
+                    record.msg = _TOKEN_QS_RE.sub(r"\1token=***", msg)
             return True
     logging.getLogger("uvicorn.access").addFilter(_LogPollFilter())
     # proxy_headers default = True macht Uvicorn XFF/X-Real-IP vertrauen (default forwarded_allow_ips="127.0.0.1").

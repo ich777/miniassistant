@@ -391,7 +391,7 @@ def _normalize_matrix(matrix: Any) -> dict[str, Any] | None:
     encrypted_rooms = m.get("encrypted_rooms")
     if encrypted_rooms is None:
         encrypted_rooms = True
-    return {
+    out = {
         "enabled": bool(m.get("enabled", True)),
         "homeserver": homeserver,
         "bot_name": (m.get("bot_name") or "MiniAssistant").strip() or "MiniAssistant",
@@ -400,6 +400,21 @@ def _normalize_matrix(matrix: Any) -> dict[str, Any] | None:
         "device_id": (m.get("device_id") or "").strip() or None,
         "encrypted_rooms": bool(encrypted_rooms),
     }
+    # Per-room response modes: {room_id: "always"|"mention"|"off"}
+    rm = m.get("room_modes")
+    if isinstance(rm, dict) and rm:
+        clean = {str(k): str(v).strip().lower() for k, v in rm.items()
+                 if isinstance(k, str) and str(v).strip().lower() in ("always", "mention", "off")}
+        if clean:
+            out["room_modes"] = clean
+    # Per-room group-mode settings: {room_id: {context, language, tools_allow, workspace_subdir,
+    #   auto_context_count, auto_context_max_chars, docs_in_sandbox}}
+    rs = m.get("room_settings")
+    if isinstance(rs, dict) and rs:
+        clean_rs = {str(k): v for k, v in rs.items() if isinstance(k, str) and isinstance(v, dict)}
+        if clean_rs:
+            out["room_settings"] = clean_rs
+    return out
 
 
 def _normalize_discord(discord: Any) -> dict[str, Any] | None:
@@ -410,11 +425,24 @@ def _normalize_discord(discord: Any) -> dict[str, Any] | None:
     bot_token = (d.get("bot_token") or "").strip()
     if not bot_token:
         return None
-    return {
+    out = {
         "enabled": bool(d.get("enabled", True)),
         "bot_token": bot_token,
         "command_prefix": (d.get("command_prefix") or "!").strip() or "!",
     }
+    cm = d.get("channel_modes")
+    if isinstance(cm, dict) and cm:
+        clean = {str(k): str(v).strip().lower() for k, v in cm.items()
+                 if isinstance(k, str) and str(v).strip().lower() in ("always", "mention", "off")}
+        if clean:
+            out["channel_modes"] = clean
+    # Per-channel group-mode settings: same shape as room_settings für Matrix
+    cs = d.get("channel_settings")
+    if isinstance(cs, dict) and cs:
+        clean_cs = {str(k): v for k, v in cs.items() if isinstance(k, str) and isinstance(v, dict)}
+        if clean_cs:
+            out["channel_settings"] = clean_cs
+    return out
 
 
 def _normalize_email_account(raw: Any) -> dict[str, Any] | None:
@@ -685,6 +713,23 @@ def _merge_with_defaults(data: dict[str, Any]) -> dict[str, Any]:
             "doc_max_chars", "doc_max_pages_render",
         ) if k in data and data[k] is not None},
     }
+
+
+_save_lock = threading.Lock()
+
+
+def save_config_atomic(updater, project_dir: str | None = None) -> Path:
+    """Race-safe config save: lock + re-load from disk + apply updater(config) + save.
+
+    Verhindert Lost-Update wenn mehrere Pfade gleichzeitig speichern wollen
+    (z.B. matrix_bot ensure_default_group_settings + webui PATCH /api/rooms).
+
+    `updater(config)` muss `config` in-place mutieren. Rückgabewert ignoriert.
+    """
+    with _save_lock:
+        config = load_config(project_dir)
+        updater(config)
+        return save_config(config, project_dir)
 
 
 def save_config(config: dict[str, Any], project_dir: str | None = None) -> Path:

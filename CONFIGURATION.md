@@ -350,8 +350,21 @@ Mehrere Suchmaschinen (SearXNG) mit fester ID. **default_search_engine** legt fe
 |-----------|-----|--------------|
 | `search_engines` | Objekt | `id → { url: "https://..." }`. Z. B. `main`, `vpn`. |
 | `default_search_engine` | string | ID der Standard-Engine (optional). |
+| `search_engine_strategy` | string | Auswahlstrategie bei mehreren Engines (default: `first`). |
 
 **VPN-Suche:** Eine Engine mit ID, die „vpn“ enthält (z. B. `vpn`, `searxng_vpn`), wird vom Assistenten **nur** genutzt, wenn der Nutzer ausdrücklich VPN/gesicherte Suche wünscht oder es in Prefs (z. B. Suchgewohnheiten) steht. Die Default-Engine ist für die normale Suche.
+
+**Strategien (`search_engine_strategy`):**
+
+| Wert | Verhalten | Wann nutzen |
+|------|-----------|-------------|
+| `first` (default) | Default-Engine; bei Error/leerem Ergebnis 1× Fallback zu zufälliger anderer | Konservativ, ein Hauptsystem |
+| `roundrobin` | Engines rotieren über Queries (Q1→A, Q2→B, Q3→C, Q4→A …); bei Fehler sequenzieller Fallback | **API-Quota schonen**, Load gleichmäßig verteilen |
+| `fallback` | Default zuerst, bei Fehler alle anderen sequenziell durch | Maximale Resilienz, eine Engine bevorzugt |
+| `random` | Zufällige Engine pro Query, kein Fallback | Einfaches Load-Spread ohne State |
+| `specific` | Nur Default-Engine, NIE Fallback | Wenn nur eine Engine vertrauenswürdig ist |
+
+**Wichtig — `roundrobin`:** Mit 3 Engines sieht jede ~33 % des Traffics; jede Query trifft **eine** Engine (nicht alle gleichzeitig). Fällt die zugewiesene aus → automatisch nächste in Rotation. Thread-safe; Counter ist in-process (bei Service-Restart wieder bei 0).
 
 **Beispiel:**
 
@@ -361,7 +374,10 @@ search_engines:
     url: https://search.example.org
   vpn:
     url: https://search-vpn.example.org
+  vpn2:
+    url: https://search-vpn2.example.org
 default_search_engine: main
+search_engine_strategy: roundrobin    # Load auf alle 3 verteilen
 ```
 
 ---

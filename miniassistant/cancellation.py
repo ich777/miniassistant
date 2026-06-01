@@ -29,3 +29,42 @@ def clear_cancel(user_id: str) -> None:
     """Clear cancellation flag after processing is done."""
     with _lock:
         _flags.pop(user_id, None)
+
+
+def cancel_keys_for_ctx(chat_ctx: dict | None) -> list[str]:
+    """Liste der Cancel-Schlüssel für einen Chat-Kontext.
+    Owner-Mode: nur user_id (sender). Group-Mode: user_id + room:<id> / chan:<id>
+    → jeder Teilnehmer kann den laufenden Task per /abort abbrechen."""
+    if not chat_ctx:
+        return []
+    keys: list[str] = []
+    uid = chat_ctx.get("user_id")
+    if uid:
+        keys.append(str(uid))
+    if chat_ctx.get("group_mode"):
+        rid = chat_ctx.get("room_id")
+        cid = chat_ctx.get("channel_id")
+        if rid:
+            keys.append(f"room:{rid}")
+        if cid:
+            keys.append(f"chan:{cid}")
+    return keys
+
+
+def check_cancel_for_chat(chat_ctx: dict | None) -> str | None:
+    """Prüft cancel-Flag für alle relevanten Keys aus chat_ctx (user + room/channel im Group-Mode)."""
+    keys = cancel_keys_for_ctx(chat_ctx)
+    with _lock:
+        for k in keys:
+            v = _flags.get(k)
+            if v:
+                return v
+    return None
+
+
+def clear_cancel_for_chat(chat_ctx: dict | None) -> None:
+    """Räumt alle Cancel-Flags des Chat-Kontexts."""
+    keys = cancel_keys_for_ctx(chat_ctx)
+    with _lock:
+        for k in keys:
+            _flags.pop(k, None)

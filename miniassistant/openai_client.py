@@ -823,22 +823,44 @@ def api_edit_image(
     def _try_openai_edits() -> dict[str, Any]:
         """OpenAI-kompatibel: POST /v1/images/edits mit multipart/form-data.
         Funktioniert mit echtem OpenAI, sd-server und LocalAI."""
-        # Extra-Parameter als <sd_cpp_extra_args> im Prompt einbetten (sd-server)
+        # Extra-Parameter sd-server (leejet stable-diffusion.cpp):
+        # 1) als DIREKTE Form-Fields — das liest der sd-server tatsächlich aus.
+        #    (steps + sample_steps beide gesetzt, da forks unterschiedlich benennen)
+        # 2) ZUSÄTZLICH als <sd_cpp_extra_args>-Tag im Prompt — für Wrapper die das parsen.
+        # Unbekannte Form-Fields ignoriert der Server, daher ist Doppel-Senden safe.
         _prompt = prompt
         _extra: dict[str, Any] = {}
+        _files: dict[str, Any] = {"image": (img_p.name, img_bytes, img_mime)}
+        _form: dict[str, Any] = {"prompt": prompt, "model": model, "size": size}
         if not is_openai:
-            if steps is not None: _extra["steps"] = steps
-            if cfg_scale is not None: _extra["cfg_scale"] = cfg_scale
-            if guidance is not None: _extra["guidance"] = guidance
-            if strength is not None: _extra["strength"] = strength
-            if sampler is not None: _extra["sample_method"] = sampler
-            if scheduler is not None: _extra["scheduler"] = scheduler
-            if seed is not None: _extra["seed"] = seed
-            if negative_prompt is not None: _extra["negative_prompt"] = negative_prompt
+            if steps is not None:
+                _extra["steps"] = steps
+                _form["steps"] = str(steps)
+                _form["sample_steps"] = str(steps)  # leejet sd-server field name
+            if cfg_scale is not None:
+                _extra["cfg_scale"] = cfg_scale
+                _form["cfg_scale"] = str(cfg_scale)
+            if guidance is not None:
+                _extra["guidance"] = guidance
+                _form["guidance"] = str(guidance)
+            if strength is not None:
+                _extra["strength"] = strength
+                _form["strength"] = str(strength)
+            if sampler is not None:
+                _extra["sample_method"] = sampler
+                _form["sample_method"] = str(sampler)
+            if scheduler is not None:
+                _extra["scheduler"] = scheduler
+                _form["scheduler"] = str(scheduler)
+            if seed is not None:
+                _extra["seed"] = seed
+                _form["seed"] = str(seed)
+            if negative_prompt is not None:
+                _extra["negative_prompt"] = negative_prompt
+                _form["negative_prompt"] = str(negative_prompt)
             if _extra:
                 _prompt = f"{prompt}<sd_cpp_extra_args>{json.dumps(_extra)}</sd_cpp_extra_args>"
-        _files: dict[str, Any] = {"image": (img_p.name, img_bytes, img_mime)}
-        _form: dict[str, Any] = {"prompt": _prompt, "model": model, "size": size}
+                _form["prompt"] = _prompt
         if is_openai:
             _form["response_format"] = "b64_json"
         if mask_path:
@@ -848,6 +870,8 @@ def api_edit_image(
         _hdrs = {}
         if api_key:
             _hdrs["Authorization"] = f"Bearer {api_key}"
+        _log.info("api_edit_image POST %s | form-keys=%s | prompt-tail=%r",
+                  url, sorted(_form.keys()), _prompt[-120:] if len(_prompt) > 120 else _prompt)
         r = httpx.post(url, headers=_hdrs, data=_form, files=_files, timeout=timeout)
         r.raise_for_status()
         return _parse(r.json())

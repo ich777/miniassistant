@@ -15,6 +15,88 @@ logger = logging.getLogger(__name__)
 _discord_client: Any = None
 _discord_loop: asyncio.AbstractEventLoop | None = None
 
+# Cache: guild_id (int) -> inviter user_id (str) of the bot. None = looked up, no inviter found.
+_guild_inviter_cache: dict[int, str | None] = {}
+
+
+def get_guild_inviter(guild_id: int) -> str | None:
+    """Sync cached lookup of the user who added the bot to a Discord guild."""
+    return _guild_inviter_cache.get(int(guild_id))
+
+
+def get_guild_inviter_cache() -> dict[int, str | None]:
+    return dict(_guild_inviter_cache)
+
+
+def leave_guild(guild_id: str) -> tuple[bool, str]:
+    """Bot leaves a Discord guild (server). Thread-safe."""
+    cl = _discord_client
+    loop = _discord_loop
+    if not cl or not loop:
+        return False, "Discord-Bot läuft nicht"
+
+    async def _do_leave() -> tuple[bool, str]:
+        try:
+            guild = cl.get_guild(int(guild_id))
+            if not guild:
+                return False, "Guild nicht gefunden"
+            await guild.leave()
+            return True, "ok"
+        except Exception as e:
+            return False, str(e)
+
+    try:
+        future = asyncio.run_coroutine_threadsafe(_do_leave(), loop)
+        return future.result(timeout=30)
+    except Exception as e:
+        return False, str(e)
+
+
+def list_channels() -> list[dict[str, Any]]:
+    """List Discord text channels + DM channels the bot can see. Returns [] if not running."""
+    cl = _discord_client
+    if not cl:
+        return []
+    out: list[dict[str, Any]] = []
+    try:
+        from miniassistant.chat_auth import is_authorized
+        from miniassistant.config import get_config_dir as _cfgdir
+        config_dir = _cfgdir()
+    except Exception:
+        is_authorized = None  # type: ignore
+        config_dir = None
+    try:
+        for guild in getattr(cl, "guilds", []) or []:
+            guild_name = getattr(guild, "name", None) or str(getattr(guild, "id", ""))
+            guild_id = str(getattr(guild, "id", ""))
+            inviter = _guild_inviter_cache.get(int(guild.id))
+            inviter_authed = bool(is_authorized("discord", inviter, config_dir)) if (inviter and is_authorized) else False
+            guild_trusted = bool(inviter_authed)
+            for ch in getattr(guild, "text_channels", []) or []:
+                out.append({
+                    "id": str(getattr(ch, "id", "")),
+                    "name": str(getattr(ch, "name", "") or getattr(ch, "id", "")),
+                    "guild": guild_name,
+                    "guild_id": guild_id,
+                    "kind": "text",
+                    "inviter": inviter,
+                    "inviter_authed": inviter_authed,
+                    "guild_trusted": guild_trusted,
+                })
+        for dm in getattr(cl, "private_channels", []) or []:
+            recipient = getattr(dm, "recipient", None)
+            rname = getattr(recipient, "name", None) if recipient else None
+            out.append({
+                "id": str(getattr(dm, "id", "")),
+                "name": str(rname or "DM"),
+                "guild": "(DM)",
+                "kind": "dm",
+            })
+    except Exception as e:
+        logger.warning("list_channels failed: %s", e)
+    out.sort(key=lambda c: (c["kind"] != "dm", c["guild"].lower(), c["name"].lower()))
+    return out
+
 # Optional: discord.py (pip install miniassistant[discord])
 _DISCORD_IMPORT_ERROR: str | None = None
 try:
@@ -57,6 +139,145 @@ def send_message_to_channel(channel_id: str, message: str) -> bool:
         return False
 
 
+def fetch_recent_messages(channel_id: str, limit: int = 20, skip_message_id: str | None = None) -> list[dict[str, Any]]:
+    """Fetcht die letzten `limit` Text-Nachrichten aus einem Discord-Channel.
+    Liefert Liste älteste→neueste. Jede Nachricht: {sender, display, body, ts, message_id}.
+    skip_message_id: lasse diese eine ID aus (z.B. die Trigger-Nachricht selbst).
+    Thread-safe; gibt [] wenn Bot nicht läuft, Channel unbekannt, oder Fehler."""
+    if not _discord_client or not _discord_loop:
+        return []
+    if limit <= 0:
+        return []
+    limit = min(limit, 100)
+
+    async def _do_fetch() -> list[dict[str, Any]]:
+        try:
+            ch = _discord_client.get_channel(int(channel_id))
+        except Exception:
+            return []
+        if not ch:
+            return []
+        collected: list[dict[str, Any]] = []
+        try:
+            # discord.py: channel.history liefert neueste zuerst (oldest_first=False default)
+            async for msg in ch.history(limit=limit + (1 if skip_message_id else 0)):
+                if skip_message_id and str(msg.id) == str(skip_message_id):
+                    continue
+                body = (msg.content or "").strip()
+                if not body:
+                    continue
+                author = msg.author
+                sender = f"{author.name}#{getattr(author, 'discriminator', '0')}" if hasattr(author, "name") else str(author)
+                display = getattr(author, "display_name", None) or getattr(author, "name", None) or str(author)
+                ts_ms = int(msg.created_at.timestamp() * 1000) if hasattr(msg, "created_at") else 0
+                collected.append({
+                    "sender": sender,
+                    "display": str(display),
+                    "body": body,
+                    "ts": ts_ms,
+                    "message_id": str(msg.id),
+                })
+                if len(collected) >= limit:
+                    break
+        except Exception as e:
+            logger.debug("Discord fetch_recent_messages fehlgeschlagen: %s", e)
+        collected.reverse()  # oldest → newest
+        return collected
+
+    try:
+        future = asyncio.run_coroutine_threadsafe(_do_fetch(), _discord_loop)
+        return future.result(timeout=20)
+    except Exception as e:
+        logger.warning("Discord fetch_recent_messages exception: %s", e)
+        return []
+
+
+def search_chat_history(
+    channel_id: str,
+    query: str,
+    max_scan: int = 200,
+    context_lines: int = 2,
+) -> dict[str, Any]:
+    """Sucht in Discord-Channel-History nach `query` (case-insensitive substring; mit `/.../` regex).
+    Scrollt bis zu max_scan Nachrichten zurück, returnt Hits mit ±context_lines Kontext."""
+    if not _discord_client or not _discord_loop or not query:
+        return {"hits": [], "scanned": 0, "query": query, "diagnostic": "no client or empty query"}
+    max_scan = max(10, min(int(max_scan), 500))
+    context_lines = max(0, min(int(context_lines), 5))
+
+    import re as _re_s
+    is_regex = len(query) >= 3 and query.startswith("/") and query.endswith("/")
+    pat = None
+    if is_regex:
+        try:
+            pat = _re_s.compile(query[1:-1], _re_s.IGNORECASE)
+        except _re_s.error:
+            return {"hits": [], "scanned": 0, "query": query, "diagnostic": "invalid regex"}
+    q_lower = query.lower() if not is_regex else None
+
+    async def _do_search() -> dict[str, Any]:
+        try:
+            ch = _discord_client.get_channel(int(channel_id))
+        except Exception:
+            return {"hits": [], "scanned": 0, "query": query, "diagnostic": "invalid channel"}
+        if not ch:
+            return {"hits": [], "scanned": 0, "query": query, "diagnostic": "channel not found"}
+        all_messages: list[dict[str, Any]] = []
+        try:
+            async for msg in ch.history(limit=max_scan):
+                body = (msg.content or "").strip()
+                if not body:
+                    continue
+                author = msg.author
+                sender = f"{author.name}#{getattr(author, 'discriminator', '0')}" if hasattr(author, "name") else str(author)
+                display = getattr(author, "display_name", None) or getattr(author, "name", None) or str(author)
+                ts_ms = int(msg.created_at.timestamp() * 1000) if hasattr(msg, "created_at") else 0
+                all_messages.append({
+                    "sender": sender,
+                    "display": str(display),
+                    "body": body,
+                    "ts": ts_ms,
+                    "message_id": str(msg.id),
+                })
+        except Exception as e:
+            logger.debug("Discord search_chat_history failed: %s", e)
+        all_messages.reverse()
+
+        def _match(body: str) -> bool:
+            if not body:
+                return False
+            if pat is not None:
+                return bool(pat.search(body))
+            return q_lower in body.lower()
+
+        hit_indices = [i for i, m in enumerate(all_messages) if _match(m["body"])]
+        included = set()
+        for i in hit_indices:
+            for j in range(max(0, i - context_lines), min(len(all_messages), i + context_lines + 1)):
+                included.add(j)
+        hits = []
+        for i in sorted(included):
+            m = dict(all_messages[i])
+            m["is_hit"] = i in hit_indices
+            hits.append(m)
+        if len(hits) > 40:
+            hits = hits[:40]
+        return {
+            "hits": hits,
+            "match_count": len(hit_indices),
+            "scanned": len(all_messages),
+            "query": query,
+            "diagnostic": None,
+        }
+
+    try:
+        future = asyncio.run_coroutine_threadsafe(_do_search(), _discord_loop)
+        return future.result(timeout=30)
+    except Exception as e:
+        logger.warning("Discord search_chat_history exception: %s", e)
+        return {"hits": [], "scanned": 0, "query": query, "diagnostic": f"exception: {e}"}
+
+
 def set_channel_typing(channel_id: str) -> bool:
     """Thread-safe: Triggert den Typing-Indikator in einem Discord-Channel.
     Wird z.B. vom Debate-Tool aufgerufen, um zwischen Runden den Typing-Status zu halten."""
@@ -76,6 +297,83 @@ def set_channel_typing(channel_id: str) -> bool:
         return False
 
 
+def get_user_profile(user_id: str, save_dir: str, channel_id: str | None = None) -> dict[str, Any]:
+    """Holt display_name + avatar von einem Discord-Nutzer. Avatar wird nach save_dir/<id>.png geschrieben.
+    Returns {display_name, avatar_path (host-Pfad), avatar_url}.
+    channel_id: wenn gesetzt, wird user_id gegen die Guild-Mitglieder des Channels geprüft —
+    Profile von Nicht-Mitgliedern werden NICHT aufgelöst (kein globaler Lookup im Group-Mode)."""
+    cl = _discord_client
+    loop = _discord_loop
+    if not cl or not loop:
+        return {"display_name": "", "avatar_path": "", "avatar_url": "", "error": "discord bot not running"}
+    try:
+        uid_int = int(user_id)
+    except (TypeError, ValueError):
+        return {"display_name": "", "avatar_path": "", "avatar_url": "", "error": "invalid discord user_id (expected numeric)"}
+
+    async def _do() -> dict[str, Any]:
+        # Membership-Gate: nur Profile von Mitgliedern DIESER Guild auflösen.
+        if channel_id:
+            try:
+                ch = cl.get_channel(int(channel_id))
+            except (TypeError, ValueError):
+                ch = None
+            guild = getattr(ch, "guild", None)
+            if guild is None:
+                return {"error": "No row found: cannot verify room membership"}
+            member = guild.get_member(uid_int)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(uid_int)
+                except Exception:
+                    member = None
+            if member is None:
+                return {"error": "No row found: user is not in this room"}
+            display = getattr(member, "display_name", None) or getattr(member, "global_name", None) or getattr(member, "name", None) or str(uid_int)
+            av = getattr(member, "display_avatar", None) or getattr(member, "avatar", None)
+            url = str(getattr(av, "url", "")) if av else ""
+            return {"display_name": str(display), "avatar_url": url}
+        try:
+            u = await cl.fetch_user(uid_int)
+        except Exception as e:
+            return {"error": f"fetch_user failed: {e}"}
+        display = getattr(u, "display_name", None) or getattr(u, "global_name", None) or getattr(u, "name", None) or str(uid_int)
+        av = getattr(u, "display_avatar", None) or getattr(u, "avatar", None)
+        url = str(getattr(av, "url", "")) if av else ""
+        return {"display_name": str(display), "avatar_url": url}
+
+    try:
+        fut = asyncio.run_coroutine_threadsafe(_do(), loop)
+        meta = fut.result(timeout=20)
+    except Exception as e:
+        return {"display_name": "", "avatar_path": "", "avatar_url": "", "error": f"profile fetch timeout: {e}"}
+    if meta.get("error"):
+        return {"display_name": "", "avatar_path": "", "avatar_url": "", "error": meta["error"]}
+    out: dict[str, Any] = {"display_name": meta.get("display_name", ""), "avatar_path": "", "avatar_url": meta.get("avatar_url", "")}
+    url = out["avatar_url"]
+    if url:
+        try:
+            import httpx as _httpx
+            r = _httpx.get(url, timeout=15, follow_redirects=True)
+            r.raise_for_status()
+            ct = r.headers.get("content-type", "")
+            ext = ".png"
+            if "jpeg" in ct or "jpg" in ct:
+                ext = ".jpg"
+            elif "webp" in ct:
+                ext = ".webp"
+            elif "gif" in ct:
+                ext = ".gif"
+            from pathlib import Path as _P
+            p = _P(save_dir) / f"{uid_int}{ext}"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(r.content)
+            out["avatar_path"] = str(p)
+        except Exception as e:
+            out["error"] = f"avatar download failed: {e}"
+    return out
+
+
 def _get_chat_response(
     config: dict[str, Any],
     discord_user_id: str,
@@ -83,24 +381,72 @@ def _get_chat_response(
     sessions: dict[str, Any],
     images: list[dict[str, Any]] | None = None,
     channel_id: str | None = None,
+    is_group: bool = False,
 ) -> str:
     """Synchroner Aufruf: Session per (channel_id, discord_user_id), handle_user_input.
     Gibt ausschließlich den sichtbaren Content zurück – KEIN Thinking.
 
     Session-Key kombiniert Channel und User: gleicher User in zwei Channels → zwei separate Sessions.
     """
-    from miniassistant.chat_loop import create_session, handle_user_input
+    # Pro Turn shallow-copy des Config-Dicts: verhindert Race auf config["_chat_context"]
+    # zwischen parallelen Triggern (Alice in Channel A vs Bob in Channel B im selben Moment).
+    # Top-level Keys werden unabhängig — nested dicts (providers, server, …) bleiben geteilt,
+    # was ok ist weil zur Laufzeit nur top-level _-Keys mutiert werden.
+    config = dict(config)
+    from miniassistant.chat_loop import create_session, handle_user_input, is_chat_command
     from miniassistant.slot_cache import derive_conv_id as _sc_derive
-    session_key = f"{channel_id or ''}|{discord_user_id}"
+    from miniassistant.group_rooms import (
+        get_room_settings, build_group_chat_context, session_key as _sess_key,
+        ensure_default_group_settings, get_auto_context_settings, format_auto_context,
+    )
+    if channel_id and is_group:
+        ensure_default_group_settings(config, "discord", channel_id, is_group=True)
+    rs = get_room_settings(config, "discord", channel_id)
     _sc_conv_id = _sc_derive("discord", channel_id=channel_id, user_id=discord_user_id) if channel_id else None
-    # Set chat_context BEFORE creating session so user_id is included in system_prompt
+    base_ctx: dict[str, Any] = {"platform": "discord", "channel_id": channel_id, "user_id": discord_user_id}
+    # Display-Name des Senders via Client lookup
+    try:
+        if _discord_client and discord_user_id:
+            _u = _discord_client.get_user(int(discord_user_id))
+            if _u is not None:
+                _dn = getattr(_u, "display_name", None) or getattr(_u, "global_name", None) or getattr(_u, "name", None) or ""
+                if _dn:
+                    base_ctx["user_display"] = str(_dn)
+    except Exception:
+        pass
+    if _sc_conv_id:
+        base_ctx["conv_id"] = _sc_conv_id
+        base_ctx["slot_cache_endpoint"] = "discord"
+    ctx = build_group_chat_context(base_ctx, rs) if channel_id else base_ctx
+    # Auto-Context im Group-Mode: letzte N Nachrichten vor user_message prependen.
+    # NICHT bei Slash-Befehlen (/new, /help, …): das Prepend würde den ^-verankerten
+    # Command-Parser in handle_user_input aushebeln → Befehl landet als Prompt beim LLM.
+    if ctx.get("group_mode") and channel_id and not is_chat_command(user_message):
+        ac_count, ac_max = get_auto_context_settings(rs)
+        if ac_count > 0:
+            try:
+                bot_sender = ""
+                try:
+                    if _discord_client and getattr(_discord_client, "user", None):
+                        u = _discord_client.user
+                        bot_sender = f"{u.name}#{getattr(u, 'discriminator', '0')}"
+                except Exception:
+                    pass
+                prev = fetch_recent_messages(channel_id, limit=ac_count + 1)
+                if prev and (prev[-1].get("body") or "").strip() == user_message.strip():
+                    prev = prev[:-1]
+                prev = prev[-ac_count:] if len(prev) > ac_count else prev
+                blk = format_auto_context(prev, max_chars=ac_max, bot_sender=bot_sender)
+                if blk:
+                    _who_now = base_ctx.get("user_display") or discord_user_id
+                    user_message = blk + f"[Current message from {_who_now}]:\n" + user_message
+            except Exception as _ac_err:
+                logger.debug("Discord auto-context fetch failed: %s", _ac_err)
+    session_key = _sess_key(channel_id, discord_user_id, bool(ctx.get("group_mode")))
     if channel_id:
-        ctx = {"platform": "discord", "channel_id": channel_id, "user_id": discord_user_id}
-        if _sc_conv_id:
-            ctx["conv_id"] = _sc_conv_id
-            ctx["slot_cache_endpoint"] = "discord"
         config["_chat_context"] = ctx
-    if session_key not in sessions:
+    # Group-Mode: stateless — jeder Turn frische Session (auto-context + read_recent_messages liefern Kontext).
+    if ctx.get("group_mode") or session_key not in sessions:
         session = create_session(config, None)
         session["system_prompt"] = (
             session.get("system_prompt", "") +
@@ -108,15 +454,13 @@ def _get_chat_response(
         )
         sessions[session_key] = session
     session = sessions[session_key]
-    # Chat-Kontext aktualisieren (Channel-ID kann sich ändern)
     if channel_id:
-        ctx = {"platform": "discord", "channel_id": channel_id, "user_id": discord_user_id}
-        if _sc_conv_id:
-            ctx["conv_id"] = _sc_conv_id
-            ctx["slot_cache_endpoint"] = "discord"
         session["chat_context"] = ctx
     result = handle_user_input(session, user_message, allow_new_session=True, images=images)
-    sessions[session_key] = result[1]
+    if ctx.get("group_mode"):
+        sessions.pop(session_key, None)
+    else:
+        sessions[session_key] = result[1]
     ai_content = result[4] if len(result) > 4 else None
     thinking = result[3] if len(result) > 3 else None
     if ai_content:
@@ -154,6 +498,18 @@ async def run_discord_bot(config: dict[str, Any]) -> None:
     from miniassistant.chat_auth import get_or_generate_code, is_authorized
     from miniassistant.chat_loop import SessionLRU
 
+    def _is_trusted(sender_id: str, channel: Any, config_dir: str | None) -> tuple[bool, str | None]:
+        """Returns (trusted, reason). True wenn User selbst authed ODER Guild-Trust (manuell oder via Inviter)."""
+        if is_authorized("discord", sender_id, config_dir):
+            return True, None
+        guild = getattr(channel, "guild", None)
+        if guild is None:
+            return False, None  # DM
+        inviter = _guild_inviter_cache.get(int(guild.id))
+        if inviter and is_authorized("discord", inviter, config_dir):
+            return True, inviter
+        return False, None
+
     # Sessions pro (channel, discord_user) — LRU mit Cap, sonst wachsen sie unbegrenzt
     discord_sessions: Any = SessionLRU(max_size=200)
     # Pending Images: User hat Bild ohne Text geschickt → nächste Textnachricht bekommt das Bild
@@ -171,6 +527,29 @@ async def run_discord_bot(config: dict[str, Any]) -> None:
         _discord_client = client
         _discord_loop = asyncio.get_event_loop()
         logger.info("Discord-Bot gestartet als %s (ID: %s)", client.user, client.user.id if client.user else "?")
+        # Inviter pro Guild aus Audit-Log holen — wenn Audit-Log Permission gegeben.
+        bot_id = client.user.id if client.user else None
+        for guild in getattr(client, "guilds", []) or []:
+            try:
+                inviter_id: str | None = None
+                async for entry in guild.audit_logs(limit=50, action=discord.AuditLogAction.bot_add):
+                    target = getattr(entry, "target", None)
+                    if target and bot_id and int(getattr(target, "id", 0)) == int(bot_id):
+                        user_obj = getattr(entry, "user", None)
+                        if user_obj and getattr(user_obj, "id", None) is not None:
+                            inviter_id = str(user_obj.id)
+                            break
+                _guild_inviter_cache[int(guild.id)] = inviter_id
+                if inviter_id:
+                    logger.info("Discord: Guild '%s' (%s) eingeladen von User-ID %s", guild.name, guild.id, inviter_id)
+                else:
+                    logger.info("Discord: Guild '%s' (%s) — kein bot_add Audit-Log-Eintrag gefunden", guild.name, guild.id)
+            except discord.Forbidden:
+                _guild_inviter_cache[int(guild.id)] = None
+                logger.warning("Discord: Audit-Log für Guild '%s' nicht zugänglich (Bot hat keine VIEW_AUDIT_LOG Permission) — Guild-Trust deaktiviert.", guild.name)
+            except Exception as e:
+                _guild_inviter_cache[int(guild.id)] = None
+                logger.warning("Discord: Audit-Log Fetch für Guild '%s' fehlgeschlagen: %s", guild.name, e)
 
     @client.event
     async def on_message(message: discord.Message) -> None:
@@ -178,11 +557,17 @@ async def run_discord_bot(config: dict[str, Any]) -> None:
         if message.author == client.user:
             return
 
-        # Nur DMs oder @-Mentions in Channels
+        # Channel-Mode: always / mention / off. Default: mention (alter Discord-Default), DMs immer always.
         is_dm = isinstance(message.channel, discord.DMChannel)
         is_mentioned = client.user is not None and client.user.mentioned_in(message)
-
-        if not is_dm and not is_mentioned:
+        ch_modes = ((config.get("chat_clients") or {}).get("discord") or {}).get("channel_modes") or {}
+        ch_id = str(getattr(message.channel, "id", ""))
+        mode = (ch_modes.get(ch_id) or "").strip().lower()
+        if mode not in ("always", "mention", "off"):
+            mode = "always" if is_dm else "mention"
+        if mode == "off":
+            return
+        if mode == "mention" and not (is_dm or is_mentioned):
             return
 
         sender_id = str(message.author.id)
@@ -233,14 +618,45 @@ async def run_discord_bot(config: dict[str, Any]) -> None:
                 except Exception as e:
                     logger.warning("Discord: Dokument-Download fehlgeschlagen für %s: %s", fname, e)
 
+        # Reply-to-Image (Discord Reply-Feature): wenn User auf eine ältere Nachricht antwortet
+        # und die Originalnachricht Image-Attachments hatte → diese auch fetchen + anhängen,
+        # damit Bot das gequotete Bild sehen kann.
+        try:
+            _ref = getattr(message, "reference", None)
+            _ref_mid = getattr(_ref, "message_id", None) if _ref is not None else None
+            if _ref_mid:
+                try:
+                    _ref_msg = await message.channel.fetch_message(int(_ref_mid))
+                except Exception as _e_fetch:
+                    _ref_msg = None
+                    logger.debug("Discord: fetch_message(%s) failed: %s", _ref_mid, _e_fetch)
+                if _ref_msg is not None and getattr(_ref_msg, "attachments", None):
+                    import base64 as _b64q
+                    for _att_q in _ref_msg.attachments:
+                        _ctq = (_att_q.content_type or "").lower()
+                        _fnq = _att_q.filename or ""
+                        if _ctq.startswith("image/") or _fnq.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+                            try:
+                                _ibq = await _att_q.read()
+                                _mq = _ctq if _ctq.startswith("image/") else "image/png"
+                                msg_images.append({"mime_type": _mq, "data": _b64q.b64encode(_ibq).decode("ascii")})
+                                logger.info("Discord: reply-to-image dereferenziert (ref_msg=%s, file=%s, %s)", _ref_mid, _fnq, _mq)
+                            except Exception as _e_q:
+                                logger.debug("Discord: reply-to-image read failed for %s: %s", _fnq, _e_q)
+        except Exception as _qerr_d:
+            logger.debug("Discord: reply-to-image processing failed: %s", _qerr_d)
+
         # Audio-Nachricht: STT → Agent → TTS → Antwort senden
         if audio_bytes is not None:
             from miniassistant.config import get_voice_stt_url, get_voice_tts_url, get_voice_language, get_voice_tts_voice
             config_dir = config.get("_config_dir")
-            if not is_authorized("discord", sender_id, config_dir):
+            trusted, via_inviter = _is_trusted(sender_id, message.channel, config_dir)
+            if not trusted:
                 code = get_or_generate_code("discord", sender_id, config_dir)
                 await message.reply(f"Nicht freigeschaltet. Auth-Code: **{code}**")
                 return
+            if via_inviter:
+                logger.debug("Discord: User %s trusted via Guild-Inviter %s", sender_id, via_inviter)
             stt_url = get_voice_stt_url(config)
             if not stt_url:
                 await message.reply("Sprachfunktion nicht konfiguriert (voice.stt.url fehlt).")
@@ -262,7 +678,7 @@ async def run_discord_bot(config: dict[str, Any]) -> None:
                 try:
                     response = await asyncio.get_event_loop().run_in_executor(
                         None,
-                        lambda: _get_chat_response(config, sender_id, f"[Voice] {transcript}", discord_sessions, channel_id=str(message.channel.id)),
+                        lambda: _get_chat_response(config, sender_id, f"[Voice] {transcript}", discord_sessions, channel_id=str(message.channel.id), is_group=(not is_dm)),
                     )
                 except Exception as e:
                     logger.exception("Discord Audio: Agent fehlgeschlagen")
@@ -301,15 +717,20 @@ async def run_discord_bot(config: dict[str, Any]) -> None:
         if not body and not msg_images and not msg_docs:
             return
 
-        # /stop, /abort, /abbruch: Cancellation-Befehle abfangen (auch mit : statt /)
-        _cancel_cmd = body.strip().lower()
-        if _cancel_cmd.startswith(":") and len(_cancel_cmd) > 1:
-            _cancel_cmd = "/" + _cancel_cmd[1:]
-        if _cancel_cmd in ("/stop", "/abort", "/abbruch"):
+        # /stop, /abort, /abbruch: Token-basiert (egal ob mit @-mention, display-name, oder ':' statt '/').
+        import re as _re_cancel_d
+        _cancel_tokens = set(_re_cancel_d.split(r"\s+", body.strip().lower()))
+        _cancel_tokens |= {("/" + t[1:]) for t in _cancel_tokens if t.startswith(":") and len(t) > 1}
+        _cancel_hit = _cancel_tokens & {"/stop", "/abort", "/abbruch"}
+        if _cancel_hit:
+            _cancel_cmd = sorted(_cancel_hit)[0]
             from miniassistant.cancellation import request_cancel
             level = "stop" if _cancel_cmd == "/stop" else "abort"
-            request_cancel(sender_id, level)
-            logger.info("Discord: %s von %s — Cancellation angefordert (%s)", body, sender_id, level)
+            # Gruppen-Channels: room-wide cancel
+            channel_id = str(message.channel.id) if hasattr(message, "channel") else ""
+            cancel_key = f"chan:{channel_id}" if (not is_dm and channel_id) else sender_id
+            request_cancel(cancel_key, level)
+            logger.info("Discord: %s von %s — Cancellation angefordert (%s, key=%s)", body[:40], sender_id, level, cancel_key)
             reply = "⏹ Verarbeitung wird abgebrochen…" if level == "abort" else "⏸ Verarbeitung wird nach aktuellem Schritt gestoppt…"
             await message.reply(reply)
             return
@@ -321,7 +742,8 @@ async def run_discord_bot(config: dict[str, Any]) -> None:
         logger.info("Discord: Nachricht von %s (%s): %.80s", message.author, sender_id, body)
 
         config_dir = config.get("_config_dir")
-        if not is_authorized("discord", sender_id, config_dir):
+        trusted, via_inviter = _is_trusted(sender_id, message.channel, config_dir)
+        if not trusted:
             code = get_or_generate_code("discord", sender_id, config_dir)
             logger.info("Discord: Auth-Code an %s gesendet (Code redacted)", sender_id)
             await message.reply(
@@ -329,6 +751,8 @@ async def run_discord_bot(config: dict[str, Any]) -> None:
                 f"Gib in der Web-UI ein: `/auth discord {code}`"
             )
             return
+        if via_inviter:
+            logger.debug("Discord: %s trusted via Guild-Inviter %s", sender_id, via_inviter)
 
         images_param = msg_images if msg_images else None
 
@@ -345,7 +769,7 @@ async def run_discord_bot(config: dict[str, Any]) -> None:
             try:
                 reply = await asyncio.get_event_loop().run_in_executor(
                     None,
-                    lambda s=sender_id, b=body, imgs=images_param, cid=str(message.channel.id): _get_chat_response(config, s, b, discord_sessions, images=imgs, channel_id=cid),
+                    lambda s=sender_id, b=body, imgs=images_param, cid=str(message.channel.id), grp=(not is_dm): _get_chat_response(config, s, b, discord_sessions, images=imgs, channel_id=cid, is_group=grp),
                 )
             except Exception as e:
                 logger.exception("Discord KI-Antwort fehlgeschlagen: %s", e)

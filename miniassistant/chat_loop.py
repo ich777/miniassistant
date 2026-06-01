@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -33,7 +34,7 @@ from miniassistant.ollama_client import (
     model_supports_vision,
     resolve_model,
 )
-from miniassistant.tools import run_exec, web_search as tool_web_search, check_url as tool_check_url, read_url as tool_read_url
+from miniassistant.tools import run_exec, web_search as tool_web_search, web_search_multi as tool_web_search_multi, check_url as tool_check_url, read_url as tool_read_url
 from miniassistant.memory import append_exchange
 import miniassistant.agent_actions_log as _aal
 import miniassistant.context_log as _ctx_log
@@ -125,12 +126,24 @@ class SessionLRU(OrderedDict):
 def _save_uploaded_images(config: dict[str, Any], images: list[dict[str, Any]]) -> list[str]:
     """Speichert hochgeladene Bilder (base64) auf Disk im Workspace/images/uploads/.
     Gibt Liste der gespeicherten Pfade zurück. Wird benötigt damit das LLM
-    den Pfad an invoke_model(image_path=...) für Image Editing geben kann."""
+    den Pfad an invoke_model(image_path=...) für Image Editing geben kann.
+
+    Group-Mode: speichert in <workspace>/groups/<sub>/images/uploads/ (raum-isoliert),
+    sonst in owner workspace/images/uploads/."""
     import base64 as _b64
     import uuid as _uuid
     saved: list[str] = []
-    workspace = (config.get("workspace") or "").strip()
-    upload_dir = Path(workspace) / "images" / "uploads" if workspace else Path("images") / "uploads"
+    _ctx_up = config.get("_chat_context") or {}
+    if _ctx_up.get("group_mode"):
+        try:
+            from miniassistant.group_rooms import group_workspace_path as _gwp_up
+            upload_dir = _gwp_up(config, _ctx_up.get("workspace_subdir") or "default") / "images" / "uploads"
+        except Exception:
+            workspace = (config.get("workspace") or "").strip()
+            upload_dir = Path(workspace) / "images" / "uploads" if workspace else Path("images") / "uploads"
+    else:
+        workspace = (config.get("workspace") or "").strip()
+        upload_dir = Path(workspace) / "images" / "uploads" if workspace else Path("images") / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
     for img in images:
         data = img.get("data", "")
@@ -1075,12 +1088,17 @@ def _proactive_rolling_summary(
     base_url: str,
     sub_timeout: float,
     resolved_name: str,
+    fetched_urls: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Proactive rolling summary: when tool results exceed threshold, compress all findings
     into one task-aware summary block, rebuild msgs compactly to keep context bounded.
 
     New msgs: [original_task, summary_context, last_assistant, last_tool_results]
     Called AFTER tool execution rounds — not before API calls (that's _compact_subagent_msgs).
+
+    fetched_urls: bereits erfolgreich gelesene URLs. Wird als explizite Checkliste an den
+    Summary-Block gehängt, damit der Subagent nach dem Kollabieren der Tool-Results nicht
+    dieselben Quellen erneut anfragt (sonst Dedup-Block-Loop, verschenkte Runden).
     """
     from miniassistant.openai_client import api_chat as _oai_chat, OPENAI_API_URL as _OAI_URL
 
@@ -1142,11 +1160,24 @@ def _proactive_rolling_summary(
             last_assistant = m
             break
 
+    _checklist = ""
+    if fetched_urls:
+        # Reihenfolge erhalten, dedupen
+        _seen_chk: set[str] = set()
+        _uniq = [u for u in fetched_urls if u and not (u in _seen_chk or _seen_chk.add(u))]
+        if _uniq:
+            _checklist = (
+                "\n\n[Bereits gelesene Quellen — vollständige Liste, überlebt jede Zusammenfassung. "
+                "Nutze diese URLs für Quellenangaben in der finalen Antwort. "
+                "Rufe KEINE davon erneut mit read_url auf:]\n"
+                + "\n".join(f"- {u}" for u in _uniq)
+            )
     summary_msg = {
         "role": "user",
         "content": (
             f"[Zwischenzusammenfassung der bisherigen Recherche-Ergebnisse]\n{summary}\n\n"
             "Setze die Recherche fort — nutze obige Ergebnisse, wiederhole keine bereits gelesenen Quellen."
+            + _checklist
         ),
     }
     new_msgs: list[dict] = [msgs[0], summary_msg]
@@ -1165,12 +1196,13 @@ def _maybe_rolling_summary(
     sub_timeout: float,
     resolved_name: str,
     cooldown_rounds: list[int],  # mutable [remaining_cooldown]
+    fetched_urls: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Wrapper that respects cooldown. cooldown_rounds[0] decrements each call."""
     if cooldown_rounds[0] > 0:
         cooldown_rounds[0] -= 1
         return msgs
-    result = _proactive_rolling_summary(msgs, user_msg, api_key, api_model, base_url, sub_timeout, resolved_name)
+    result = _proactive_rolling_summary(msgs, user_msg, api_key, api_model, base_url, sub_timeout, resolved_name, fetched_urls)
     if isinstance(result, tuple):
         new_msgs, did_summarize = result
         if did_summarize:
@@ -1386,22 +1418,32 @@ def _compact_history(
     system_prompt: str,
     tools: list | None,
     num_ctx: int,
-) -> list[dict[str, Any]]:
+    *,
+    prior_summary: str | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
     """
     Smart Compacting: Fasst ältere Messages zusammen, behält neuere unverändert.
     Budget = num_ctx * context_quota. Reserve für neueste Messages = 15% von num_ctx.
-    Gibt komprimierte Message-Liste zurück: [summary_msg] + recent_messages.
-    Bei Fehler: Fallback auf harte Kürzung (älteste Messages entfernen).
+    Gibt (recent_messages, combined_summary | None) zurück.
+    `prior_summary` wird mit den neu zusammengefassten Messages gefoldet, damit
+    Kontext aus früheren Compactions nicht verloren geht.
+    Der Caller muss den Summary in den `system_prompt` einbauen — die Compactor
+    legt KEINE role=system Message in die History, weil viele Jinja-Chat-Templates
+    (Mistral, llama.cpp) nur eine system-message am Anfang erlauben.
+    Bei Fehler: Fallback auf harte Kürzung; prior_summary bleibt erhalten.
     """
     budget = _context_budget(config, num_ctx)
+    # System-Budget muss prior_summary mitrechnen, da der Caller ihn anhängt.
+    summary_overhead = _estimate_tokens(prior_summary) if prior_summary else 0
     fixed_tokens = (
         _estimate_tokens(system_prompt)
+        + summary_overhead
         + _estimate_tokens(json.dumps(tools or [], ensure_ascii=False))
     )
     msg_budget = max(0, budget - fixed_tokens)
 
     if _messages_token_estimate(messages) <= msg_budget:
-        return messages
+        return messages, None
 
     # Reserve: 15% von num_ctx für neueste Messages (skaliert mit Modellgröße)
     reserve = int(num_ctx * 0.15)
@@ -1417,14 +1459,29 @@ def _compact_history(
         recent.insert(0, msg)
         recent_tokens += t
 
+    # Qwen/Mistral chat templates haben multi_step_tool check — verlangen mind. 1 user-msg.
+    # Wenn recent nur assistant+tool ist (z.B. Tool-Loop-Ende), Template wirft 400.
+    # Walk weiter zurück bis erste user-msg drin ist, ignoriert reserve.
+    while not any(m.get("role") == "user" for m in recent):
+        idx = len(messages) - len(recent) - 1
+        if idx < 0:
+            break
+        recent.insert(0, messages[idx])
+        recent_tokens += _message_tokens_estimate(messages[idx])
+
     old_count = len(messages) - len(recent)
     old = messages[:old_count]
     if not old:
-        return messages
+        return messages, None
 
     conversation_text = _format_messages_for_summary(old)
+    if prior_summary:
+        conversation_text = (
+            f"[Prior summary of earlier conversation]\n{prior_summary}\n\n"
+            f"[New messages since prior summary]\n{conversation_text}"
+        )
     if not conversation_text.strip():
-        return recent
+        return recent, prior_summary
 
     # Model-Aufruf für Summary (Provider-übergreifend)
     try:
@@ -1439,18 +1496,14 @@ def _compact_history(
         out = list(messages)
         while out and _messages_token_estimate(out) > msg_budget:
             out.pop(0)
-        return out
+        return out, prior_summary
 
     if not summary:
         out = list(messages)
         while out and _messages_token_estimate(out) > msg_budget:
             out.pop(0)
-        return out
+        return out, prior_summary
 
-    summary_msg = {
-        "role": "system",
-        "content": f"[Compressed summary of previous conversation]\n{summary}",
-    }
     summary_tokens = _estimate_tokens(summary)
     _log.info(
         "Chat compacted: %d messages → summary (%d tokens) + %d recent messages (budget: %d, num_ctx: %d)",
@@ -1461,7 +1514,20 @@ def _compact_history(
     _uv = _logging.getLogger("uvicorn.error")
     _uv.info("Chat compacted: %d msgs → summary (%d tokens) + %d recent (budget: %d)", old_count, summary_tokens, len(recent), budget)
     _aal.log_compact(config, old_count, summary_tokens, len(recent), budget)
-    return [summary_msg] + recent
+    return recent, summary
+
+
+def _apply_chat_summary(system_prompt: str, chat_summary: str | None) -> str:
+    """Hängt komprimierten Konversationskontext an den system_prompt an.
+    Wird vor jedem Dispatch aufgerufen, damit der Summary garantiert als Teil
+    der einzigen system-message landet (Jinja-Template-konform)."""
+    if not chat_summary:
+        return system_prompt
+    return (
+        system_prompt
+        + "\n\n[Compressed summary of earlier conversation]\n"
+        + chat_summary
+    )
 
 
 def _format_help() -> str:
@@ -1782,6 +1848,57 @@ def _validate_provider_config(merged: dict) -> str | None:
 _EXTERNAL_CONTENT_TOOLS = frozenset({"exec", "web_search", "read_url", "check_url"})
 
 
+_IMG_DELIVER_LOCK = threading.Lock()
+
+
+def _image_turn_cap(config: dict[str, Any]) -> int:
+    """Max Bilder pro Turn (auto-deliver + send_image zusammen). Verhindert Edit-Retry-Spam,
+    erlaubt aber Multi-Bild-Generierung. Default 4, konfigurierbar via images_max_per_turn."""
+    try:
+        return max(1, int(config.get("images_max_per_turn") or 4))
+    except (TypeError, ValueError):
+        return 4
+
+
+def _auto_deliver_group_image(config: dict[str, Any], host_path: str, caption: str = "") -> str | None:
+    """Liefert ein frisch generiertes/bearbeitetes Bild im Matrix/Discord-Group-Mode direkt aus,
+    ohne dass das Model send_image aufrufen muss (Model ignoriert den Aufruf oft → Bild kam nie an).
+    Thread-safe (parallele invoke_model-Calls). Returns "sent" | "cap" | "dup" | None (n/a)."""
+    _ctx = config.get("_chat_context") or {}
+    if not _ctx.get("group_mode"):
+        return None
+    _platform = _ctx.get("platform")
+    if _platform not in ("matrix", "discord"):
+        return None
+    with _IMG_DELIVER_LOCK:
+        _sent_paths = config.setdefault("_auto_sent_image_paths", set())
+        if host_path in _sent_paths:
+            return "dup"
+        _count = int(config.get("_send_image_count_this_turn") or 0)
+        if _count >= _image_turn_cap(config):
+            return "cap"
+        # innerhalb des Locks reservieren, damit parallele Calls den Cap nicht überschreiten
+        config["_send_image_count_this_turn"] = _count + 1
+        _sent_paths.add(host_path)
+    try:
+        from miniassistant.notify import send_image as _ni_send
+        _ni_send(
+            host_path, caption,
+            client=_platform,
+            room_id=_ctx.get("room_id"),
+            channel_id=_ctx.get("channel_id"),
+            config=config,
+        )
+    except Exception as _e:
+        _log.warning("auto-deliver group image failed: %s", _e)
+        # Reservierung zurückrollen, damit Model per send_image fallback senden kann
+        with _IMG_DELIVER_LOCK:
+            config["_send_image_count_this_turn"] = max(0, int(config.get("_send_image_count_this_turn") or 1) - 1)
+            (config.get("_auto_sent_image_paths") or set()).discard(host_path)
+        return None
+    return "sent"
+
+
 def _run_tool_safe(
     name: str, args: dict[str, Any] | str, config: dict[str, Any], project_dir: str | None,
 ) -> str:
@@ -1916,6 +2033,13 @@ def _run_tool(
     if not isinstance(arguments, dict):
         arguments = {}
     _aal.log_tool_start(config, name, arguments)
+    # Group-Mode Hard-Reject: nur whitelisted Tools dürfen laufen.
+    _gm_ctx = config.get("_chat_context") or {}
+    if _gm_ctx.get("group_mode"):
+        from miniassistant.group_rooms import GROUP_ALLOWED_TOOLS
+        _allowed = set(_gm_ctx.get("tools_allow") or []) & GROUP_ALLOWED_TOOLS
+        if name not in _allowed:
+            return f"Tool `{name}` not available in this group room (whitelist: {sorted(_allowed) or 'empty'})."
     if name == "wait":
         _wait_secs = max(1, min(int(arguments.get("seconds") or 30), 600))
         _wait_reason = (arguments.get("reason") or "").strip()
@@ -2026,8 +2150,43 @@ def _run_tool(
         return "\n".join(_sm_lines)
     if name == "exec":
         cmd = arguments.get("command", "")
-        workspace = (config.get("workspace") or "").strip() or None
-        result = run_exec(cmd, cwd=workspace, extra_env=_exec_env(config))
+        _exec_ctx = config.get("_chat_context") or {}
+        if _exec_ctx.get("group_mode"):
+            # Communication-boundary: in Gruppenräumen niemals exec-Workarounds für externe Kommunikation.
+            # Pattern-Block für mail/sendmail/smtp/web-POST gegen Reddit/Twitter/etc.
+            _low_cmd = (cmd or "").lower()
+            _comm_patterns = (
+                "sendmail", "mailutils", "msmtp", " mutt ", "mutt ", " swaks", "swaks ",
+                "smtplib", "smtp://", "curl -x post", "curl --request post", "curl -d ",
+                "wget --post-data", "apt-get install", "apt install", "pip install",
+            )
+            # "mail " als word boundary check (false-positive bei "email" etc. vermeiden)
+            import re as _re_cmd
+            _has_mail_bin = bool(_re_cmd.search(r'\b(mail|sendmail|msmtp|mutt|swaks)\b\s', _low_cmd))
+            if _has_mail_bin or any(p in _low_cmd for p in _comm_patterns):
+                _log.warning("Group exec BLOCKED (communication-boundary): %s", cmd[:200])
+                return (
+                    "exec REJECTED in group room: this command pattern matches sending/installing "
+                    "external-communication tools (mail/sendmail/smtp/curl-POST/apt-install). "
+                    "In group rooms you may DRAFT messages inline in your reply — never send them. "
+                    "The user copies and sends themselves."
+                )
+            from miniassistant.group_rooms import group_workspace_path
+            from miniassistant.sandbox import run_sandboxed_exec
+            sub = _exec_ctx.get("workspace_subdir") or "default"
+            try:
+                gws = group_workspace_path(config, sub)
+            except Exception as _e:
+                return f"returncode: -1\nstdout:\n\nstderr:\nGroup workspace error: {_e}"
+            # docs_in_sandbox toggle: bei True docs read-only nach /docs mounten
+            _docs_dir = None
+            if _exec_ctx.get("docs_in_sandbox"):
+                from miniassistant.agent_loader import _docs_dir_path as _ddp
+                _docs_dir = _ddp(config)
+            result = run_sandboxed_exec(cmd, gws, timeout=int(config.get("exec_timeout_seconds", 60) or 60), allow_net=True, docs_dir=_docs_dir)
+        else:
+            workspace = (config.get("workspace") or "").strip() or None
+            result = run_exec(cmd, cwd=workspace, extra_env=_exec_env(config))
         stdout = result["stdout"] or ""
         stderr = result["stderr"] or ""
         _max_output = int(config.get("exec_max_output_chars", 8000) or 8000)
@@ -2039,11 +2198,7 @@ def _run_tool(
     if name == "web_search":
         query = arguments.get("query", "")
         _categories = arguments.get("categories")
-        from miniassistant.config import get_search_engine_for_request
-        url, _used_eid = get_search_engine_for_request(config, arguments.get("engine"))
-        if not url:
-            return "web_search not configured (no search_engines or invalid engine)"
-        result = tool_web_search(url, query, categories=_categories)
+        result = tool_web_search_multi(config, query, categories=_categories, engine_id=arguments.get("engine"))
         if result.get("error"):
             return f"Error: {result['error']}"
         lines = []
@@ -2052,28 +2207,19 @@ def _run_tool(
             if r.get("img_src"):
                 line += f"\n  img_src: {r['img_src']}"
             lines.append(line)
+        used = result.get("used_engines") or []
+        errors = result.get("errors") or {}
         if not lines:
-            strategy = (config.get("search_engine_strategy") or "first").strip().lower()
-            if strategy != "specific":
-                import random as _random
-                others = [eid for eid, ecfg in (config.get("search_engines") or {}).items() if (ecfg.get("url") or "").strip() != url]
-                _random.shuffle(others)
-                if others:
-                    # Auto-fallback zu anderer Engine statt User zu fragen
-                    next_engine = others[0]
-                    next_url = (config.get("search_engines") or {}).get(next_engine, {}).get("url", "")
-                    if next_url:
-                        alt_result = tool_web_search(next_url, query, categories=_categories)
-                        if alt_result.get("results"):
-                            alt_lines = []
-                            for r in alt_result["results"]:
-                                _al = f"- {r.get('title', '')} | {r.get('url', '')}\n  {r.get('snippet', '')}"
-                                if r.get("img_src"):
-                                    _al += f"\n  img_src: {r['img_src']}"
-                                alt_lines.append(_al)
-                            return f"[No results from '{url}', results from '{next_engine}':]\n" + "\n".join(alt_lines)
-            return "Search engine returned no results. This is a search engine failure — do NOT conclude that nothing exists. Tell the user the search returned no results and suggest rephrasing."
-        return "\n".join(lines)
+            base = "Search engine returned no results. This is a search engine failure — do NOT conclude that nothing exists. Tell the user the search returned no results and suggest rephrasing."
+            if used:
+                base += f" (tried: {', '.join(used)})"
+            if errors:
+                base += f" Errors: {errors}"
+            return base
+        header = ""
+        if len(used) > 1:
+            header = f"[Results merged from engines: {', '.join(used)}]\n"
+        return header + "\n".join(lines)
     if name == "check_url":
         url_arg = arguments.get("url", "").strip()
         if not url_arg:
@@ -2094,7 +2240,20 @@ def _run_tool(
             _mc = int(_mc_arg) if _mc_arg is not None else 8000
         except (TypeError, ValueError):
             _mc = 8000
-        result = tool_read_url(url_arg, max_chars=_mc, config=config, proxy=arguments.get("proxy"), js=bool(arguments.get("js", False)))
+        # Dynamischer Cap aus dem Kontextfenster des aktiven Modells: EIN read_url-Ergebnis darf
+        # nicht den Kontext fluten (sonst sofort Compaction). ~30% von num_ctx in Zeichen
+        # (Tokenschätzung ~3 chars/token) → genug Spielraum für System-Prompt, Tools, History, Antwort.
+        # Größere Dokumente liest das Modell chunk-weise über offset.
+        _nctx = int(config.get("_active_num_ctx") or 32768)
+        _char_cap = max(8000, int(_nctx * 0.30 * 3))
+        if _mc > _char_cap:
+            _log.info("read_url: max_chars %d über Cap %d (num_ctx=%d) → gedeckelt", _mc, _char_cap, _nctx)
+            _mc = _char_cap
+        try:
+            _off = int(arguments.get("offset") or 0)
+        except (TypeError, ValueError):
+            _off = 0
+        result = tool_read_url(url_arg, max_chars=_mc, offset=_off, config=config, proxy=arguments.get("proxy"), js=bool(arguments.get("js", False)))
         conn = result.get("connection", "")
         if result.get("ok"):
             content = result.get("content", "")
@@ -2297,18 +2456,223 @@ def _run_tool(
         recur_desc = " (recurring)" if recurring else f", Timeout in {timeout_hours:.0f}h"
         return f"Watch aktiv [{job_id_short}] — prüft {interval_desc}{recur_desc}: {check}"
 
+    if name == "search_chat_history":
+        query = (arguments.get("query") or "").strip()
+        if not query:
+            return "search_chat_history requires 'query'"
+        max_scan_arg = arguments.get("max_scan")
+        chat_ctx = config.get("_chat_context") or {}
+        platform = chat_ctx.get("platform")
+        room_id = chat_ctx.get("room_id") or ""
+        channel_id = chat_ctx.get("channel_id") or ""
+        # Per-room max_scan limit; arg darf nicht überschreiten
+        room_max = 200
+        if chat_ctx.get("group_mode"):
+            try:
+                from miniassistant.group_rooms import get_room_settings
+                rs = get_room_settings(config, platform, room_id or channel_id)
+                if rs.get("search_chat_history_max") is not None:
+                    room_max = max(10, min(int(rs["search_chat_history_max"]), 500))
+            except Exception:
+                pass
+        if max_scan_arg is not None:
+            try:
+                max_scan = min(int(max_scan_arg), room_max)
+            except (TypeError, ValueError):
+                max_scan = room_max
+        else:
+            max_scan = min(200, room_max)
+        max_scan = max(10, max_scan)
+        if platform == "matrix" and room_id:
+            try:
+                from miniassistant.matrix_bot import search_chat_history as _sch
+                res = _sch(room_id, query, max_scan=max_scan)
+            except Exception as e:
+                return f"search_chat_history: matrix failed: {e}"
+        elif platform == "discord" and channel_id:
+            try:
+                from miniassistant.discord_bot import search_chat_history as _sch
+                res = _sch(channel_id, query, max_scan=max_scan)
+            except Exception as e:
+                return f"search_chat_history: discord failed: {e}"
+        else:
+            return "search_chat_history: only available in matrix rooms or discord channels."
+        diag = res.get("diagnostic")
+        hits = res.get("hits") or []
+        if not hits:
+            base = f"No matches for '{query}' in last {res.get('scanned', 0)} messages."
+            if diag:
+                base += f" ({diag})"
+            return base
+        import datetime as _dt
+        lines = [f"Search results for '{query}' — {res.get('match_count', 0)} match(es) in {res.get('scanned', 0)} scanned messages:"]
+        for m in hits:
+            ts_ms = m.get("ts") or 0
+            try:
+                tstr = _dt.datetime.fromtimestamp(ts_ms / 1000).strftime("%d.%m. %H:%M")
+            except Exception:
+                tstr = ""
+            who = m.get("display") or m.get("sender") or "?"
+            body = (m.get("body") or "").replace("\n", " ").strip()
+            marker = "→ " if m.get("is_hit") else "  "
+            prefix = f"[{tstr}] " if tstr else ""
+            lines.append(f"{marker}{prefix}{who}: {body}")
+        return "\n".join(lines)
+
+    if name == "get_user_profile":
+        chat_ctx = config.get("_chat_context") or {}
+        if not chat_ctx.get("group_mode"):
+            return "get_user_profile is only available in group rooms."
+        user_id = (arguments.get("user_id") or "").strip()
+        if not user_id:
+            return "get_user_profile requires 'user_id'"
+        platform = chat_ctx.get("platform")
+        sub = chat_ctx.get("workspace_subdir") or "default"
+        try:
+            from miniassistant.group_rooms import group_workspace_path as _gwp_ap
+            gws = _gwp_ap(config, sub)
+            avatar_dir = gws / "avatars"
+            avatar_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return f"get_user_profile: workspace setup failed: {e}"
+        if platform == "matrix":
+            try:
+                from miniassistant.matrix_bot import get_user_profile as _gup
+                res = _gup(user_id, str(avatar_dir), room_id=chat_ctx.get("room_id") or "")
+            except Exception as e:
+                return f"get_user_profile: matrix failed: {e}"
+        elif platform == "discord":
+            try:
+                from miniassistant.discord_bot import get_user_profile as _gup
+                res = _gup(user_id, str(avatar_dir), channel_id=chat_ctx.get("channel_id") or "")
+            except Exception as e:
+                return f"get_user_profile: discord failed: {e}"
+        else:
+            return "get_user_profile: only available in matrix/discord group rooms."
+        # Host-Pfad → Sandbox-Sicht
+        ap_host = res.get("avatar_path") or ""
+        if ap_host:
+            try:
+                rel = Path(ap_host).resolve().relative_to(gws.resolve())
+                res["avatar_path"] = f"/workspace/{rel}"
+            except Exception:
+                pass
+        parts = []
+        if res.get("display_name"):
+            parts.append(f"display_name: {res['display_name']}")
+        else:
+            parts.append("display_name: (not set)")
+        if res.get("avatar_path"):
+            parts.append(f"avatar_path: {res['avatar_path']}")
+        else:
+            parts.append("avatar_path: (user has no avatar set)")
+        if res.get("error"):
+            parts.append(f"note: {res['error']}")
+        return "\n".join(parts)
+
+    if name == "read_recent_messages":
+        limit = arguments.get("limit") or 20
+        try:
+            limit = max(1, min(int(limit), 100))
+        except (TypeError, ValueError):
+            limit = 20
+        chat_ctx = config.get("_chat_context") or {}
+        platform = chat_ctx.get("platform")
+        room_id = chat_ctx.get("room_id") or ""
+        channel_id = chat_ctx.get("channel_id") or ""
+        skip_event = chat_ctx.get("trigger_event_id") or None
+        skip_msg = chat_ctx.get("trigger_message_id") or None
+        msgs: list[dict[str, Any]] = []
+        diag = None
+        if platform == "matrix" and room_id:
+            try:
+                from miniassistant.matrix_bot import fetch_recent_messages as _fr
+                _res = _fr(room_id, limit=limit, skip_event_id=skip_event)
+                if isinstance(_res, dict):
+                    msgs = _res.get("messages") or []
+                    diag = _res.get("diagnostic")
+                else:
+                    msgs = _res or []
+            except Exception as e:
+                return f"read_recent_messages: matrix fetch failed: {e}"
+        elif platform == "discord" and channel_id:
+            try:
+                from miniassistant.discord_bot import fetch_recent_messages as _fr
+                msgs = _fr(channel_id, limit=limit, skip_message_id=skip_msg)
+            except Exception as e:
+                return f"read_recent_messages: discord fetch failed: {e}"
+        else:
+            return "read_recent_messages: only available in matrix rooms or discord channels."
+        if not msgs:
+            base = "No previous messages available."
+            if diag:
+                base += f" Reason: {diag}."
+            return base
+        import datetime as _dt
+        lines = []
+        for m in msgs:
+            ts_ms = m.get("ts") or 0
+            try:
+                tstr = _dt.datetime.fromtimestamp(ts_ms / 1000).strftime("%H:%M")
+            except Exception:
+                tstr = ""
+            who = m.get("display") or m.get("sender") or "?"
+            body = (m.get("body") or "").replace("\n", " ").strip()
+            if not body:
+                body = "[encrypted or empty]"
+            prefix = f"[{tstr}] " if tstr else ""
+            lines.append(f"{prefix}{who}: {body}")
+        return f"Last {len(msgs)} messages (oldest → newest):\n" + "\n".join(lines)
+
     if name == "send_image":
         from pathlib import Path as _Path
+        # Abort-Gate: hat der User mitten im Turn /abort gesendet, kein Bild mehr hochladen
+        # (z.B. wenn invoke_model + send_image in derselben Runde liefen). "stop" lässt das
+        # bereits fertige Bild durch (graceful), nur "abort" unterdrückt.
+        from miniassistant.cancellation import check_cancel_for_chat as _ccfc_si
+        if _ccfc_si(config.get("_chat_context") or {}) == "abort":
+            _log.info("send_image unterdrückt — User-Abbruch (abort) aktiv")
+            return "send_image skipped: user aborted — image not delivered."
         image_path = arguments.get("image_path", "").strip()
         caption = arguments.get("caption", "").strip()
         if not image_path:
             return "send_image requires image_path"
-        if not _Path(image_path).exists():
-            return f"File not found: {image_path}"
+        # Anti-Spam: Bilder pro Turn gedeckelt (auto-deliver + manuell zusammengezählt).
+        _sent_count = int(config.get("_send_image_count_this_turn") or 0)
+        _img_cap = _image_turn_cap(config)
+        if _sent_count >= _img_cap:
+            return f"send_image rejected: already delivered {_sent_count} image(s) this turn (limit {_img_cap}). Wait for user's next message."
         chat_ctx = config.get("_chat_context") or {}
         platform = chat_ctx.get("platform")
         room_id = chat_ctx.get("room_id")
         channel_id = chat_ctx.get("channel_id")
+        # Group-Mode Pfad-Translation: Bot denkt in Sandbox-Sicht (/workspace/X).
+        # Hauptprozess sieht aber den echten Host-Pfad <workspace>/groups/<sub>/X.
+        if chat_ctx.get("group_mode"):
+            try:
+                from miniassistant.group_rooms import group_workspace_path as _gwp
+                sub = chat_ctx.get("workspace_subdir") or "default"
+                gws = _gwp(config, sub)
+                _ip = image_path
+                # Strip /workspace/ prefix (sandbox view) → relative
+                if _ip.startswith("/workspace/"):
+                    _ip = _ip[len("/workspace/"):]
+                elif _ip == "/workspace":
+                    _ip = ""
+                # Relative path → host-resolve in group workspace
+                if _ip and not _ip.startswith("/"):
+                    image_path = str((gws / _ip).resolve())
+                # Path-Traversal-Schutz: muss unter gws bleiben
+                _resolved = _Path(image_path).resolve()
+                if not str(_resolved).startswith(str(gws.resolve()) + "/") and _resolved != gws.resolve():
+                    return f"send_image rejected: path {image_path} is outside the room workspace"
+            except Exception as _e:
+                return f"send_image path resolution failed: {_e}"
+        if not _Path(image_path).exists():
+            return f"File not found: {image_path}"
+        # Dedup: im Group-Mode bereits auto-geliefertes Bild nicht erneut senden.
+        if image_path in (config.get("_auto_sent_image_paths") or set()):
+            return "send_image skipped: this image was already auto-delivered to the room. Do not resend."
         # Web/API: Bild in _pending_images speichern (NICHT in Tool-Response!).
         # Tool-Response geht ins LLM-Context → base64 würde Context sprengen (500er).
         # Die Bilder werden am Ende in den finalen Content injiziert.
@@ -2347,6 +2711,7 @@ def _run_tool(
                     "url": _img_url,
                     "caption": caption or "Bild",
                 })
+            config["_send_image_count_this_turn"] = _sent_count + 1
             return f"Image delivered to user: {image_path} (displayed inline)"
         try:
             from miniassistant.notify import send_image as _send_img
@@ -2358,6 +2723,7 @@ def _run_tool(
                 config=config,
             )
             parts = [f"{k}: {v}" for k, v in results.items()]
+            config["_send_image_count_this_turn"] = _sent_count + 1
             return "\n".join(parts) if parts else f"Bild gespeichert: {image_path} (kein Chat-Client im Kontext)"
         except Exception as e:
             return f"send_image failed: {e}"
@@ -2600,6 +2966,83 @@ def _run_tool(
             return f"Create failed: {res}"
         item = res  # type: ignore
         return f"Created webhook id={item['id'][:8]} name={item.get('name') or '-'}\nToken: {item['token']}\nPOST URL: /webhook/{item['token']}"
+    if name == "get_room_last_fire":
+        kind = (arguments.get("kind") or "any").lower()
+        if kind not in ("any", "webhook", "schedule"):
+            return "kind must be 'any', 'webhook', or 'schedule'"
+        chat_ctx = config.get("_chat_context") or {}
+        room_id = chat_ctx.get("room_id")
+        channel_id = chat_ctx.get("channel_id")
+        if not room_id and not channel_id:
+            return "No room/channel context — this tool only works in Matrix/Discord chats."
+
+        def _match(it: dict[str, Any]) -> bool:
+            return (room_id and it.get("room_id") == room_id) or (channel_id and it.get("channel_id") == channel_id)
+
+        def _ts(it: dict[str, Any]) -> str:
+            return it.get("last_fired") or it.get("added_at") or it.get("created_at") or ""
+
+        sched_item = None
+        wh_item = None
+        if kind in ("any", "schedule"):
+            try:
+                from miniassistant.scheduler import list_scheduled_jobs as _lsj
+                cands = [j for j in (_lsj() or []) if _match(j)]
+                cands.sort(key=_ts, reverse=True)
+                sched_item = cands[0] if cands else None
+            except Exception as e:
+                _log.warning("get_room_last_fire: schedule lookup failed: %s", e)
+        if kind in ("any", "webhook"):
+            try:
+                from miniassistant import webhooks as _wh
+                cands = [w for w in (_wh.list_webhooks() or []) if _match(w) and not w.get("silent") and w.get("last_fired")]
+                cands.sort(key=_ts, reverse=True)
+                wh_item = cands[0] if cands else None
+            except Exception as e:
+                _log.warning("get_room_last_fire: webhook lookup failed: %s", e)
+
+        if kind == "schedule":
+            pick = ("schedule", sched_item) if sched_item else (None, None)
+        elif kind == "webhook":
+            pick = ("webhook", wh_item) if wh_item else (None, None)
+        else:
+            if sched_item and wh_item:
+                pick = ("webhook", wh_item) if _ts(wh_item) > _ts(sched_item) else ("schedule", sched_item)
+            elif wh_item:
+                pick = ("webhook", wh_item)
+            elif sched_item:
+                pick = ("schedule", sched_item)
+            else:
+                pick = (None, None)
+        ptype, item = pick
+        if not item:
+            label = "webhook or schedule" if kind == "any" else kind
+            return f"No recent {label} fire in this room."
+
+        ident = item.get("name") or (item.get("id") or "")[:8]
+        prompt_txt = (item.get("prompt") or "").strip() or "(no prompt)"
+        last = item.get("last_fired") or item.get("added_at") or item.get("created_at") or "unknown"
+        out_lines = [f"type: {ptype}", f"id/name: {ident}", f"last_fired: {last}", f"prompt: {prompt_txt}"]
+
+        if ptype == "webhook":
+            try:
+                from miniassistant import webhooks as _wh
+                res = _wh.read_output(item)
+                if res:
+                    path, content = res
+                    try:
+                        txt = content.decode("utf-8", errors="replace")
+                    except Exception:
+                        txt = f"<binary {len(content)} bytes>"
+                    if len(txt) > 4000:
+                        txt = txt[:4000] + "\n…[truncated]"
+                    out_lines.append(f"\nlast output ({path.name}):\n{txt}")
+                else:
+                    out_lines.append("\n(no saved output)")
+            except Exception as e:
+                out_lines.append(f"\n(output read failed: {e})")
+        return "\n".join(out_lines)
+
     if name == "debate":
         topic = arguments.get("topic", "").strip()
         perspective_a = arguments.get("perspective_a", "").strip()
@@ -2627,26 +3070,131 @@ def _run_tool(
         language = arguments.get("language", "").strip() or "Deutsch"
         return _run_debate(config, topic, perspective_a, perspective_b, sub_model, model_b, rounds, language)
     if name == "invoke_model":
-        # Subagents: global config oder per-provider subagents: true
+        # Subagent-Authorisierung:
+        # - Top-Level `subagents:` Liste = Whitelist (Source of Truth)
+        # - Provider `models.subagents: true` = Capability-Gate (Provider darf Subagent-Calls servieren)
+        # - BEIDE Bedingungen müssen erfüllt sein: Modell in Liste UND dessen Provider hat subagents:true
+        # Plus separate Whitelists: image_generation:, vision: (eigene Config-Knöpfe)
         subagent_list = config.get("subagents") or []
-        any_subagents = bool(subagent_list) or any(
-            (p.get("models") or {}).get("subagents")
-            for p in (config.get("providers") or {}).values()
-            if isinstance(p, dict)
+        _providers_cfg = config.get("providers") or {}
+        _default_prov_name = next(iter(_providers_cfg), "")
+        _enabled_providers = {
+            pname for pname, pcfg in _providers_cfg.items()
+            if isinstance(pcfg, dict) and (pcfg.get("models") or {}).get("subagents")
+        }
+        # Image-gen/vision sind separate Listen, unabhängig von Subagent-Gate
+        from miniassistant.ollama_client import (
+            get_image_generation_models as _wl_img,
+            get_vision_models as _wl_vis,
         )
-        if not any_subagents:
-            return "invoke_model not enabled (set subagents list in config or providers.<name>.models.subagents: true)"
+        _img_list = _wl_img(config) or []
+        _vis_list = _wl_vis(config) or []
+        if not subagent_list and not _img_list and not _vis_list:
+            return (
+                "invoke_model not enabled. Set `subagents:` (text models), "
+                "`image_generation:` (image models), or `vision:` (vision models) in config. "
+                "Subagent text models additionally require provider `models.subagents: true`."
+            )
         sub_model = arguments.get("model", "").strip()
         sub_msg = arguments.get("message", "").strip()
-        # Auto-select image gen model when model is missing but image_path is set
+        # Auto-select image gen model when model is missing but image_path is set.
+        # Default: erstes Modell in image_generation Liste (User-Reihenfolge respektiert).
         if not sub_model and arguments.get("image_path"):
             from miniassistant.ollama_client import get_image_generation_models as _auto_img_models
             _auto_models = _auto_img_models(config)
             if _auto_models:
                 sub_model = _auto_models[0]
-                _log.info("invoke_model: auto-selected image model '%s' (model was missing)", sub_model)
+                _log.info("invoke_model: auto-selected '%s' (no model given, image_path set)", sub_model)
         if not sub_model or not sub_msg:
             return "invoke_model requires 'model' and 'message'"
+        # Whitelist bauen:
+        # 1) subagents-Liste: jedes Modell muss zu einem Provider gehören der subagents:true hat
+        # 2) image_generation: + vision: (unabhängig, eigene Mechanismen)
+        # Halluzinationen (`nemotron`, `midjourney`, `sdxl`) werden hart geblockt.
+        _allowed_invoke: set[str] = set()
+        _dropped_no_provider: list[str] = []
+        # Strikt: jedes Subagent-Listen-Item MUSS 'provider/model' enthalten.
+        # Bare Aliases würden bei Multi-Provider ambig sein → ablehnen.
+        for _m in subagent_list:
+            if not isinstance(_m, str) or not _m.strip():
+                continue
+            _mname = _m.strip()
+            if "/" not in _mname:
+                _dropped_no_provider.append(f"{_mname} (missing provider prefix — use 'provider/model')")
+                continue
+            _mprov, _mreal = _mname.split("/", 1)
+            if _mprov not in _enabled_providers:
+                _dropped_no_provider.append(f"{_mname} (provider '{_mprov}' has no models.subagents:true)")
+                continue
+            _allowed_invoke.add(_mname)
+            # Aliases im selben Provider die auf _mreal zeigen → auch erlaubt (prefixed form)
+            _pcfg_a = _providers_cfg.get(_mprov) or {}
+            _aliases_a = (_pcfg_a.get("models") or {}).get("aliases") or {}
+            for _al, _tgt in _aliases_a.items():
+                if _tgt == _mreal:
+                    _allowed_invoke.add(f"{_mprov}/{_al}")
+        # Snapshot der reinen Text-Subagent-Liste BEVOR image_generation/vision dazukommen.
+        # Wird gebraucht um Text-Aufträge strikt nur gegen `subagents:` zu autorisieren.
+        _subagent_only = set(_allowed_invoke)
+        for _m in _img_list:
+            if _m:
+                _allowed_invoke.add(_m)
+        for _m in _vis_list:
+            if _m:
+                _allowed_invoke.add(_m)
+        _resolved_check = resolve_model(config, sub_model) or sub_model
+        # Whitelist-Vergleich prefix-normalisiert: resolve_model gibt für Default-Provider-Aliase
+        # bare Namen zurück (z.B. 'qwen' → 'qwen3.6-35b-a3b-uncensored'), während die Whitelist
+        # voll-prefixed ist ('llama-swap/qwen3.6-35b-a3b-uncensored'). Ohne Normalisierung würden
+        # legitime Subagent-Calls mit Kurz-Aliasen fälschlich geblockt.
+        def _canon_invoke(_n: str) -> str:
+            if not _n:
+                return _n
+            if "/" in _n:
+                _p, _, _c = _n.partition("/")
+                if "." in _p or ":" in _p:
+                    return _n  # Registry-Pfad, kein Provider-Prefix
+                for _k in _providers_cfg:
+                    if _k.lower() == _p.lower():
+                        return f"{_k}/{_c}"
+                return _n
+            return f"{_default_prov_name}/{_n}" if _default_prov_name else _n
+        _img_canon = {_canon_invoke(_m) for _m in _img_list if _m}
+        _vis_canon = {_canon_invoke(_m) for _m in _vis_list if _m}
+        _sub_canon = {_canon_invoke(_m) for _m in _subagent_only}
+        # Autorisierung NACH Auftragstyp:
+        # - Bild-Auftrag (image_path gesetzt): image_generation + vision (Edit/Analyse).
+        # - Reiner Text-Auftrag: NUR subagents-Liste + image_generation (Text→Bild).
+        #   vision-Modelle (z.B. normales qwen3.6-35b-a3b) dürfen NICHT als Text-Subworker laufen
+        #   — sonst kann der Hauptagent jedes Vision-Model als Text-Arbeiter zweckentfremden.
+        # - GROUP-MODE: Text-Subagents hart gesperrt, nur image_generation + vision (Bild-Fragen);
+        #   sonst missbraucht der Agent das Edit-Model mit der Frage als Edit-Prompt (Doom-Loop).
+        _gm_ctx_inv = config.get("_chat_context") or {}
+        _has_image_path = bool((arguments.get("image_path") or "").strip())
+        if _gm_ctx_inv.get("group_mode") or _has_image_path:
+            _allowed_invoke = {_m for _m in (list(_img_list) + list(_vis_list)) if _m}
+            _wl_canon = _img_canon | _vis_canon
+        else:
+            _allowed_invoke = set(_subagent_only) | {_m for _m in _img_list if _m}
+            _wl_canon = _sub_canon | _img_canon
+        if _canon_invoke(sub_model) not in _wl_canon and _canon_invoke(_resolved_check) not in _wl_canon:
+            _log.warning(
+                "invoke_model BLOCKED: model '%s' (resolved '%s') not in whitelist=%s dropped=%s",
+                sub_model, _resolved_check, sorted(_allowed_invoke), _dropped_no_provider,
+            )
+            _avail = ", ".join(sorted(_allowed_invoke)) or "(none configured)"
+            _hint = ""
+            if _dropped_no_provider:
+                _hint = (
+                    f" Also dropped from whitelist (provider lacks subagents:true): "
+                    f"{', '.join(_dropped_no_provider)}."
+                )
+            return (
+                f"invoke_model rejected: model '{sub_model}' is not in the configured whitelist. "
+                f"Available: {_avail}.{_hint} "
+                "Use one of these EXACT names — do not invent model names or use aliases not listed. "
+                "If none fit the task, tell the user no suitable model is configured."
+            )
         # Image generation/editing parameters (optional, passed through to backend)
         _img_params: dict[str, Any] = {}
         _img_size = arguments.get("size", "").strip() if isinstance(arguments.get("size"), str) else ""
@@ -2662,9 +3210,48 @@ def _run_tool(
             _pv = arguments.get(_pk, "").strip() if isinstance(arguments.get(_pk), str) else ""
             if _pv:
                 _img_params[_pk] = _pv
+        # Regex-Fallback aus ORIGINAL-User-Request: schwache lokale LLMs vergessen oft
+        # steps/cfg/size als Tool-Param zu setzen. Der Rohtext ("mach mit 20 steps") wird
+        # hier nachgezogen — nur für Felder die der Agent NICHT explizit gesetzt hat.
+        _orig_req = config.get("_user_request_text") or ""
+        if _orig_req:
+            import re as _ip_re
+            if "steps" not in _img_params:
+                _m = _ip_re.search(r'(\d+)\s*(?:steps?|stepps?|schritte?n?)\b', _orig_req, _ip_re.IGNORECASE)
+                if _m:
+                    _img_params["steps"] = int(_m.group(1))
+            if "cfg_scale" not in _img_params:
+                _m = _ip_re.search(r'(?:cfg[_ ]?(?:scale)?|guidance)\s*[:=]?\s*(\d+(?:\.\d+)?)', _orig_req, _ip_re.IGNORECASE)
+                if _m:
+                    _img_params["cfg_scale"] = float(_m.group(1))
+            if "size" not in _img_params:
+                _m = _ip_re.search(r'(\d{3,4})\s*[xX×]\s*(\d{3,4})', _orig_req)
+                if _m:
+                    _img_params["size"] = f"{_m.group(1)}x{_m.group(2)}"
+        if _img_params:
+            _log.info("invoke_model image params resolved: %s", _img_params)
         # Image editing: source image path
         _edit_image_path = (arguments.get("image_path") or "").strip()
         if _edit_image_path:
+            # Group-Mode: Sandbox-Pfad in Host-Pfad übersetzen für main-process Lesen
+            _ctx_im = config.get("_chat_context") or {}
+            if _ctx_im.get("group_mode"):
+                try:
+                    from miniassistant.group_rooms import group_workspace_path as _gwp_im
+                    _gws_im = _gwp_im(config, _ctx_im.get("workspace_subdir") or "default")
+                    _ip = _edit_image_path
+                    if _ip.startswith("/workspace/"):
+                        _ip = _ip[len("/workspace/"):]
+                    elif _ip == "/workspace":
+                        _ip = ""
+                    if _ip and not _ip.startswith("/"):
+                        _edit_image_path = str((_gws_im / _ip).resolve())
+                    # Path-Traversal-Schutz
+                    _r = Path(_edit_image_path).resolve()
+                    if not str(_r).startswith(str(_gws_im.resolve()) + "/") and _r != _gws_im.resolve():
+                        return f"invoke_model rejected: image_path {_edit_image_path} outside room workspace"
+                except Exception as _e:
+                    return f"invoke_model image_path resolution failed: {_e}"
             _img_params["image_path"] = _edit_image_path
         _img_gen_params_snapshot = dict(_img_params) if _img_params else None
         resolved = resolve_model(config, sub_model) or sub_model
@@ -2845,6 +3432,45 @@ def _send_debate_status(config: dict[str, Any], message: str) -> None:
         elif platform == "discord" and channel_id:
             from miniassistant.discord_bot import send_message_to_channel
             send_message_to_channel(channel_id, message)
+    except Exception:
+        pass
+
+
+def _notify_chat_compaction_start(config: dict[str, Any]) -> None:
+    """Schickt kurze Status-Nachricht + Typing-Indikator wenn Compacting läuft.
+    Wirkt nur in Matrix/Discord — Web/API hat eigene Stream-Status-Yields.
+    Idempotent + fail-silent (Compacting darf nicht an UI-Nebenwirkungen scheitern)."""
+    chat_ctx = config.get("_chat_context") or {}
+    platform = chat_ctx.get("platform")
+    room_id = chat_ctx.get("room_id")
+    channel_id = chat_ctx.get("channel_id")
+    msg = "⏳ Komprimiere Chat-Verlauf, einen Moment…"
+    try:
+        if platform == "matrix" and room_id:
+            from miniassistant.matrix_bot import send_message_to_room, set_typing
+            send_message_to_room(room_id, msg)
+            set_typing(room_id, True)
+        elif platform == "discord" and channel_id:
+            from miniassistant.discord_bot import send_message_to_channel, set_channel_typing
+            send_message_to_channel(channel_id, msg)
+            set_channel_typing(channel_id)
+    except Exception:
+        pass
+
+
+def _notify_chat_compaction_done(config: dict[str, Any]) -> None:
+    """Re-triggert Typing-Indikator nach Compacting (das send_message hat ihn evtl. zurückgesetzt)."""
+    chat_ctx = config.get("_chat_context") or {}
+    platform = chat_ctx.get("platform")
+    room_id = chat_ctx.get("room_id")
+    channel_id = chat_ctx.get("channel_id")
+    try:
+        if platform == "matrix" and room_id:
+            from miniassistant.matrix_bot import set_typing
+            set_typing(room_id, True)
+        elif platform == "discord" and channel_id:
+            from miniassistant.discord_bot import set_channel_typing
+            set_channel_typing(channel_id)
     except Exception:
         pass
 
@@ -3043,8 +3669,8 @@ def _run_debate(
         # Cancellation prüfen
         cancel_user = (config.get("_chat_context") or {}).get("user_id")
         if cancel_user:
-            from miniassistant.cancellation import check_cancel
-            if check_cancel(cancel_user):
+            from miniassistant.cancellation import check_cancel_for_chat
+            if check_cancel_for_chat(config.get("_chat_context") or {}):
                 _append_to_file(debate_file, f"\n---\n\n*Debatte abgebrochen in Runde {round_num}.*\n")
                 _aal.log_debate_end(config, topic, rounds_completed, str(debate_file))
                 return f"Debatte abgebrochen in Runde {round_num}. Datei: `{debate_file}`"
@@ -3074,8 +3700,8 @@ def _run_debate(
 
         # Cancellation zwischen A und B prüfen
         if cancel_user:
-            from miniassistant.cancellation import check_cancel
-            if check_cancel(cancel_user):
+            from miniassistant.cancellation import check_cancel_for_chat
+            if check_cancel_for_chat(config.get("_chat_context") or {}):
                 _append_to_file(debate_file, f"\n---\n\n*Debatte abgebrochen nach Seite A, Runde {round_num}.*\n")
                 _aal.log_debate_end(config, topic, rounds_completed, str(debate_file))
                 return f"Debatte abgebrochen in Runde {round_num}. Datei: `{debate_file}`"
@@ -3248,8 +3874,8 @@ def _run_subagent_anthropic(
         # Cancellation check for Anthropic subagent tool rounds
         _cancel_user = (config.get("_chat_context") or {}).get("user_id")
         if _cancel_user:
-            from miniassistant.cancellation import check_cancel
-            if check_cancel(_cancel_user):
+            from miniassistant.cancellation import check_cancel_for_chat
+            if check_cancel_for_chat(config.get("_chat_context") or {}):
                 _log.info("Subagent %s (anthropic): cancellation detected — aborting after round %d", resolved_name, rounds_used)
                 if not total_content.strip():
                     total_content = "(Subagent abgebrochen)"
@@ -3406,8 +4032,8 @@ def _run_subagent_google(
         # Cancellation check for Google subagent tool rounds
         _cancel_user = (config.get("_chat_context") or {}).get("user_id")
         if _cancel_user:
-            from miniassistant.cancellation import check_cancel
-            if check_cancel(_cancel_user):
+            from miniassistant.cancellation import check_cancel_for_chat
+            if check_cancel_for_chat(config.get("_chat_context") or {}):
                 _log.info("Subagent %s (google): cancellation detected — aborting after round %d", resolved_name, rounds_used)
                 if not total_content.strip():
                     total_content = "(Subagent abgebrochen)"
@@ -3472,8 +4098,18 @@ def _run_subagent_google(
         import base64 as _b64
         from pathlib import Path as _Path
         import time as _time
-        workspace = (config.get("workspace") or "").strip()
-        img_dir = _Path(workspace) / "images" if workspace else _Path("images")
+        # Group-Mode: in den Group-Workspace speichern damit send_image (mit /workspace-Translation) sie findet
+        _img_ctx_save = config.get("_chat_context") or {}
+        if _img_ctx_save.get("group_mode"):
+            from miniassistant.group_rooms import group_workspace_path as _gwp_img
+            try:
+                img_dir = _gwp_img(config, _img_ctx_save.get("workspace_subdir") or "default") / "images"
+            except Exception:
+                workspace = (config.get("workspace") or "").strip()
+                img_dir = _Path(workspace) / "images" if workspace else _Path("images")
+        else:
+            workspace = (config.get("workspace") or "").strip()
+            img_dir = _Path(workspace) / "images" if workspace else _Path("images")
         img_dir.mkdir(parents=True, exist_ok=True)
         saved_paths: list[str] = []
         for i, img in enumerate(msg["images"]):
@@ -3489,10 +4125,35 @@ def _run_subagent_google(
             except Exception as e:
                 _log.warning("Image generation save failed: %s", e)
         if saved_paths:
-            paths_str = ", ".join(f"`{p}`" for p in saved_paths)
-            total_content += f"\n\nBild(er) gespeichert: {paths_str}"
             _img_ctx = config.get("_chat_context") or {}
             _img_platform = _img_ctx.get("platform")
+            # Group-Mode: dem Bot Sandbox-Sicht zeigen, damit send_image(/workspace/images/X.png) funktioniert
+            if _img_ctx.get("group_mode"):
+                _display_paths = [f"/workspace/images/{_Path(p).name}" for p in saved_paths]
+            else:
+                _display_paths = saved_paths
+            paths_str = ", ".join(f"`{p}`" for p in _display_paths)
+            # Matrix/Discord Group: Bilder direkt ausliefern (Model ruft send_image oft nicht auf).
+            # Web/API: _pending_images injiziert automatisch. Matrix/Discord DM: Model ruft send_image.
+            if _img_platform in ("matrix", "discord") and _img_ctx.get("group_mode"):
+                _delivered = 0
+                _capped = False
+                for _hp in saved_paths:
+                    _st = _auto_deliver_group_image(config, _hp, "Generiertes Bild")
+                    if _st == "sent":
+                        _delivered += 1
+                    elif _st == "cap":
+                        _capped = True
+                if _delivered:
+                    total_content += f"\n\n{_delivered} Bild(er) direkt in den Raum gesendet. Rufe send_image NICHT auf."
+                if _capped:
+                    total_content += f"\n\n(Turn-Bildlimit erreicht — restliche nicht gesendet: {paths_str})"
+                if not _delivered and not _capped:
+                    total_content += f"\n\nBild(er) gespeichert: {paths_str}\nCall `send_image(image_path='{_display_paths[0]}')` to deliver."
+            elif _img_platform in ("matrix", "discord"):
+                total_content += f"\n\nBild(er) gespeichert: {paths_str}\nCall `send_image(image_path='{_display_paths[0]}')` to deliver."
+            else:
+                total_content += f"\n\nBild(er) gespeichert: {paths_str} (wird dem User inline angezeigt)"
             for _sp in saved_paths:
                 _sp_p = _Path(_sp)
                 if _img_platform == "web":
@@ -3577,12 +4238,62 @@ def _run_subagent_openai(
             if _quality_m:
                 _q = _quality_m.group(1).lower()
                 _img_kwargs["quality"] = "hd" if _q in ("hd", "high", "hq") else "standard"
-            # Image Editing vs Generation: wenn image_path gesetzt → edit
+            # Image Editing vs Generation: wenn image_path gesetzt → edit.
+            # Wenn image_path gesetzt aber Datei fehlt → HART abbrechen statt still zu
+            # generieren. Sonst wirkt es im Gruppenraum als "Edit ignoriert mein Bild":
+            # ein nicht-auflösbarer Pfad würde sonst heimlich ein neues Bild erzeugen.
             _edit_src = _explicit.get("image_path", "").strip()
-            if _edit_src and _Path(_edit_src).exists():
+            if _edit_src and not _Path(_edit_src).exists():
+                err = (
+                    f"Image Edit Fehler: Quellbild nicht gefunden unter `{_edit_src}`. "
+                    "Es wurde KEIN neues Bild generiert. Prüfe den image_path — im Gruppenraum "
+                    "muss er der `/workspace/...`-Pfad aus `[Hochgeladenes Bild gespeichert unter:]` "
+                    "bzw. dem `Last uploaded image`-Hinweis sein — und rufe invoke_model erneut auf."
+                )
+                _aal.log_subagent_result(config, resolved_name, err, "")
+                return err
+            if _edit_src:
                 _log.info("Image editing: source=%s, model=%s", _edit_src, api_model)
                 # quality ist kein Parameter von api_edit_image
                 _img_kwargs.pop("quality", None)
+                # Auflösung: bei Edits Seitenverhältnis der Quelle IMMER erhalten (kein 1024x1024,
+                # das würde nicht-quadratische Bilder verzerren). Längste Kante wird auf
+                # image_edit_max_edge gecappt (default 2048) → verhindert OOM/Crash des
+                # Diffusion-Backends bei 4K-Quellen (flux.2-klein OOMt bei 3840x2160).
+                # Explizite size (tool-param / NNNxNNN im prompt) übersteuert komplett.
+                # Echtes OpenAI (dall-e) akzeptiert nur 256/512/1024 — kein source-dim override.
+                _is_real_openai = OPENAI_API_URL in (base_url or OPENAI_API_URL)
+                if not _is_real_openai and "size" not in _img_kwargs:
+                    try:
+                        from PIL import Image as _PILImage
+                        with _PILImage.open(_edit_src) as _src_im:
+                            _ow, _oh = _src_im.size  # original
+                        _max_edge = int(config.get("image_edit_max_edge") or 2048)
+                        _sw, _sh = _ow, _oh
+                        _longest = max(_ow, _oh)
+                        _was_capped = _longest > _max_edge
+                        if _was_capped:
+                            _scale = _max_edge / _longest
+                            _sw = int(_ow * _scale)
+                            _sh = int(_oh * _scale)
+                        # Diffusion-Backends brauchen Dim teilbar durch 8 (latent /8). Runde ab.
+                        _sw -= _sw % 8
+                        _sh -= _sh % 8
+                        if _sw > 0 and _sh > 0:
+                            _img_kwargs["size"] = f"{_sw}x{_sh}"
+                            _cap_note = f" (capped from {_ow}x{_oh})" if _was_capped else ""
+                            _log.info("Image editing: size = %dx%d, aspect preserved%s", _sw, _sh, _cap_note)
+                    except Exception as _res_err:
+                        _log.warning("Image editing: source resolution read failed (%s) — backend default used", _res_err)
+                # Default strength=0.85 wenn nicht explizit gesetzt — bei sd-server distill-models
+                # (flux klein, qwen-image-edit) ist 0.3-0.5 zu schwach: Output sieht ~identisch zum Input aus.
+                # 0.85 = klare Transformation bei erhaltener Komposition.
+                if "strength" not in _img_kwargs:
+                    _img_kwargs["strength"] = 0.85
+                    _log.info("Image editing: strength not set → default 0.85 (sd-server distill model)")
+                # KEINE t_enc-Kompensation mehr: der vom User genannte steps-Wert wird VERBATIM
+                # gesendet (20 → 20), nicht hochskaliert. Wenn das Backend (sd-server) effektiv
+                # weniger Steps fährt, ist das Backend-Sache — wir verfälschen die Eingabe nicht.
                 # image_api aus Provider-Config (z.B. "a1111" für A1111/Forge Backends)
                 _prov_cfg, _ = get_provider_config(config, resolved_name)
                 _image_api = str(_prov_cfg.get("image_api", "")).strip()
@@ -3599,8 +4310,18 @@ def _run_subagent_openai(
                     base_url=base_url or OPENAI_API_URL,
                     **_img_kwargs,
                 )
-            workspace = (config.get("workspace") or "").strip()
-            img_dir = _Path(workspace) / "images" if workspace else _Path("images")
+            # Group-Mode: in den Group-Workspace speichern damit send_image die Datei findet
+            _img_ctx_save2 = config.get("_chat_context") or {}
+            if _img_ctx_save2.get("group_mode"):
+                from miniassistant.group_rooms import group_workspace_path as _gwp_img2
+                try:
+                    img_dir = _gwp_img2(config, _img_ctx_save2.get("workspace_subdir") or "default") / "images"
+                except Exception:
+                    workspace = (config.get("workspace") or "").strip()
+                    img_dir = _Path(workspace) / "images" if workspace else _Path("images")
+            else:
+                workspace = (config.get("workspace") or "").strip()
+                img_dir = _Path(workspace) / "images" if workspace else _Path("images")
             img_dir.mkdir(parents=True, exist_ok=True)
             import uuid as _uuid_img
             fpath = img_dir / f"{_uuid_img.uuid4().hex}.png"
@@ -3636,7 +4357,21 @@ def _run_subagent_openai(
                     "caption": _caption,
                 })
                 _op_de = "bearbeitet" if _edit_src else "generiert"
-                result = f"Bild {_op_de} und gespeichert: `{fpath}` (wird dem User inline angezeigt)"
+                _display_fpath = f"/workspace/images/{fpath.name}" if _img_ctx.get("group_mode") else str(fpath)
+                if _img_platform in ("matrix", "discord") and _img_ctx.get("group_mode"):
+                    _st = _auto_deliver_group_image(config, str(fpath), _caption)
+                    if _st == "sent":
+                        result = f"Bild {_op_de} und direkt in den Raum gesendet. Rufe send_image NICHT auf."
+                    elif _st == "cap":
+                        result = f"Bild {_op_de} und gespeichert: `{_display_fpath}` — Turn-Bildlimit erreicht, nicht gesendet."
+                    elif _st == "dup":
+                        result = f"Bild {_op_de} (war bereits gesendet)."
+                    else:
+                        result = f"Bild {_op_de} und gespeichert: `{_display_fpath}`\nCall `send_image(image_path='{_display_fpath}')` to deliver."
+                elif _img_platform in ("matrix", "discord"):
+                    result = f"Bild {_op_de} und gespeichert: `{_display_fpath}`\nCall `send_image(image_path='{_display_fpath}')` to deliver."
+                else:
+                    result = f"Bild {_op_de} und gespeichert: `{_display_fpath}` (wird dem User inline angezeigt)"
                 if r.get("revised_prompt"):
                     result += f"\n\nRevisierter Prompt: {r['revised_prompt']}"
             else:
@@ -3653,6 +4388,34 @@ def _run_subagent_openai(
     _sub_num_ctx = get_num_ctx_for_model(config, resolved_name)
     _sub_timeout = float(config.get("subagent_api_timeout") or config.get("api_timeout") or 900)
     msgs: list[dict[str, Any]] = [{"role": "user", "content": user_msg}]
+    # Vision via invoke_model(model=VL, image_path=...): wenn nicht img-gen aber image_path gesetzt,
+    # Datei einlesen und als images-Attachment dem User-Message hinzufügen.
+    _vl_params = config.get("_img_gen_params") or {}
+    _vl_img_path = (_vl_params.get("image_path") or "").strip()
+    if _vl_img_path and not _is_img_gen:
+        try:
+            from pathlib import Path as _PVL
+            import base64 as _bvl
+            _pp = _PVL(_vl_img_path)
+            if _pp.is_file():
+                _bytes = _pp.read_bytes()
+                _suf = _pp.suffix.lower()
+                _mime = "image/png"
+                if _suf in (".jpg", ".jpeg"):
+                    _mime = "image/jpeg"
+                elif _suf == ".webp":
+                    _mime = "image/webp"
+                elif _suf == ".gif":
+                    _mime = "image/gif"
+                msgs[0]["images"] = [{"mime_type": _mime, "data": _bvl.b64encode(_bytes).decode("ascii")}]
+                _log.info("invoke_model (vision): attached image %s (%d bytes) to subagent %s", _pp, len(_bytes), resolved_name)
+                # Vision = reine Bild-Beschreibung. KEINE Tools (vor allem kein exec) — sonst
+                # geht ein Text-Model das nur "schauen" soll per exec rogue (Doom-Loop, siehe Bug).
+                sub_tools = []
+            else:
+                _log.warning("invoke_model (vision): image_path %s not found", _vl_img_path)
+        except Exception as _e_vl:
+            _log.warning("invoke_model (vision): failed to attach image: %s", _e_vl)
     total_content = ""
     total_thinking = ""
     _ALLOWED_SUB_TOOLS = {"exec", "web_search", "check_url", "read_url"}
@@ -3660,6 +4423,8 @@ def _run_subagent_openai(
     _consecutive_search_fails = 0
     _MAX_SEARCH_FAILS = 2
     _rolling_cooldown = [0]  # mutable for _maybe_rolling_summary
+    _search_rr = [0]  # round-robin counter über Such-Engines (überlebt Runden)
+    _sub_fetched_urls: list[str] = []  # Checkliste gelesener URLs (überlebt rolling-summary)
     _sub_seen_tool_keys: set[str] = set()
     _sub_dedup_enabled = bool(config.get("tool_call_dedup", True))
     _SUB_DEDUP_TOOLS = {"web_search", "read_url", "check_url"}
@@ -3743,110 +4508,38 @@ def _run_subagent_openai(
         # Cancellation check for OpenAI subagent tool rounds
         _cancel_user = (config.get("_chat_context") or {}).get("user_id")
         if _cancel_user:
-            from miniassistant.cancellation import check_cancel
-            if check_cancel(_cancel_user):
+            from miniassistant.cancellation import check_cancel_for_chat
+            if check_cancel_for_chat(config.get("_chat_context") or {}):
                 _log.info("Subagent %s (openai): cancellation detected — aborting after round %d", resolved_name, rounds_used)
                 if not total_content.strip():
                     total_content = "(Subagent abgebrochen)"
                 break
-        for tc_name, tc_args in tool_calls:
-            # Dedup-Block
-            if _sub_dedup_enabled and tc_name in _SUB_DEDUP_TOOLS:
-                try:
-                    _sub_dkey = f"{tc_name}::{json.dumps(tc_args, sort_keys=True, ensure_ascii=False).lower()}"
-                except Exception:
-                    _sub_dkey = ""
-                if _sub_dkey and _sub_dkey in _sub_seen_tool_keys:
-                    _hint = tc_args.get("query") or tc_args.get("url") or ""
-                    tool_result = (
-                        f"[DEDUP-BLOCK] You already called {tc_name} with the same arguments earlier "
-                        f"({_hint!r}). Use the previous result from history. Do NOT repeat — try different "
-                        f"arguments or finalize your answer."
-                    )
-                    _log.warning("Subagent %s (openai): dedup-block %s (%s)", resolved_name, tc_name, _hint)
-                    _aal.log_tool_call(config, f"subagent:{tc_name}", tc_args, tool_result)
-                    msgs.append({"role": "tool", "content": str(tool_result)})
-                    continue
-                if _sub_dkey:
-                    _sub_seen_tool_keys.add(_sub_dkey)
-            if tc_name not in _ALLOWED_SUB_TOOLS:
-                tool_result = f"Tool '{tc_name}' is not available for subagents."
-            elif tc_name == "exec":
-                _ws = (config.get("workspace") or "").strip() or None
-                _exec_r = run_exec(tc_args.get("command", ""), cwd=_ws, extra_env=_exec_env(config))
-                tool_result = f"returncode: {_exec_r['returncode']}\nstdout:\n{_exec_r['stdout']}\nstderr:\n{_exec_r['stderr']}"
-            elif tc_name == "web_search":
-                tool_result, _consecutive_search_fails = _subagent_web_search(
-                    config, tc_args, resolved_name,
-                    consecutive_fails=_consecutive_search_fails, max_fails=_MAX_SEARCH_FAILS,
+        def _compress_openai(_u: str, _c: str) -> str:
+            try:
+                _cr = openai_chat(
+                    [{"role": "user", "content": f"TASK:\n{user_msg}\n\nURL: {_u}\n\nRAW CONTENT:\n{_c}"}],
+                    api_key=api_key, model=api_model,
+                    system=_SUBAGENT_COMPRESS_SYSTEM, thinking=False, tools=None,
+                    base_url=base_url or OPENAI_API_URL, timeout=600,
                 )
-            elif tc_name == "check_url":
-                _cu_r = tool_check_url(tc_args.get("url", ""))
-                _cu_parts = [f"reachable: {_cu_r.get('reachable', False)}", f"status_code: {_cu_r.get('status_code', '')}"]
-                if _cu_r.get("final_url"): _cu_parts.append(f"final_url: {_cu_r['final_url']}")
-                if _cu_r.get("error"): _cu_parts.append(f"error: {_cu_r['error']}")
-                tool_result = "\n".join(_cu_parts)
-            elif tc_name == "read_url":
-                _ru_url = tc_args.get("url", "")
-                _ru_r = tool_read_url(
-                    _ru_url, config=config,
-                    proxy=tc_args.get("proxy"), js=bool(tc_args.get("js", False)),
-                    max_chars=None,
-                )
-                _ru_conn = _ru_r.get("connection", "")
-                if _ru_r.get("ok"):
-                    _ru_content = _ru_r.get("content", "")
-                    _ru_tokens = _estimate_tokens(_ru_content)
-                    _from_cache = bool(_ru_r.get("from_cache"))
-                    if _ru_tokens > 15000 and user_msg:
-                        _log.info("Subagent %s (openai): read_url %s = %d tok → compress (task-aware)",
-                                  resolved_name, _ru_url, _ru_tokens)
-                        try:
-                            _compress_system = (
-                                "Extrahiere aus dem webseiten-text alle infos relevant für die TASK.\n"
-                                "VERBATIM erhalten: URLs, zahlen, preise, versionen, zitate, code, error-messages, datum.\n"
-                                "Drop: navigation, cookie-banner, ads, related-posts, footer-links, boilerplate.\n"
-                                "Format: kompakte fakten-liste, keine einleitung. Max ~5000 tokens output.\n"
-                                "Antworte in der sprache der quelle."
-                            )
-                            _compress_msg = (
-                                f"TASK:\n{user_msg}\n\nURL: {_ru_url}\n\nRAW CONTENT:\n{_ru_content}"
-                            )
-                            _cr = openai_chat(
-                                [{"role": "user", "content": _compress_msg}],
-                                api_key=api_key, model=api_model,
-                                system=_compress_system, thinking=False, tools=None,
-                                base_url=base_url or OPENAI_API_URL,
-                                timeout=600,
-                            )
-                            _compressed = ((_cr.get("message") or {}).get("content") or "").strip()
-                            if _compressed:
-                                _src = "cache" if _from_cache else (_ru_conn or "fetch")
-                                tool_result = (
-                                    f"[compressed {_ru_tokens}→{_estimate_tokens(_compressed)} tok, "
-                                    f"src: {_src}, url: {_ru_url}]\n{_compressed}"
-                                )
-                            else:
-                                tool_result = _ru_content[:24000] + "\n\n[... truncated (compress empty) ...]"
-                        except Exception as _ce:
-                            _log.warning("Subagent %s (openai): compress failed for %s (%s) — hard trim",
-                                         resolved_name, _ru_url, _ce)
-                            tool_result = _ru_content[:24000] + "\n\n[... truncated (compress error) ...]"
-                    else:
-                        _prefix = "[cache hit] " if _from_cache else ""
-                        tool_result = f"{_prefix}[connection: {_ru_conn}]\n{_ru_content}" if _ru_conn else f"{_prefix}{_ru_content}"
-                else:
-                    _ru_err = _ru_r.get("error", "unknown error")
-                    tool_result = f"[connection: {_ru_conn}] Error reading URL: {_ru_err}" if _ru_conn else f"Error reading URL: {_ru_err}"
-            else:
-                tool_result = f"Unknown tool: {tc_name}"
-            _aal.log_tool_call(config, f"subagent:{tc_name}", tc_args, tool_result)
-            msgs.append({"role": "tool", "tool_name": tc_name, "content": str(tool_result)})
+                return ((_cr.get("message") or {}).get("content") or "").strip()
+            except Exception as _ce:
+                _log.warning("Subagent %s (openai): compress failed for %s (%s) — hard trim",
+                             resolved_name, _u, _ce)
+                return ""
+        _consecutive_search_fails = _subagent_process_round(
+            tool_calls, msgs, config, resolved_name,
+            allowed_tools=_ALLOWED_SUB_TOOLS, dedup_enabled=_sub_dedup_enabled,
+            dedup_tools=_SUB_DEDUP_TOOLS, seen_keys=_sub_seen_tool_keys,
+            fetched_urls=_sub_fetched_urls, consecutive_fails=_consecutive_search_fails,
+            max_search_fails=_MAX_SEARCH_FAILS, has_task=bool(user_msg),
+            compress_fn=_compress_openai, log_suffix=" (openai)", search_rr=_search_rr,
+        )
         rounds_used += 1
         # Proaktive rolling summary: wenn tool-results zu groß → sofort komprimieren (mit cooldown)
         msgs = _maybe_rolling_summary(
             msgs, user_msg, api_key, api_model, base_url or OPENAI_API_URL,
-            _sub_timeout, resolved_name, _rolling_cooldown,
+            _sub_timeout, resolved_name, _rolling_cooldown, _sub_fetched_urls,
         )
     result = _strip_tool_call_tags(total_content).strip()
     if not result:
@@ -3891,49 +4584,23 @@ def _subagent_web_search(
             "STOP searching. Summarize what you already know and give your answer now."
         ), consecutive_fails
 
-    from miniassistant.config import get_search_engine_url
-    _ws_url = get_search_engine_url(config, tc_args.get("engine"))
-    if not _ws_url:
-        return "web_search not configured (no search_engines or invalid engine)", consecutive_fails
-
     _ws_query = tc_args.get("query", "")
     _ws_cats = tc_args.get("categories")
-    _ws_res = tool_web_search(_ws_url, _ws_query, categories=_ws_cats)
+    _ws_res = tool_web_search_multi(config, _ws_query, categories=_ws_cats, engine_id=tc_args.get("engine"))
+    if _ws_res.get("error"):
+        return f"web_search error: {_ws_res['error']}", consecutive_fails
     _ws_lines: list[str] = []
-    if not _ws_res.get("error"):
-        for _r in _ws_res.get("results") or []:
-            _wl = f"- {_r.get('title', '')} | {_r.get('url', '')}\n  {_r.get('snippet', '')}"
-            if _r.get("img_src"):
-                _wl += f"\n  img_src: {_r['img_src']}"
-            _ws_lines.append(_wl)
-
-    # Engine-Fallback wenn keine Ergebnisse
-    if not _ws_lines:
-        _strategy = (config.get("search_engine_strategy") or "first").strip().lower()
-        if _strategy != "specific":
-            import random as _rng
-            _others = [
-                eid for eid, ecfg in (config.get("search_engines") or {}).items()
-                if (ecfg.get("url") or "").strip() and (ecfg.get("url") or "").strip() != _ws_url
-            ]
-            _rng.shuffle(_others)
-            for _alt_eid in _others:
-                _alt_url = (config.get("search_engines") or {})[_alt_eid].get("url", "").strip()
-                if not _alt_url:
-                    continue
-                _alt_res = tool_web_search(_alt_url, _ws_query, categories=_ws_cats)
-                if _alt_res.get("error") or not _alt_res.get("results"):
-                    continue
-                for _r in _alt_res["results"]:
-                    _wl = f"- {_r.get('title', '')} | {_r.get('url', '')}\n  {_r.get('snippet', '')}"
-                    if _r.get("img_src"):
-                        _wl += f"\n  img_src: {_r['img_src']}"
-                    _ws_lines.append(_wl)
-                if _ws_lines:
-                    _log.info("Subagent %s: search fallback to engine '%s' succeeded", resolved_name, _alt_eid)
-                    break
+    for _r in _ws_res.get("results") or []:
+        _wl = f"- {_r.get('title', '')} | {_r.get('url', '')}\n  {_r.get('snippet', '')}"
+        if _r.get("img_src"):
+            _wl += f"\n  img_src: {_r['img_src']}"
+        _ws_lines.append(_wl)
 
     if _ws_lines:
+        _used = _ws_res.get("used_engines") or []
+        if len(_used) > 1:
+            _log.info("Subagent %s: web_search results merged from engines: %s", resolved_name, _used)
+            return f"[Results merged from engines: {', '.join(_used)}]\n" + "\n".join(_ws_lines), 0
         return "\n".join(_ws_lines), 0  # reset counter on success
 
     consecutive_fails += 1
@@ -3946,6 +4613,165 @@ def _subagent_web_search(
         f"Search engine returned no results ({consecutive_fails}/{max_fails} consecutive failures). "
         "Try a simpler/shorter query, or use read_url on a known URL instead."
     ), consecutive_fails
+
+
+_SUBAGENT_COMPRESS_SYSTEM = (
+    "Extrahiere aus dem webseiten-text alle infos relevant für die TASK.\n"
+    "VERBATIM erhalten: URLs, zahlen, preise, versionen, zitate, code, error-messages, datum.\n"
+    "Drop: navigation, cookie-banner, ads, related-posts, footer-links, boilerplate.\n"
+    "Format: kompakte fakten-liste, keine einleitung. Max ~5000 tokens output.\n"
+    "Antworte in der sprache der quelle."
+)
+
+# Max. parallele read_url-Fetches pro Subagent-Runde. Begrenzt gleichzeitig die compress-Last
+# auf dem Model-Server (jeder große Fetch löst einen compress-LLM-Call aus) → kein 502-Storm.
+_SUBAGENT_FETCH_WORKERS = 3
+
+
+def _subagent_process_round(
+    tool_calls: list[tuple[str, dict[str, Any]]],
+    msgs: list[dict[str, Any]],
+    config: dict[str, Any],
+    resolved_name: str,
+    *,
+    allowed_tools: set[str],
+    dedup_enabled: bool,
+    dedup_tools: set[str],
+    seen_keys: set[str],
+    fetched_urls: list[str],
+    consecutive_fails: int,
+    max_search_fails: int,
+    has_task: bool,
+    compress_fn,
+    log_suffix: str,
+    search_rr: list[int],
+) -> int:
+    """Verarbeitet die Tool-Calls EINER Subagent-Runde und hängt die Ergebnisse
+    in Original-Reihenfolge an `msgs` an.
+
+    - read_url: PARALLEL geholt + komprimiert (max `_SUBAGENT_FETCH_WORKERS` gleichzeitig →
+      bounded compress-Last). I/O-bound, größter Speed-Gewinn.
+    - web_search: sequenziell (Circuit-Breaker `consecutive_fails` ist sequenziell), aber
+      ohne explizite engine wird round-robin über die konfigurierten Engines verteilt
+      (`search_rr` hält den Zähler über Runden hinweg) → spreizt Last, kein Rate-Limit.
+    - exec / check_url: sequenziell.
+
+    compress_fn(url, content) -> komprimierter Text ("" bei Fehler/leer).
+    Gibt aktualisierte `consecutive_fails` zurück.
+    """
+    import concurrent.futures as _cf
+
+    _engines = list((config.get("search_engines") or {}).keys())
+
+    # 1) Pre-pass: Dedup + Seen-Tracking, deterministisch sequenziell (kein Thread-Race).
+    planned: list[dict[str, Any]] = []
+    for _i, (tc_name, tc_args) in enumerate(tool_calls):
+        _dedup_res: str | None = None
+        if dedup_enabled and tc_name in dedup_tools:
+            try:
+                _dk = f"{tc_name}::{json.dumps(tc_args, sort_keys=True, ensure_ascii=False).lower()}"
+            except Exception:
+                _dk = ""
+            if _dk and _dk in seen_keys:
+                _hint = tc_args.get("query") or tc_args.get("url") or ""
+                _dedup_res = (
+                    f"[DEDUP-BLOCK] You already called {tc_name} with the same arguments earlier "
+                    f"({_hint!r}). Use the previous result from history. Do NOT repeat — try different "
+                    f"arguments or finalize your answer."
+                )
+                _log.warning("Subagent %s%s: dedup-block %s (%s)", resolved_name, log_suffix, tc_name, _hint)
+            elif _dk:
+                seen_keys.add(_dk)
+        planned.append({"idx": _i, "name": tc_name, "args": tc_args, "dedup": _dedup_res})
+
+    # 2) read_url parallel holen.
+    def _fetch_one(_args: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        _url = _args.get("url", "")
+        try:
+            _r = tool_read_url(
+                _url, config=config, proxy=_args.get("proxy"),
+                js=bool(_args.get("js", False)), max_chars=None,
+            )
+        except Exception as _fe:
+            _r = {"ok": False, "error": str(_fe)}
+        return _url, _r
+
+    _ru_items = [p for p in planned if p["dedup"] is None and p["name"] == "read_url"]
+    _ru_raw: dict[int, tuple[str, dict[str, Any]]] = {}
+    if _ru_items:
+        _workers = min(_SUBAGENT_FETCH_WORKERS, len(_ru_items))
+        with _cf.ThreadPoolExecutor(max_workers=_workers) as _pool:
+            _fut = {_pool.submit(_fetch_one, p["args"]): p["idx"] for p in _ru_items}
+            for _f in _cf.as_completed(_fut):
+                _idx = _fut[_f]
+                try:
+                    _ru_raw[_idx] = _f.result()
+                except Exception as _fe:
+                    _ru_raw[_idx] = (planned[_idx]["args"].get("url", ""), {"ok": False, "error": str(_fe)})
+
+    # 3) Ergebnisse in Original-Reihenfolge zusammenbauen (compress läuft hier, durch Worker-Cap gedrosselt).
+    for p in planned:
+        _name = p["name"]
+        _args = p["args"]
+        _idx = p["idx"]
+        if p["dedup"] is not None:
+            tool_result = p["dedup"]
+        elif _name not in allowed_tools:
+            tool_result = f"Tool '{_name}' is not available for subagents."
+        elif _name == "exec":
+            _ws = (config.get("workspace") or "").strip() or None
+            _er = run_exec(_args.get("command", ""), cwd=_ws, extra_env=_exec_env(config))
+            tool_result = f"returncode: {_er['returncode']}\nstdout:\n{_er['stdout']}\nstderr:\n{_er['stderr']}"
+        elif _name == "web_search":
+            if _engines and len(_engines) > 1 and not _args.get("engine"):
+                _args = dict(_args)
+                _args["engine"] = _engines[search_rr[0] % len(_engines)]
+                search_rr[0] += 1
+            tool_result, consecutive_fails = _subagent_web_search(
+                config, _args, resolved_name,
+                consecutive_fails=consecutive_fails, max_fails=max_search_fails,
+            )
+        elif _name == "check_url":
+            _cu = tool_check_url(_args.get("url", ""))
+            _parts = [f"reachable: {_cu.get('reachable', False)}", f"status_code: {_cu.get('status_code', '')}"]
+            if _cu.get("final_url"):
+                _parts.append(f"final_url: {_cu['final_url']}")
+            if _cu.get("error"):
+                _parts.append(f"error: {_cu['error']}")
+            tool_result = "\n".join(_parts)
+        elif _name == "read_url":
+            _url, _r = _ru_raw.get(_idx, (_args.get("url", ""), {"ok": False, "error": "no result"}))
+            _conn = _r.get("connection", "")
+            if _r.get("ok"):
+                _content = _r.get("content", "")
+                _tokens = _estimate_tokens(_content)
+                _from_cache = bool(_r.get("from_cache"))
+                if _url and _url not in fetched_urls:
+                    fetched_urls.append(_url)
+                if _tokens > 15000 and has_task:
+                    _log.info("Subagent %s%s: read_url %s = %d tok → compress (task-aware)",
+                              resolved_name, log_suffix, _url, _tokens)
+                    _compressed = compress_fn(_url, _content)
+                    if _compressed:
+                        _src = "cache" if _from_cache else (_conn or "fetch")
+                        tool_result = (
+                            f"[compressed {_tokens}→{_estimate_tokens(_compressed)} tok, "
+                            f"src: {_src}, url: {_url}]\n{_compressed}"
+                        )
+                    else:
+                        tool_result = _content[:24000] + "\n\n[... truncated (compress empty) ...]"
+                else:
+                    _prefix = "[cache hit] " if _from_cache else ""
+                    tool_result = f"{_prefix}[connection: {_conn}]\n{_content}" if _conn else f"{_prefix}{_content}"
+            else:
+                _err = _r.get("error", "unknown error")
+                tool_result = f"[connection: {_conn}] Error reading URL: {_err}" if _conn else f"Error reading URL: {_err}"
+        else:
+            tool_result = f"Unknown tool: {_name}"
+        _aal.log_tool_call(config, f"subagent:{_name}", _args, tool_result)
+        msgs.append({"role": "tool", "tool_name": _name, "content": str(tool_result)})
+
+    return consecutive_fails
 
 
 def _run_subagent_with_tools(
@@ -3976,6 +4802,8 @@ def _run_subagent_with_tools(
     _consecutive_search_fails = 0
     _MAX_SEARCH_FAILS = 2
     _rolling_cooldown = [0]
+    _search_rr = [0]  # round-robin counter über Such-Engines (überlebt Runden)
+    _sub_fetched_urls: list[str] = []  # Checkliste gelesener URLs (überlebt rolling-summary)
     _sub_seen_tool_keys: set[str] = set()
     _sub_dedup_enabled = bool(config.get("tool_call_dedup", True))
     _SUB_DEDUP_TOOLS = {"web_search", "read_url", "check_url"}
@@ -4077,109 +4905,38 @@ def _run_subagent_with_tools(
         # Cancellation check for subagent tool rounds
         _cancel_user = (config.get("_chat_context") or {}).get("user_id")
         if _cancel_user:
-            from miniassistant.cancellation import check_cancel
-            if check_cancel(_cancel_user):
+            from miniassistant.cancellation import check_cancel_for_chat
+            if check_cancel_for_chat(config.get("_chat_context") or {}):
                 _log.info("Subagent %s: cancellation detected — aborting after round %d", resolved_name, rounds_used)
                 if not total_content.strip():
                     total_content = "(Subagent abgebrochen)"
                 break
-        for tc_name, tc_args in tool_calls:
-            # Dedup-Block: identischer Tool-Call zweimal → synthetic block.
-            if _sub_dedup_enabled and tc_name in _SUB_DEDUP_TOOLS:
-                try:
-                    _sub_dkey = f"{tc_name}::{json.dumps(tc_args, sort_keys=True, ensure_ascii=False).lower()}"
-                except Exception:
-                    _sub_dkey = ""
-                if _sub_dkey and _sub_dkey in _sub_seen_tool_keys:
-                    _hint = tc_args.get("query") or tc_args.get("url") or ""
-                    tool_result = (
-                        f"[DEDUP-BLOCK] You already called {tc_name} with the same arguments earlier "
-                        f"({_hint!r}). Use the previous result from history. Do NOT repeat this call — "
-                        f"either try different arguments or finalize your answer."
-                    )
-                    _log.warning("Subagent %s: dedup-block %s (%s)", resolved_name, tc_name, _hint)
-                    _aal.log_tool_call(config, f"subagent:{tc_name}", tc_args, tool_result)
-                    msgs.append({"role": "tool", "content": str(tool_result)})
-                    continue
-                if _sub_dkey:
-                    _sub_seen_tool_keys.add(_sub_dkey)
-            if tc_name not in _ALLOWED_SUB_TOOLS:
-                tool_result = f"Tool '{tc_name}' is not available for subagents."
-            elif tc_name == "exec":
-                _ws = (config.get("workspace") or "").strip() or None
-                _exec_r = run_exec(tc_args.get("command", ""), cwd=_ws, extra_env=_exec_env(config))
-                tool_result = f"returncode: {_exec_r['returncode']}\nstdout:\n{_exec_r['stdout']}\nstderr:\n{_exec_r['stderr']}"
-            elif tc_name == "web_search":
-                tool_result, _consecutive_search_fails = _subagent_web_search(
-                    config, tc_args, resolved_name,
-                    consecutive_fails=_consecutive_search_fails, max_fails=_MAX_SEARCH_FAILS,
+        def _compress_ollama(_u: str, _c: str) -> str:
+            try:
+                _cr = ollama_chat(
+                    base_url,
+                    [{"role": "user", "content": f"TASK:\n{user_msg}\n\nURL: {_u}\n\nRAW CONTENT:\n{_c}"}],
+                    model=api_model, system=_SUBAGENT_COMPRESS_SYSTEM,
+                    num_ctx=num_ctx, options=options or None, api_key=api_key,
+                    timeout=600.0,
                 )
-            elif tc_name == "check_url":
-                _cu_r = tool_check_url(tc_args.get("url", ""))
-                _cu_parts = [f"reachable: {_cu_r.get('reachable', False)}", f"status_code: {_cu_r.get('status_code', '')}"]
-                if _cu_r.get("final_url"): _cu_parts.append(f"final_url: {_cu_r['final_url']}")
-                if _cu_r.get("error"): _cu_parts.append(f"error: {_cu_r['error']}")
-                tool_result = "\n".join(_cu_parts)
-            elif tc_name == "read_url":
-                _ru_url = tc_args.get("url", "")
-                _ru_r = tool_read_url(
-                    _ru_url, config=config,
-                    proxy=tc_args.get("proxy"), js=bool(tc_args.get("js", False)),
-                    max_chars=None,
-                )
-                _ru_conn = _ru_r.get("connection", "")
-                if _ru_r.get("ok"):
-                    _ru_content = _ru_r.get("content", "")
-                    _ru_tokens = _estimate_tokens(_ru_content)
-                    _from_cache = bool(_ru_r.get("from_cache"))
-                    if _ru_tokens > 15000 and user_msg:
-                        _log.info("Subagent %s: read_url %s = %d tok → compress (task-aware)",
-                                  resolved_name, _ru_url, _ru_tokens)
-                        try:
-                            _compress_system = (
-                                "Extrahiere aus dem webseiten-text alle infos relevant für die TASK.\n"
-                                "VERBATIM erhalten: URLs, zahlen, preise, versionen, zitate, code, error-messages, datum.\n"
-                                "Drop: navigation, cookie-banner, ads, related-posts, footer-links, boilerplate.\n"
-                                "Format: kompakte fakten-liste, keine einleitung. Max ~5000 tokens output.\n"
-                                "Antworte in der sprache der quelle."
-                            )
-                            _compress_msg = (
-                                f"TASK:\n{user_msg}\n\nURL: {_ru_url}\n\nRAW CONTENT:\n{_ru_content}"
-                            )
-                            _cr = ollama_chat(
-                                base_url,
-                                [{"role": "user", "content": _compress_msg}],
-                                model=api_model, system=_compress_system,
-                                num_ctx=num_ctx, options=options or None, api_key=api_key,
-                                timeout=600.0,
-                            )
-                            _compressed = ((_cr.get("message") or {}).get("content") or "").strip()
-                            if _compressed:
-                                _src = "cache" if _from_cache else (_ru_conn or "fetch")
-                                tool_result = (
-                                    f"[compressed {_ru_tokens}→{_estimate_tokens(_compressed)} tok, "
-                                    f"src: {_src}, url: {_ru_url}]\n{_compressed}"
-                                )
-                            else:
-                                tool_result = _ru_content[:24000] + "\n\n[... truncated (compress empty) ...]"
-                        except Exception as _ce:
-                            _log.warning("Subagent %s: compress failed for %s (%s) — hard trim",
-                                         resolved_name, _ru_url, _ce)
-                            tool_result = _ru_content[:24000] + "\n\n[... truncated (compress error) ...]"
-                    else:
-                        _prefix = "[cache hit] " if _from_cache else ""
-                        tool_result = f"{_prefix}[connection: {_ru_conn}]\n{_ru_content}" if _ru_conn else f"{_prefix}{_ru_content}"
-                else:
-                    _ru_err = _ru_r.get("error", "unknown error")
-                    tool_result = f"[connection: {_ru_conn}] Error reading URL: {_ru_err}" if _ru_conn else f"Error reading URL: {_ru_err}"
-            else:
-                tool_result = f"Unknown tool: {tc_name}"
-            _aal.log_tool_call(config, f"subagent:{tc_name}", tc_args, tool_result)
-            msgs.append({"role": "tool", "content": str(tool_result)})
+                return ((_cr.get("message") or {}).get("content") or "").strip()
+            except Exception as _ce:
+                _log.warning("Subagent %s: compress failed for %s (%s) — hard trim",
+                             resolved_name, _u, _ce)
+                return ""
+        _consecutive_search_fails = _subagent_process_round(
+            tool_calls, msgs, config, resolved_name,
+            allowed_tools=_ALLOWED_SUB_TOOLS, dedup_enabled=_sub_dedup_enabled,
+            dedup_tools=_SUB_DEDUP_TOOLS, seen_keys=_sub_seen_tool_keys,
+            fetched_urls=_sub_fetched_urls, consecutive_fails=_consecutive_search_fails,
+            max_search_fails=_MAX_SEARCH_FAILS, has_task=bool(user_msg),
+            compress_fn=_compress_ollama, log_suffix="", search_rr=_search_rr,
+        )
         rounds_used += 1
         # Proaktive rolling summary mit cooldown
         msgs = _maybe_rolling_summary(
-            msgs, user_msg, api_key, api_model, base_url, _sub_timeout, resolved_name, _rolling_cooldown,
+            msgs, user_msg, api_key, api_model, base_url, _sub_timeout, resolved_name, _rolling_cooldown, _sub_fetched_urls,
         )
     # Stuck-Prevention: wenn nach Tool-Runden kein Content, Nudge senden
     if not total_content.strip() and rounds_used > 0:
@@ -4563,6 +5320,10 @@ def chat_round(
     switch_info = {"model": str, "reason": str} wenn auf Fallback gewechselt wurde.
     """
     system_prompt = refresh_datetime_in_prompt(system_prompt)
+    # Original-User-Request für Image-Param-Extraktion (steps/cfg/size) merken:
+    # invoke_model bekommt nur die agent-konstruierte Edit-Prompt, nicht den Rohtext.
+    # So greift der Regex-Fallback auf "mach mit 20 steps" auch wenn Agent den Param weglässt.
+    config["_user_request_text"] = user_content or ""
     # Slot-Cache: Restore versuchen wenn conv_id im Context gesetzt
     _ctx = config.get("_chat_context") or {}
     _conv_id = _ctx.get("conv_id")
@@ -4573,7 +5334,9 @@ def chat_round(
             _slot_cache.restore_before_round(config, _conv_id, model, endpoint=_endpoint)
         except Exception as _e:
             _log.debug("slot_cache restore skipped: %s", _e)
-    tools_schema = get_tools_schema(config)
+    _gm_ctx = config.get("_chat_context") or {}
+    _gm_allow = set(_gm_ctx.get("tools_allow") or []) if _gm_ctx.get("group_mode") else None
+    tools_schema = get_tools_schema(config, allow=_gm_allow)
     debug = (config.get("server") or {}).get("debug", False)
     models_cfg = config.get("models") or {}
     per_prov_fb = [resolve_model(config, fb) or fb for fb in (models_cfg.get("fallbacks") or []) if fb]
@@ -4594,11 +5357,21 @@ def chat_round(
     last_error: Exception | None = None
     _subagent_failed = False
 
-    # Smart Compacting: History zusammenfassen wenn Quota überschritten
+    # Smart Compacting: History zusammenfassen wenn Quota überschritten.
+    # Summary landet im system_prompt (siehe _apply_chat_summary), nicht als
+    # separate role=system msg — Jinja-Templates erlauben nur 1 system am Anfang.
     compacted_messages = list(messages)
     _compact_num_ctx = get_num_ctx_for_model(config, model)
+    _chat_summary: str | None = None
     if _needs_compacting(config, system_prompt, compacted_messages, tools_schema, _compact_num_ctx):
-        compacted_messages = _compact_history(config, compacted_messages, model, system_prompt, tools_schema, _compact_num_ctx)
+        _notify_chat_compaction_start(config)
+        compacted_messages, _new_sum = _compact_history(
+            config, compacted_messages, model, system_prompt, tools_schema, _compact_num_ctx,
+            prior_summary=_chat_summary,
+        )
+        if _new_sum:
+            _chat_summary = _new_sum
+        _notify_chat_compaction_done(config)
 
     # Dokument-Anhaenge dynamisch ans Modell-Kontext anpassen
     if "<doc " in (user_content or ""):
@@ -4629,18 +5402,33 @@ def chat_round(
         think = get_think_for_model(config, try_model)
         try:
             while rounds < max_tool_rounds:
+                # Cancel-Check VOR jedem API-Call (sonst stecken wir 3x retry × api_timeout fest)
+                _chat_ctx_pre = config.get("_chat_context") or {}
+                if _chat_ctx_pre:
+                    from miniassistant.cancellation import check_cancel_for_chat as _ccfc_pre, clear_cancel_for_chat as _clcf_pre
+                    if _ccfc_pre(_chat_ctx_pre):
+                        _clcf_pre(_chat_ctx_pre)
+                        _log.info("Cancellation BEFORE API call — round %d", rounds)
+                        if not total_content.strip():
+                            total_content = "(Verarbeitung abgebrochen)"
+                        msgs.append({"role": "assistant", "content": total_content.strip()})
+                        msgs_final = msgs
+                        effective_model = try_model
+                        break
                 last_msgs_before_call = list(msgs)
                 options = get_options_for_model(config, try_model)
                 tools = tools_schema if _provider_supports_tools(config, try_model) else []
-                system_effective = system_prompt
+                system_base = _apply_chat_summary(system_prompt, _chat_summary)
+                system_effective = system_base
                 if not tools and not _provider_no_api_tools(config, try_model):
                     system_effective = (
-                        system_prompt
+                        system_base
                         + "\n\n[Wichtig: Diesem Modell stehen keine Tools (exec, schedule, web_search) zur Verfügung. Antworte nur mit Text; schlage keine Tool-Aufrufe oder konkreten schedule/exec-Beispiele vor.]"
                     )
                 elif not tools and _provider_no_api_tools(config, try_model) and tools_schema:
-                    system_effective = system_prompt + "\n\n" + _build_no_api_tools_prompt(tools_schema)
+                    system_effective = system_base + "\n\n" + _build_no_api_tools_prompt(tools_schema)
                 num_ctx = get_num_ctx_for_model(config, try_model)
+                config["_active_num_ctx"] = num_ctx  # für dynamischen read_url-Cap im Tool-Handler
                 msgs = _trim_messages_to_fit(system_effective, msgs, num_ctx, reserve_tokens=1024, tools=tools)
                 last_msgs_before_call = list(msgs)
                 if rounds == 0:
@@ -4666,10 +5454,17 @@ def chat_round(
                             if attempt < 2:
                                 code = getattr(getattr(e, "response", None), "status_code", None)
                                 err_str = str(e).lower()
-                                if (isinstance(e, (httpx.TimeoutException, httpx.RemoteProtocolError, OSError)) or 
-                                    code in (400, 500, 502, 503, 504) or 
+                                if (isinstance(e, (httpx.TimeoutException, httpx.RemoteProtocolError, OSError)) or
+                                    code in (400, 500, 502, 503, 504) or
                                     "broken pipe" in err_str or "errno 32" in err_str):
                                     _log.warning("API attempt %d/3 failed (%s), retrying in 3s …", attempt + 1, e)
+                                    # Cancel-Check vor Retry-Sleep
+                                    _ctx_rt = config.get("_chat_context") or {}
+                                    if _ctx_rt:
+                                        from miniassistant.cancellation import check_cancel_for_chat as _ccfc_rt
+                                        if _ccfc_rt(_ctx_rt):
+                                            _log.info("Cancellation during API retry — abort attempt %d", attempt + 1)
+                                            raise RuntimeError("aborted by user during API retry")
                                     time.sleep(3)
                                     continue
                             raise
@@ -4733,19 +5528,23 @@ def chat_round(
                     "thinking": msg.get("thinking") or "",
                     "tool_calls": response.get("message", {}).get("tool_calls") or [],
                 })
-                # Cancellation check between tool rounds
-                _cancel_user = (config.get("_chat_context") or {}).get("user_id")
-                if _cancel_user:
-                    from miniassistant.cancellation import check_cancel, clear_cancel
-                    _cancel_level = check_cancel(_cancel_user)
+                # Cancellation check between tool rounds (room-wide für group_mode)
+                _chat_ctx_c = config.get("_chat_context") or {}
+                if _chat_ctx_c:
+                    from miniassistant.cancellation import check_cancel_for_chat, clear_cancel_for_chat
+                    _cancel_level = check_cancel_for_chat(_chat_ctx_c)
                     if _cancel_level:
-                        clear_cancel(_cancel_user)
-                        _log.info("Cancellation (%s) für %s — breche nach Runde %d ab", _cancel_level, _cancel_user, rounds)
-                        if not total_content.strip():
-                            total_content += "\n\n*(Verarbeitung abgebrochen)*"
+                        clear_cancel_for_chat(_chat_ctx_c)
+                        _log.info("Cancellation (%s) — breche nach Runde %d ab (ctx=%s)", _cancel_level, rounds, {k:_chat_ctx_c.get(k) for k in ("user_id","room_id","channel_id")})
+                        if _cancel_level == "abort":
+                            # Harter Abbruch: Output komplett unterdrücken. Der User hat beim
+                            # /abort bereits die "⏹ abgebrochen"-Bestätigung bekommen — ein
+                            # zweiter Text bzw. ein nachgereichtes Bild wäre unerwünschter Output.
+                            total_content = "[NO_MESSAGE]"
                         else:
-                            total_content += "\n\n*(Verarbeitung abgebrochen)*"
-                        msgs.append({"role": "assistant", "content": total_content.strip()})
+                            # Graceful stop: bisher Erarbeitetes behalten + Hinweis.
+                            total_content = (total_content.strip() + "\n\n*(Verarbeitung gestoppt)*").strip()
+                        msgs.append({"role": "assistant", "content": total_content})
                         msgs_final = msgs
                         effective_model = try_model
                         break
@@ -4993,6 +5792,8 @@ def chat_round_stream(
     | {"type": "done", "thinking", "content", "new_messages", "debug_info", "switch_info"}.
     """
     system_prompt = refresh_datetime_in_prompt(system_prompt)
+    # Original-User-Request für Image-Param-Extraktion (steps/cfg/size) merken (siehe chat_round).
+    config["_user_request_text"] = user_content or ""
     # Slot-Cache: Restore versuchen wenn conv_id im Context gesetzt
     _ctx_s = config.get("_chat_context") or {}
     _conv_id_s = _ctx_s.get("conv_id")
@@ -5003,7 +5804,9 @@ def chat_round_stream(
             _slot_cache.restore_before_round(config, _conv_id_s, model, endpoint=_endpoint_s)
         except Exception as _e:
             _log.debug("slot_cache restore (stream) skipped: %s", _e)
-    tools_schema = get_tools_schema(config)
+    _gm_ctx = config.get("_chat_context") or {}
+    _gm_allow = set(_gm_ctx.get("tools_allow") or []) if _gm_ctx.get("group_mode") else None
+    tools_schema = get_tools_schema(config, allow=_gm_allow)
     models_cfg = config.get("models") or {}
     per_prov_fb = [resolve_model(config, fb) or fb for fb in (models_cfg.get("fallbacks") or []) if fb]
     global_fb = [resolve_model(config, fb) or fb for fb in (config.get("fallbacks") or []) if fb]
@@ -5018,11 +5821,21 @@ def chat_round_stream(
     effective_model = model
 
     msgs = list(messages)
-    # Smart Compacting: History zusammenfassen wenn Quota überschritten
+    # Smart Compacting: History zusammenfassen wenn Quota überschritten.
+    # Summary wird via _apply_chat_summary in den system_prompt eingebaut
+    # (Jinja-Templates erlauben nur 1 system-message am Anfang).
     _compact_num_ctx = get_num_ctx_for_model(config, model)
+    _chat_summary: str | None = None
     if _needs_compacting(config, system_prompt, msgs, tools_schema, _compact_num_ctx):
         yield {"type": "status", "message": "Chat-Verlauf wird komprimiert…"}
-        msgs = _compact_history(config, msgs, model, system_prompt, tools_schema, _compact_num_ctx)
+        _notify_chat_compaction_start(config)
+        msgs, _new_sum = _compact_history(
+            config, msgs, model, system_prompt, tools_schema, _compact_num_ctx,
+            prior_summary=_chat_summary,
+        )
+        if _new_sum:
+            _chat_summary = _new_sum
+        _notify_chat_compaction_done(config)
         yield {"type": "status", "message": "Verlauf komprimiert."}
     # Dokument-Anhaenge dynamisch ans Modell-Kontext anpassen (NACH Compacting, damit freier Platz mitzaehlt)
     if "<doc " in (user_content or ""):
@@ -5048,7 +5861,13 @@ def chat_round_stream(
         _img_gen_available_s = bool(_get_img_models_stream(config))
         _saved_paths_s = _save_uploaded_images(config, images) if _img_gen_available_s else []
         if _saved_paths_s:
-            _paths_info_s = "\n".join(f"- `{p}`" for p in _saved_paths_s)
+            # Group-Mode: Sandbox-Sicht zeigen
+            _ctx_up_s = config.get("_chat_context") or {}
+            if _ctx_up_s.get("group_mode"):
+                _display_s = [f"/workspace/images/uploads/{Path(p).name}" for p in _saved_paths_s]
+            else:
+                _display_s = _saved_paths_s
+            _paths_info_s = "\n".join(f"- `{p}`" for p in _display_s)
             user_content = f"{user_content}\n\n[Hochgeladenes Bild gespeichert unter:]\n{_paths_info_s}"
         user_content, images = describe_images_with_vl_model(config, images, user_content, model)
 
@@ -5089,8 +5908,15 @@ def chat_round_stream(
                 _log.info("Per-round compact triggered (round=%d, ctx=%d, budget=%d)",
                           rounds, _ctx_for_check, _context_budget(config, _compact_num_ctx))
                 yield {"type": "status", "message": "Chat-Verlauf wird komprimiert…"}
-                msgs = _compact_history(config, msgs, models_to_try[0] if rounds == 0 else effective_model,
-                                        system_prompt, tools_schema, _compact_num_ctx)
+                _notify_chat_compaction_start(config)
+                msgs, _new_sum = _compact_history(
+                    config, msgs, models_to_try[0] if rounds == 0 else effective_model,
+                    system_prompt, tools_schema, _compact_num_ctx,
+                    prior_summary=_chat_summary,
+                )
+                if _new_sum:
+                    _chat_summary = _new_sum
+                _notify_chat_compaction_done(config)
                 _last_real_ctx = None
                 _msgs_len_at_call = len(msgs)
                 yield {"type": "status", "message": "Verlauf komprimiert."}
@@ -5104,15 +5930,17 @@ def chat_round_stream(
         think = get_think_for_model(config, try_model)
         options = get_options_for_model(config, try_model)
         tools = tools_schema if _provider_supports_tools(config, try_model) else []
-        system_effective = system_prompt
+        system_base = _apply_chat_summary(system_prompt, _chat_summary)
+        system_effective = system_base
         if not tools and not _provider_no_api_tools(config, try_model):
             system_effective = (
-                system_prompt
+                system_base
                 + "\n\n[Wichtig: Diesem Modell stehen keine Tools (exec, schedule, web_search) zur Verfügung. Antworte nur mit Text; schlage keine Tool-Aufrufe oder konkreten schedule/exec-Beispiele vor.]"
             )
         elif not tools and _provider_no_api_tools(config, try_model) and tools_schema:
-            system_effective = system_prompt + "\n\n" + _build_no_api_tools_prompt(tools_schema)
+            system_effective = system_base + "\n\n" + _build_no_api_tools_prompt(tools_schema)
         num_ctx = get_num_ctx_for_model(config, try_model)
+        config["_active_num_ctx"] = num_ctx  # für dynamischen read_url-Cap im Tool-Handler
         msgs = _trim_messages_to_fit(system_effective, msgs, num_ctx, reserve_tokens=1024, tools=tools)
         if rounds == 0:
             _log_estimated_tokens(config, system_effective, msgs, tools)
@@ -5593,14 +6421,14 @@ def chat_round_stream(
             "thinking": _hist_s_thinking,
             "tool_calls": all_tool_calls_raw,
         })
-        # Cancellation check between tool rounds (stream)
-        _cancel_user = (config.get("_chat_context") or {}).get("user_id")
-        if _cancel_user:
-            from miniassistant.cancellation import check_cancel, clear_cancel
-            _cancel_level = check_cancel(_cancel_user)
+        # Cancellation check between tool rounds (stream, room-wide für group_mode)
+        _chat_ctx_sc = config.get("_chat_context") or {}
+        if _chat_ctx_sc:
+            from miniassistant.cancellation import check_cancel_for_chat, clear_cancel_for_chat
+            _cancel_level = check_cancel_for_chat(_chat_ctx_sc)
             if _cancel_level:
-                clear_cancel(_cancel_user)
-                _log.info("Stream cancellation (%s) für %s — breche nach Runde %d ab", _cancel_level, _cancel_user, rounds)
+                clear_cancel_for_chat(_chat_ctx_sc)
+                _log.info("Stream cancellation (%s) — breche nach Runde %d ab (ctx=%s)", _cancel_level, rounds, {k:_chat_ctx_sc.get(k) for k in ("user_id","room_id","channel_id")})
                 total_content += "\n\n*(Verarbeitung abgebrochen)*"
                 msgs.append({"role": "assistant", "content": total_content.strip()})
                 _final_content, _final_thinking = _clean_response(
@@ -5883,7 +6711,12 @@ def is_chat_command(user_input: str) -> bool:
         return True
     if parse_models_command(raw)[0]:
         return True
-    if lower in ("/new", "/neu"):
+    # /new auch mit leading bot-mention prefix (z.B. "clawi: :new clawi" von Matrix Element)
+    import re as _re_isc
+    _no_prefix = _normalize_cmd(_re_isc.sub(r"^[@]?[a-zA-Z][a-zA-Z0-9_-]{1,30}\s*[:,]?\s+", "", raw, count=1).strip()).lower()
+    if lower in ("/new", "/neu") or lower.startswith(("/new ", "/neu ")):
+        return True
+    if _no_prefix in ("/new", "/neu") or _no_prefix.startswith(("/new ", "/neu ")):
         return True
     if lower in ("/schedules", "/aufgaben", "/jobs"):
         return True
@@ -5917,9 +6750,16 @@ def create_session(config: dict[str, Any] | None = None, project_dir: str | None
 def _should_append_exchange_to_memory(session: dict[str, Any], config: dict[str, Any]) -> bool:
     """Nur bei Web/API-Chat in Memory + mempalace schreiben, wenn der Nutzer explizit speichert.
 
-    Matrix, Discord, CLI, Scheduler: weiterhin immer persistieren (kein track-Flag).
+    Matrix, Discord, CLI: weiterhin immer persistieren (kein track-Flag).
+    Group-Mode: NIE persistieren — kein Personal-Memory aus fremden Räumen.
+    Scheduler (autonomous tasks): NIE persistieren — Boilerplate + Repo-Dumps
+    verschmutzen Identity-Memory (Bot würde User mit Tool-Subjects wie GitHub-Orgs verwechseln).
     """
     _ctx = (config.get("_chat_context") or session.get("chat_context") or {})
+    if _ctx.get("group_mode"):
+        return False
+    if config.get("_scheduled_task_prompt"):
+        return False
     _p = str(_ctx.get("platform") or "").strip().lower()
     if _p in ("web", "api"):
         return bool(session.get("_track_chat"))
@@ -5942,6 +6782,24 @@ def handle_user_input(
     user_input = _normalize_cmd(user_input.strip()) if user_input else user_input
     config = session["config"]
     project_dir = session.get("project_dir")
+
+    # Owner-only slash commands: in Gruppenräumen blocken (Owner-DMs + Web/API bleiben offen).
+    _ctx = config.get("_chat_context") or {}
+    if _ctx.get("group_mode"):
+        _raw_chk = _normalize_cmd((user_input or "").strip())
+        _lower = _raw_chk.lower()
+        _blocked = False
+        if _lower in ("/model", "/models"): _blocked = True
+        elif parse_model_switch(_raw_chk)[0] is not None: _blocked = True
+        elif parse_models_command(_raw_chk)[0]: _blocked = True
+        elif _lower in ("/schedules", "/aufgaben", "/jobs"): _blocked = True
+        elif _lower.startswith("/schedule ") or _lower.startswith("/aufgabe ") or _lower.startswith("/job "): _blocked = True
+        if _blocked:
+            return (
+                f"Befehl `{_raw_chk.split()[0]}` ist in Gruppenräumen deaktiviert. "
+                "Konfigurations- und Modell-Befehle laufen nur über Owner-DM oder Web-UI.",
+                session, None, None, None, None,
+            )
 
     # /model ohne Argument → aktuelles Modell anzeigen
     if user_input.strip().lower() == "/model":
@@ -6000,9 +6858,21 @@ def handle_user_input(
     if raw.lower() in ("/help", "/hilfe", "/?"):
         return _format_help(), session, None, None, None, None
 
-    if raw.lower() in ("/new", "/neu") and not allow_new_session:
-        return "", session, None, None, None, None
-    if raw.lower() in ("/new", "/neu"):
+    # /new + trailing bot-name/mention/whitespace (z.B. "/new clawi") als reines /new behandeln.
+    # Außerdem: Matrix-Element / Discord prefixen body bei @-Mention oft mit "BOTNAME: " oder
+    # "BOTNAME " (z.B. "clawi: :new clawi"). Vor dem /new-Check leading-mention-prefix abstrippen.
+    import re as _re_new
+    _stripped_for_check = _re_new.sub(r"^[@]?[a-zA-Z][a-zA-Z0-9_-]{1,30}\s*[:,]?\s+", "", raw, count=1)
+    _lower_raw = _normalize_cmd(_stripped_for_check.strip()).lower()
+    _is_new_cmd = _lower_raw in ("/new", "/neu") or _lower_raw.startswith(("/new ", "/neu "))
+    if _is_new_cmd and not allow_new_session:
+        # matrix/discord: Session-Erstellung verboten, aber Verlauf trotzdem leeren + Confirm senden
+        try:
+            session["messages"] = []
+        except Exception:
+            pass
+        return "🔄 Verlauf gelöscht.", session, None, None, None, None
+    if _is_new_cmd:
         # Slot-Cache invalidieren BEVOR neue Session erstellt wird
         try:
             _old_conv = (session.get("config") or {}).get("_chat_context", {}).get("conv_id")
@@ -6229,7 +7099,12 @@ def handle_user_input(
         _img_gen_available = bool(_get_img_models_ui(config))
         _saved_paths = _save_uploaded_images(config, images) if _img_gen_available else []
         if _saved_paths:
-            _paths_info = "\n".join(f"- `{p}`" for p in _saved_paths)
+            _ctx_up = config.get("_chat_context") or {}
+            if _ctx_up.get("group_mode"):
+                _display = [f"/workspace/images/uploads/{Path(p).name}" for p in _saved_paths]
+            else:
+                _display = _saved_paths
+            _paths_info = "\n".join(f"- `{p}`" for p in _display)
             rest = f"{rest}\n\n[Hochgeladenes Bild gespeichert unter:]\n{_paths_info}"
         rest, images = describe_images_with_vl_model(config, images, rest, model)
 

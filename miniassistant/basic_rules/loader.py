@@ -23,6 +23,7 @@ RULE_FILES = [
     "language.md",
     "subagent.md",
     "webhook.md",
+    "group_room.md",
 ]
 
 # RAM-Cache: {dateiname: inhalt}

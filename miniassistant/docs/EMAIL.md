@@ -2,6 +2,8 @@
 
 `email:` is a **top-level key** in `config.yaml` — NOT under `providers:`, NOT under `chat_clients:`. Use `save_config` to set it.
 
+**NOT available in group rooms** — `send_email` is excluded from `GROUP_ALLOWED_TOOLS`. The chat_loop additionally pattern-blocks `exec` commands that try to send mail via `mail`/`sendmail`/`mutt`/`swaks`/`smtplib`/`apt install mailutils`. In group rooms the bot may DRAFT email text inline; the user copies and sends manually. See `GROUP_ROOMS.md` → Communication boundary.
+
 ## Config structure
 
 **Required:** `email.accounts.<name>` with `imap_server`, `smtp_server`, `username`, `password`. Optional: `imap_port` (default 993), `smtp_port` (default 587), `ssl` (default true), `name` (display name). `email.default` sets the default account.

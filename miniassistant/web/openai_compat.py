@@ -279,6 +279,35 @@ def _make_stream_chunk(
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
+def _is_webui_meta_task(messages_raw: list[dict[str, Any]]) -> bool:
+    """Erkennt OpenWebUI-Hilfstasks (Titel-, Tag-, Query-, Autocomplete-, Follow-up-Generierung).
+    Diese kommen über denselben /v1/chat/completions-Endpoint, sollen aber NICHT den
+    Agent-Loop mit Tools auslösen — sonst triggert z.B. die Titel-Generierung eine Web-Suche.
+    Signatur: OpenWebUI-Task-Templates beginnen mit '### Task:' und enthalten strukturiertes
+    Output-Markup bzw. eine der bekannten Task-Phrasen."""
+    _last_user = ""
+    for m in reversed(messages_raw):
+        if isinstance(m, dict) and m.get("role") == "user":
+            c = m.get("content")
+            if isinstance(c, list):  # multimodal → nur Text-Teile
+                c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+            _last_user = str(c or "")
+            break
+    if "### Task:" not in _last_user:
+        return False
+    _markers = (
+        "Generate a concise",        # Titel
+        "broad tags categorizing",   # Tags
+        "search queries",            # Query-Generierung
+        "autocompletion system",     # Autocomplete
+        "follow-up questions",       # Follow-ups
+        "JSON format:",              # generisches JSON-Output
+        "### Output:",
+        "### Chat History:",
+    )
+    return any(_m in _last_user for _m in _markers)
+
+
 @router.post("/chat/completions")
 async def chat_completions(request: Request):
     _require_token(request)
@@ -310,6 +339,49 @@ async def chat_completions(request: Request):
             status_code=400,
             detail="No model specified and no default model configured",
         )
+
+    # OpenWebUI-Hilfstasks (Titel/Tags/Query/Autocomplete/Follow-up) NICHT durch den
+    # Agent-Loop schicken — sonst löst z.B. die Titel-Generierung eine Web-Suche aus.
+    # Stattdessen: ein einziger Modell-Call OHNE Tools/Agent-Prompt, Antwort direkt zurück.
+    if _is_webui_meta_task(messages_raw):
+        _meta_msgs, _ = _openai_messages_to_internal(messages_raw)
+        if not _meta_msgs:
+            raise HTTPException(status_code=400, detail="No user/assistant messages provided")
+        from miniassistant.web.app import _chat_executor as _meta_exec
+        from miniassistant.chat_loop import _dispatch_chat as _meta_dispatch
+        _loop_m = asyncio.get_event_loop()
+
+        def _run_meta() -> str:
+            _r = _meta_dispatch(
+                config, resolved, _meta_msgs,
+                system="Follow the task in the user message exactly. Output ONLY what is requested — no preamble, no tools, no explanations.",
+                think=False, tools=None, timeout=60.0,
+            )
+            return ((_r.get("message") or {}).get("content") or "").strip()
+
+        _meta_out = await _loop_m.run_in_executor(_meta_exec, _run_meta)
+        # think-Tags + Tool-Call-XML defensiv strippen (Title-Models leaken sonst <think>…)
+        _meta_out = _re.sub(r"(?is)<think>.*?</think>", "", _meta_out)
+        _meta_out = _strip_tool_call_xml(_meta_out).strip()
+        _meta_cid = _make_completion_id()
+        _meta_model = model_requested or resolved
+        _log.info("openai_compat: WebUI meta-task short-circuited (no tools), %d chars out", len(_meta_out))
+        if stream:
+            async def _meta_stream():
+                _c1 = {"id": _meta_cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                       "model": _meta_model,
+                       "choices": [{"index": 0, "delta": {"role": "assistant", "content": _meta_out}, "finish_reason": None}]}
+                yield f"data: {json.dumps(_c1, ensure_ascii=False)}\n\n"
+                _c2 = {"id": _meta_cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                       "model": _meta_model,
+                       "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                yield f"data: {json.dumps(_c2, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(
+                _meta_stream(), media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        return JSONResponse(_make_response(_meta_cid, _meta_model, _meta_out, None))
 
     # Memory/mempalace nur bei explizitem Wunsch (wie Web-Chat mit track)
     _persist_exchange = bool(body.get("persist_memory") or body.get("track"))

@@ -81,10 +81,12 @@ search_engines:
   vpn:
     url: https://search-vpn.example.org
 default_search_engine: main
-search_engine_strategy: first             # 'first' (default), 'random', or 'specific'
-                                          # first: use default engine; on no results, suggest others to user
-                                          # random: pick a random engine each request
-                                          # specific: always use default engine only, no fallback suggestion
+search_engine_strategy: first             # 'first' (default), 'roundrobin', 'fallback', 'random', 'specific'
+                                          # first:      default engine; on error/empty → 1 random fallback
+                                          # roundrobin: engines rotate per query (load-spread); fallback on error
+                                          # fallback:   default first, then all others sequentially on error/empty
+                                          # random:     random engine per query, no fallback
+                                          # specific:   only default engine, NEVER fallback
 
 scheduler: false                          # or { enabled: true }
 

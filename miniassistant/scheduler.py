@@ -209,27 +209,6 @@ def _run_prompt(
     # da response_text bei leerem Content das Thinking enthält und sonst in Matrix landet.
     content = result[4] if len(result) > 4 else None
 
-    # Strukturelle Erkennung: Hat das Modell Tools aufgerufen?
-    # Wenn nein aber Content vorhanden → wahrscheinlich Ankündigung statt Aktion.
-    msgs = session.get("messages", [])
-    tool_calls_made = any(m.get("role") == "tool" for m in msgs)
-    if not tool_calls_made and content and content.strip() not in _SILENT_SENTINELS:
-        logger.warning(
-            "Schedule: Modell hat KEINE Tools aufgerufen aber Text produziert (%d Zeichen) — sende Nudge",
-            len(content),
-        )
-        _NUDGE = (
-            "STOP. You described what you would do but did NOT call any tools. "
-            "Call the required tools RIGHT NOW and return only the actual result."
-        )
-        nudge_result = handle_user_input(session, _NUDGE)
-        nudge_content = nudge_result[4] if len(nudge_result) > 4 else None
-        if nudge_content and nudge_content.strip():
-            logger.info("Schedule: Nudge erfolgreich — %d Zeichen", len(nudge_content))
-            content = nudge_content
-        else:
-            logger.warning("Schedule: Nudge lieferte auch keinen Content — behalte Original")
-
     if not content or not content.strip():
         logger.warning("Schedule: Modell hat keinen Content produziert (nur Thinking oder leer)")
     return (content or "").strip()
@@ -531,8 +510,12 @@ def update_schedule_prompt(
     *,
     new_model: str | None = None,
     new_when: str | None = None,
+    new_room_id: str | None | object = ...,
+    new_channel_id: str | None | object = ...,
+    new_client: str | None | object = ...,
 ) -> tuple[bool, str]:
-    """Aktualisiert Prompt, Modell und/oder Zeitplan eines bestehenden Jobs."""
+    """Aktualisiert Prompt, Modell, Zeitplan und/oder Ziel (Raum/Channel/Client) eines bestehenden Jobs.
+    Sentinel-Default ... = Feld unverändert lassen. None = Feld löschen."""
     jobs = _load_jobs()
     job = next((j for j in jobs if j.get("id") == job_id), None)
     if not job:
@@ -544,6 +527,13 @@ def update_schedule_prompt(
             job["model"] = new_model
         else:
             job.pop("model", None)
+    for field, value in (("room_id", new_room_id), ("channel_id", new_channel_id), ("client", new_client)):
+        if value is ...:  # unchanged
+            continue
+        if value:
+            job[field] = value
+        else:
+            job.pop(field, None)
     new_trigger_type: str | None = None
     new_trigger_args: dict | None = None
     if new_when:

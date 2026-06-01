@@ -16,8 +16,11 @@ _lock = threading.Lock()
 
 
 def _log_path(config: dict[str, Any]) -> Path | None:
-    """Gibt den Pfad zur context.log zurück, oder None wenn deaktiviert."""
+    """Gibt den Pfad zur context.log zurück, oder None wenn deaktiviert.
+    Group-Mode: nicht loggen (vermeidet Vermischung mit Personal-Konversationen)."""
     if not (config.get("server") or {}).get("show_context"):
+        return None
+    if (config.get("_chat_context") or {}).get("group_mode"):
         return None
     config_dir = config.get("_config_dir") or ""
     if not config_dir:

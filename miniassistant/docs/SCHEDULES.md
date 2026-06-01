@@ -2,6 +2,8 @@
 
 Scheduled tasks are managed by the **schedule** tool and stored in `schedules.json` (config directory).
 
+**NOT available in group rooms** — `schedule` is excluded from `GROUP_ALLOWED_TOOLS`. Owner can use it in DM/agent mode. See `GROUP_ROOMS.md`.
+
 ## wait vs watch vs schedule
 
 | Tool | When to use | Duration |

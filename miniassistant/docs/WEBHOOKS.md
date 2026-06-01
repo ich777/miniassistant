@@ -58,6 +58,26 @@ Final prompt assembly: `extra_context + "\n\n" + (body.prompt or webhook.prompt)
 
 Token may also be passed via header `X-Webhook-Token: <token>` to keep it out of URL logs.
 
+### Foreign payloads (GitHub, Discord, Slack, generic senders)
+
+External services don't know our body schema. They POST their own JSON / form-encoded / text body.
+The receiver auto-extracts:
+
+- **Control fields** in JSON body (`prompt`, `extra_context`, `client`, `room_id`, `channel_id`, `silent`, `save_output`, `output_name`, `model`) → honored normally.
+- **Everything else** → wrapped into a `[INCOMING WEBHOOK PAYLOAD]` block and used as `extra_context`. Includes forwarded `X-*` headers and `User-Agent` so the prompt can read event type, signatures, source.
+- **Payload cap:** 20 000 chars (truncate marker appended if longer).
+
+Content-Types handled:
+| Type | Treatment |
+|------|-----------|
+| `application/json` | Parsed. Control keys split out; remainder is payload. Foreign-only JSON → whole body is payload. |
+| `application/x-www-form-urlencoded` | Parsed as form. Same split as JSON. |
+| anything else (`text/plain`, raw, …) | Raw body decoded as UTF-8, used as payload. |
+
+If the caller sets `extra_context` explicitly, that wins — auto-build is skipped.
+
+For external-service webhooks the **default prompt is effectively required** (GitHub won't send `prompt`). Status 400 `no prompt available` if no default and no `prompt` body field.
+
 ### Response (sync)
 
 ```json
@@ -167,6 +187,38 @@ webhook(action='create', name='img-gen', prompt='Generate a square 1024x1024 ima
 ```
 
 POST with the subject in `extra_context`, then GET `/webhook/<token>/last` returns the PNG.
+
+### GitHub PR notifications → Matrix
+
+Create:
+```
+webhook(action='create', name='gh-prs', client='matrix', room_id='!devs:matrix.org',
+        prompt='Summarize the GitHub event in 1 line. Event type is in X-GitHub-Event header. For pull_request: "<action>: <title> by <user.login>". For push: "<n> commits to <ref> by <pusher.name>". Skip if event is ping.')
+```
+
+Then at github.com → repo Settings → Webhooks → Add webhook:
+- Payload URL: `https://my-ma/webhook/<token>`
+- Content type: `application/json`
+- Events: choose what you care about
+
+GitHub auto-POSTs every selected event. Headers (`X-GitHub-Event`, `X-GitHub-Delivery`) + body land in the prompt as `[INCOMING WEBHOOK PAYLOAD]`. Bot summarizes, pushes to Matrix.
+
+### Sensor with conditional alerting
+
+Create:
+```
+webhook(action='create', name='temp-alert', client='matrix', room_id='!home:matrix.org', save_output=true,
+        prompt='If temp > 30 → reply with alarm message. Otherwise reply with exactly [NO_MESSAGE] (silent token, no Matrix push).')
+```
+
+Sensor:
+```
+curl -X POST https://my-ma/webhook/<token> \
+  -H 'Content-Type: application/json' \
+  -d '{"sensor":"livingroom","temp":24.7,"ts":1715856000}'
+```
+
+When `[NO_MESSAGE]` is returned the scheduler suppresses delivery; output still saved to file.
 
 ## Self-management via tool
 

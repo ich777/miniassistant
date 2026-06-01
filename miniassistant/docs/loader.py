@@ -40,6 +40,7 @@ DOC_FILES = [
     "WEB_FETCHING.md",
     "DIRECTIONS.md",
     "DOCUMENTS.md",
+    "GROUP_ROOMS.md",
 ]
 
 

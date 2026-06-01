@@ -301,18 +301,22 @@ def get_think_for_model(config: dict[str, Any], model_name: str) -> bool | None:
     return True
 
 
-def get_tools_schema(config: dict[str, Any]) -> list[dict[str, Any]]:
-    """Tool-Schema für exec, optional web_search, optional schedule, optional invoke_model (Subagenten)."""
+def get_tools_schema(config: dict[str, Any], *, allow: set[str] | None = None) -> list[dict[str, Any]]:
+    """Tool-Schema für exec, optional web_search, optional schedule, optional invoke_model (Subagenten).
+    allow: wenn gesetzt, nur Tools mit Namen in dieser Menge zurückgeben (Group-Mode-Whitelist)."""
     any_subagents = bool(config.get("subagents")) or any(
         (p.get("models") or {}).get("subagents")
         for p in (config.get("providers") or {}).values()
         if isinstance(p, dict)
     )
-    return _tools_schema(
+    schema = _tools_schema(
         config,
         config.get("scheduler"),
         subagents=any_subagents,
     )
+    if allow is not None:
+        schema = [t for t in schema if t.get("function", {}).get("name") in allow]
+    return schema
 
 
 def _tools_schema(
@@ -426,8 +430,10 @@ def _tools_schema(
                 "CANNOT fill forms or click buttons. Only if the site truly REQUIRES filling a form: "
                 "escalate to exec+Playwright (read docs/WEB_FETCHING.md). "
                 "Never guess URLs from memory — verify with web_search first. "
-                "Output is capped at max_chars (default 8000). If you see a '[... truncated: X of Y chars ...]' "
-                "marker and the missing content matters, re-call with max_chars set to the full Y value."
+                "Output is capped at max_chars (default 8000) and bounded by your context window. "
+                "If you see a '[... chars shown … remain …]' marker and need more, read the NEXT part by re-calling "
+                "with the same url and offset set to where the previous part ended — do NOT pull a whole large "
+                "document at once. Read only as much as the task actually needs."
             ),
             "parameters": {
                 "type": "object",
@@ -435,7 +441,8 @@ def _tools_schema(
                     "url": {"type": "string", "description": "Full URL to read (e.g. https://en.wikipedia.org/wiki/Topic)"},
                     "proxy": {"type": "string", "description": "Proxy name to use (from configured proxies). Omit to use the default proxy or direct connection."},
                     "js": {"type": "boolean", "description": "Set true for JS-heavy pages (SPAs, React/Vue/Angular apps) that need browser rendering. Only use when plain fetch returns empty or minimal content. Requires Playwright to be installed."},
-                    "max_chars": {"type": "integer", "description": "Max characters to return (default 8000). Raise when the truncation marker indicates important content was cut — the marker states the full length; pass that value here to get everything."},
+                    "max_chars": {"type": "integer", "description": "Max characters per call (default 8000). Capped to what fits the model's context window. For large documents read in successive chunks via offset, not one giant call."},
+                    "offset": {"type": "integer", "description": "Character offset to start from (default 0). Use the value shown in the truncation marker to read the next part of a large document."},
                 },
                 "required": ["url"],
             },
@@ -490,6 +497,92 @@ def _tools_schema(
                 },
             },
         })
+    schema.append({
+        "type": "function",
+        "function": {
+            "name": "search_chat_history",
+            "description": (
+                "Search the chat history of the CURRENT room/channel for a keyword or phrase. "
+                "Use ONLY when the user explicitly asks to find/search something in past messages "
+                "('such in chat nach X', 'find Y in history', 'was hat Alice über Z gesagt'). "
+                "Returns matching messages with ±2 lines of context. "
+                "For regex search: wrap query in slashes like `/pattern/` (case-insensitive). "
+                "Do NOT use this proactively or for greetings — only on explicit search requests."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Keyword or phrase to find. Wrap in /…/ for regex."},
+                    "max_scan": {"type": "integer", "description": "How many past messages to scan (10–500, default 200). Higher = slower but catches older mentions."},
+                },
+                "required": ["query"],
+            },
+        },
+    })
+    schema.append({
+        "type": "function",
+        "function": {
+            "name": "get_user_profile",
+            "description": (
+                "Fetch a user's display name and profile picture (avatar) by their platform ID. "
+                "GROUP-ROOMS ONLY (matrix/discord). Use when the user asks about another participant's "
+                "avatar/profile picture or asks you to use someone's avatar as image-edit source. "
+                "Pass the FULL platform ID: matrix → `@user:server.tld`, discord → numeric user ID string. "
+                "Returns display_name + avatar_path (e.g. `/workspace/avatars/<id>.png`) — pass that path "
+                "to `invoke_model(image_path=…)` for editing. Returns 'no avatar set' if user has none."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "Platform ID (matrix: @user:server, discord: numeric)"},
+                },
+                "required": ["user_id"],
+            },
+        },
+    })
+    schema.append({
+        "type": "function",
+        "function": {
+            "name": "read_recent_messages",
+            "description": (
+                "Fetch the last N messages of the CURRENT chat room/channel (Matrix or Discord). "
+                "Use when the user references prior context you did not see ('was sagst du dazu', 'lies das oben', "
+                "'was haben wir gerade besprochen', 'about that topic'). "
+                "Returns oldest→newest with sender, display name, body, and timestamp. "
+                "In group rooms with auto-context already enabled, call only if you need MORE than the auto-context provided. "
+                "Encrypted Matrix rooms without keys → body is empty; tell the user."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "How many messages to fetch (1–100, default 20)."},
+                },
+                "required": [],
+            },
+        },
+    })
+    schema.append({
+        "type": "function",
+        "function": {
+            "name": "get_room_last_fire",
+            "description": (
+                "Fetch the last automated fire (webhook or schedule) in the CURRENT chat room/channel, "
+                "including its full saved output. "
+                "Use when the user references something from a prior automated message in this room "
+                "('das von vorhin', 'die letzte Mail', 'antworte drauf', 'was war das Wetter') and you need "
+                "the original content to answer. "
+                "The system prompt 'Recent fires in this room' section shows pointers — call this tool to load "
+                "the actual output. Returns 'No recent ... fire in this room.' if nothing found."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["any", "webhook", "schedule"], "description": "'any' (default, picks most recent), 'webhook' only, or 'schedule' only"},
+                },
+                "required": [],
+            },
+        },
+    })
     wh_cfg = config.get("webhooks")
     if isinstance(wh_cfg, dict) and wh_cfg.get("enabled"):
         schema.append({
@@ -808,15 +901,17 @@ def get_subagent_tools_schema(config: dict[str, Any]) -> list[dict[str, Any]]:
                 "Read the content of a URL as clean text. "
                 "CANNOT fill forms or click buttons — use exec+Playwright for that. "
                 "Never guess or construct URLs from memory — verify with web_search first if unsure. "
-                "Output is capped at max_chars (default 8000); raise it when the truncation marker "
-                "shows important content was cut."
+                "Output is capped at max_chars (default 8000) and bounded by the context window. "
+                "If the truncation marker shows more remains, read the next part via offset — "
+                "do not pull a whole large document at once."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "Full URL to read"},
                     "proxy": {"type": "string", "description": "Proxy name to use (from configured proxies). Omit for default/direct."},
-                    "max_chars": {"type": "integer", "description": "Max characters to return (default 8000). Raise if the truncation marker shows important content was cut."},
+                    "max_chars": {"type": "integer", "description": "Max characters per call (default 8000). For large documents read in successive chunks via offset."},
+                    "offset": {"type": "integer", "description": "Character offset to start from (default 0). Use the value from the truncation marker to continue reading."},
                 },
                 "required": ["url"],
             },

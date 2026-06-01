@@ -45,9 +45,11 @@ invoke_model(model='EXACT_NAME_FROM_LIST', message='make the sky sunset orange',
 - `0.1–0.3` = subtle changes (color correction, minor touch-ups)
 - `0.4–0.6` = moderate changes (style transfer, object modifications)
 - `0.7–1.0` = major changes (heavy transformation, almost new image)
-- If omitted: the backend uses its default (typically ~0.5–0.75).
+- **System default when omitted on edit calls: `0.85`** — distill models (`flux-klein`, `qwen-image-edit`) need high strength for visible transformation; lower values often return the input nearly unchanged. Pass an explicit lower value only when the user asks for subtle changes.
 
-**Only pass `strength` when the user explicitly asks for subtle/strong changes.** Do NOT invent default values.
+**Edit model auto-selection:** when `image_path` is set and `model` is not specified, the system uses the FIRST model in the `image_generation:` config list (user controls ordering). Explicit `model='…'` is always honored.
+
+**Group-room path translation:** in group rooms, `image_path` must be a sandbox-relative path (`/workspace/...`). The system translates it to the host path under `<workspace>/groups/<sub>/` automatically. Refuses paths outside the room workspace.
 
 ## Parameter synonyms — what the user means
 
