@@ -5374,6 +5374,16 @@ async def _build_incoming_context(request: Request) -> tuple[dict, str]:
         try:
             body = await request.json()
         except Exception:
+            # Declared application/json but body won't parse. Don't swallow it —
+            # a non-empty broken body means the caller's fields (extra_context, prompt)
+            # would vanish silently. Empty body is fine (fire default prompt).
+            raw = b""
+            try:
+                raw = await request.body()
+            except Exception:
+                pass
+            if raw and raw.strip():
+                raise HTTPException(status_code=400, detail="invalid JSON body (Content-Type: application/json). Check shell quoting — nested single quotes break the payload.")
             body = None
         if isinstance(body, dict):
             controls = {k: body[k] for k in _WH_CONTROL_KEYS if k in body}
@@ -5687,6 +5697,99 @@ async def webhooks_page(request: Request):
                 f'<td>{last}</td>'
                 f'<td><code>{wid}</code> <button class="btn-run" data-id="{full_id}" data-has-default="{_has_default}" data-name="{_html.escape(w.get("name") or "", quote=True)}" title="Jetzt ausführen">&#9654;</button>{edit_btn}<button class="btn-del" data-id="{full_id}" title="Loeschen">&#10005;</button></td></tr>'
             )
+    test_options = ""
+    if enabled and items:
+        for w in items:
+            _tid = _escape(w.get("id", ""))
+            _tnm = _escape(w.get("name") or (w.get("id") or "")[:8])
+            test_options += f'<option value="{_tid}">{_tnm}</option>'
+    test_panel = "" if not (enabled and items) else (
+        '<details class="card" style="margin-bottom:1em;" open>'
+        '<summary style="font-size:1.05em;font-weight:600;cursor:pointer;">🧪 Live-Test (direkt aus dem Browser feuern)</summary>'
+        '<div style="padding:0.6em 0 0;">'
+        '<p style="margin:0 0 0.6em;color:var(--muted);font-size:0.88em;">Feuert echt gegen <code>' + _escape(_host_base) + '/webhook/&lt;token&gt;</code> — derselbe Pfad wie ein externer curl. '
+        'Prüft den JSON-Body <strong>bevor</strong> du sendest (ungültiges JSON wird serverseitig still verworfen → <code>extra_context</code> geht verloren). '
+        'Achtung: hat der Webhook ein Ziel (Raum/Channel), landet die Antwort dort.</p>'
+        '<div class="wh-form">'
+        '<label for="testHook">Webhook</label>'
+        '<select id="testHook">' + test_options + '</select>'
+        '<label for="testToken">Token</label>'
+        '<input type="text" id="testToken" placeholder="wird beim Auswählen geladen — oder manuell einfügen">'
+        '<label for="testBody">JSON-Body</label>'
+        '<textarea id="testBody" rows="4">{"prompt":"Antworte nur mit: WUFF"}</textarea>'
+        '</div>'
+        '<div style="margin:0.5em 0 0.3em;"><span id="testJsonState" style="font-size:0.82em;"></span></div>'
+        '<label style="display:block;font-size:0.8em;color:var(--muted);margin:0.3em 0 0.2em;">Äquivalenter curl:</label>'
+        '<pre style="background:var(--bg);padding:0.6em;border-radius:4px;overflow-x:auto;font-size:0.8em;margin:0;"><code id="testCurl"></code></pre>'
+        '<div style="display:flex;gap:0.5em;align-items:center;margin-top:0.6em;flex-wrap:wrap;">'
+        '<button class="btn btn-primary" id="testSend">▶ Senden</button>'
+        '<button class="btn btn-outline" id="testCurlCopy">📋 curl kopieren</button>'
+        '<span id="testStatus" style="font-size:0.85em;color:var(--muted);"></span>'
+        '</div>'
+        '<pre id="testResult" style="display:none;background:var(--bg);padding:0.6em;border-radius:4px;overflow-x:auto;font-size:0.82em;margin-top:0.6em;white-space:pre-wrap;"></pre>'
+        '</div></details>'
+    )
+    test_js = "" if not (enabled and items) else ("""
+    <script>
+    (function(){
+      var hostBase = "__HOSTBASE__";
+      var hookTokens = {};
+      var sel = document.getElementById("testHook");
+      if (!sel) return;
+      var tokIn = document.getElementById("testToken");
+      var bodyIn = document.getElementById("testBody");
+      var curlEl = document.getElementById("testCurl");
+      var jsonState = document.getElementById("testJsonState");
+      function curtok(){ return tokIn.value.trim() || "<TOKEN>"; }
+      function updateCurl(){
+        var b = bodyIn.value;
+        if (!b.trim()){ jsonState.textContent = ""; }
+        else { try { JSON.parse(b); jsonState.textContent = "\\u2713 g\\u00fcltiges JSON"; jsonState.style.color = "#2d8a4e"; }
+               catch(e){ jsonState.textContent = "\\u26a0 ung\\u00fcltiges JSON \\u2014 w\\u00fcrde serverseitig still verworfen (extra_context ginge verloren)"; jsonState.style.color = "#c53030"; } }
+        var bodyEsc = b.replace(/'/g, "'\\\\''");
+        curlEl.textContent = "curl -X POST " + hostBase + "/webhook/" + curtok() +
+          " \\\\\\n  -H \\"Content-Type: application/json\\" \\\\\\n  -d '" + bodyEsc + "'";
+      }
+      function loadToken(id){
+        if (!id) return;
+        if (hookTokens[id]){ tokIn.value = hookTokens[id]; updateCurl(); return; }
+        fetch("/api/webhook/" + encodeURIComponent(id) + "/token" + tq(), {credentials:"same-origin"})
+          .then(function(r){ return r.json(); })
+          .then(function(d){ if (d && d.token){ hookTokens[id] = d.token; tokIn.value = d.token; updateCurl(); } })
+          .catch(function(){});
+      }
+      sel.addEventListener("change", function(){ loadToken(sel.value); });
+      bodyIn.addEventListener("input", updateCurl);
+      tokIn.addEventListener("input", updateCurl);
+      document.getElementById("testCurlCopy").addEventListener("click", function(){
+        if (navigator.clipboard && navigator.clipboard.writeText)
+          navigator.clipboard.writeText(curlEl.textContent).then(function(){ appToast("curl kopiert","success"); }, function(){ appToast("Kopieren fehlgeschlagen","error"); });
+      });
+      document.getElementById("testSend").addEventListener("click", function(){
+        var tok = tokIn.value.trim();
+        if (!tok){ appToast("Token fehlt","error"); return; }
+        var b = bodyIn.value;
+        var status = document.getElementById("testStatus");
+        var res = document.getElementById("testResult");
+        var btn = this; btn.disabled = true; status.textContent = "l\\u00e4uft\\u2026"; status.style.color = "var(--muted)";
+        fetch(hostBase + "/webhook/" + encodeURIComponent(tok), {
+          method:"POST", headers:{"Content-Type":"application/json"}, body: b
+        }).then(function(r){
+          return r.text().then(function(t){
+            var pretty = t; try { pretty = JSON.stringify(JSON.parse(t), null, 2); } catch(e){}
+            res.style.display = "block";
+            res.textContent = "HTTP " + r.status + "\\n\\n" + pretty;
+            status.textContent = r.ok ? "\\u2713 fertig" : "\\u2717 HTTP " + r.status;
+            status.style.color = r.ok ? "#2d8a4e" : "#c53030";
+            btn.disabled = false;
+          });
+        }).catch(function(e){ status.textContent = "Fehler: " + e; status.style.color = "#c53030"; btn.disabled = false; });
+      });
+      if (sel.value) loadToken(sel.value);
+      updateCurl();
+    })();
+    </script>
+    """.replace("__HOSTBASE__", _host_base))
     enabled_form = "" if not enabled else (
         '<details class="card wh-create" style="margin-bottom:1em;">'
         '<summary style="font-size:1.05em;font-weight:600;cursor:pointer;">+ Neuer Webhook</summary>'
@@ -5769,11 +5872,12 @@ async def webhooks_page(request: Request):
         <h1>Webhooks</h1>
       </div>
       {enabled_form}
+      {test_panel}
       <details class="card" style="margin-bottom:1em;">
         <summary style="font-size:1.0em;font-weight:600;cursor:pointer;">📖 Beispiele</summary>
         <div style="padding:0.6em 0 0;">
           <p style="margin:0.2em 0 0.6em;color:var(--muted);font-size:0.9em;">
-            Beispiele nutzen <code>ADRESSE:PORT</code> als Platzhalter. Deine aktuelle Adresse ist: <code>{_host_base}</code> (kopieren und ersetzen oder anpassen je nach Reverse-Proxy/Domain).<br>
+            Adresse unten ist deine aktuelle: <code>{_host_base}</code> (anpassen je nach Reverse-Proxy/Domain).<br>
             <code>&lt;TOKEN&gt;</code> = der Token des Webhooks (Reveal-Button 👁 in der Tabelle).
             Body-Felder sind <strong>optional</strong> ausser markiert.
           </p>
@@ -5781,27 +5885,27 @@ async def webhooks_page(request: Request):
           <h3 style="margin:1em 0 0.3em;font-size:0.95em;">① Webhook <em>mit</em> Default Prompt</h3>
           <p style="margin:0 0 0.3em;font-size:0.88em;color:var(--muted);">Default Prompt im Webhook gespeichert → kein Body nötig. Einfachster Fall, z.B. cron-getriggerte Reports.</p>
           <pre style="background:var(--bg);padding:0.6em;border-radius:4px;overflow-x:auto;font-size:0.85em;"><code># Minimal — feuert mit dem gespeicherten Default-Prompt
-curl -X POST ADRESSE:PORT/webhook/&lt;TOKEN&gt;
+curl -X POST {_host_base}/webhook/&lt;TOKEN&gt;
 
 # Mit zusätzlichem Kontext (z.B. CI-Payload, Sensorwert, …)
-curl -X POST ADRESSE:PORT/webhook/&lt;TOKEN&gt; \\
+curl -X POST {_host_base}/webhook/&lt;TOKEN&gt; \\
   -H "Content-Type: application/json" \\
   -d '{{"extra_context":"build #4231 failed on commit abc123"}}'
 
 # Default-Prompt für DIESEN Lauf einmalig überschreiben
-curl -X POST ADRESSE:PORT/webhook/&lt;TOKEN&gt; \\
+curl -X POST {_host_base}/webhook/&lt;TOKEN&gt; \\
   -H "Content-Type: application/json" \\
   -d '{{"prompt":"Fasse das Folgende in 2 Sätzen zusammen","extra_context":"…lange Logdatei…"}}'</code></pre>
 
           <h3 style="margin:1.2em 0 0.3em;font-size:0.95em;">② Webhook <em>ohne</em> Default Prompt (open)</h3>
           <p style="margin:0 0 0.3em;font-size:0.88em;color:var(--muted);"><strong>Pflicht:</strong> <code>prompt</code> im Body. Sonst tut der Webhook nichts. Nutze das wenn jeder Aufruf eine andere Frage stellt.</p>
           <pre style="background:var(--bg);padding:0.6em;border-radius:4px;overflow-x:auto;font-size:0.85em;"><code># Pflicht-Body: prompt
-curl -X POST ADRESSE:PORT/webhook/&lt;TOKEN&gt; \\
+curl -X POST {_host_base}/webhook/&lt;TOKEN&gt; \\
   -H "Content-Type: application/json" \\
   -d '{{"prompt":"Welches Wetter ist heute in Wien?"}}'
 
 # Mit allen optionalen Feldern
-curl -X POST ADRESSE:PORT/webhook/&lt;TOKEN&gt; \\
+curl -X POST {_host_base}/webhook/&lt;TOKEN&gt; \\
   -H "Content-Type: application/json" \\
   -d '{{
     "prompt":      "Analysiere die Daten und antworte als JSON",
@@ -5840,10 +5944,10 @@ curl -X POST ADRESSE:PORT/webhook/&lt;TOKEN&gt; \\
 #                  Bei ping: still bleiben — antworte exakt [NO_MESSAGE]."
 # Client: matrix, Room: !abc:server, Silent: aus
 #
-# Payload URL für GitHub: ADRESSE:PORT/webhook/&lt;TOKEN&gt;
+# Payload URL für GitHub: {_host_base}/webhook/&lt;TOKEN&gt;
 #
 # GitHub schickt automatisch bei jedem Event:
-#   POST ADRESSE:PORT/webhook/&lt;TOKEN&gt;
+#   POST {_host_base}/webhook/&lt;TOKEN&gt;
 #   Headers: X-GitHub-Event: pull_request, X-GitHub-Delivery: &lt;uuid&gt;, X-Hub-Signature-256: …
 #   Body: {{"action":"opened","pull_request":{{"title":"Fix bug","user":{{"login":"alice"}}, …}}, …}}
 # → Modell schreibt z.B. "opened: 'Fix bug' von alice" in Matrix.</code></pre>
@@ -5856,20 +5960,20 @@ curl -X POST ADRESSE:PORT/webhook/&lt;TOKEN&gt; \\
 # Client: matrix, Room: !abc:server
 #
 # Slack schickt z.B.:
-#   POST ADRESSE:PORT/webhook/&lt;TOKEN&gt;
+#   POST {_host_base}/webhook/&lt;TOKEN&gt;
 #   Content-Type: application/x-www-form-urlencoded
 #   text=urgent+server+down&user_name=alice&trigger_word=alarm&channel_name=ops
 # → Modell pushed nach Matrix wenn Bedingung passt.
 
 # Manueller Test (Slack-ähnlich simulieren):
-curl -X POST ADRESSE:PORT/webhook/&lt;TOKEN&gt; \\
+curl -X POST {_host_base}/webhook/&lt;TOKEN&gt; \\
   -H "Content-Type: application/x-www-form-urlencoded" \\
   -d 'text=urgent+server+down&user_name=alice&trigger_word=alarm'</code></pre>
 
           <h4 style="margin:0.8em 0 0.2em;font-size:0.92em;">Discord Bot Interaction Forwarding</h4>
           <p style="margin:0 0 0.3em;font-size:0.85em;color:var(--muted);">Discord hat keine klassischen „Outgoing Webhooks“. Stattdessen: dein Discord-Bot/Slash-Command-Handler POSTet zu uns weiter (z.B. via discord-interactions library mit eigenem Proxy-Bot).</p>
           <pre style="background:var(--bg);padding:0.6em;border-radius:4px;overflow-x:auto;font-size:0.85em;"><code># Mit JSON-Forwarder, der Discord-Interaction payload weitergibt:
-curl -X POST ADRESSE:PORT/webhook/&lt;TOKEN&gt; \\
+curl -X POST {_host_base}/webhook/&lt;TOKEN&gt; \\
   -H "Content-Type: application/json" \\
   -d '{{"type":2,"data":{{"name":"summarize","options":[]}},"member":{{"user":{{"username":"alice"}}}},"channel_id":"123"}}'
 # → Modell liest type/data/options aus Payload, antwortet entsprechend.</code></pre>
@@ -5879,7 +5983,7 @@ curl -X POST ADRESSE:PORT/webhook/&lt;TOKEN&gt; \\
 #                  Sonst antworte exakt [NO_MESSAGE]."
 # Client: matrix, Room: !home:server, save_output: true (Log behalten)
 #
-curl -X POST ADRESSE:PORT/webhook/&lt;TOKEN&gt; \\
+curl -X POST {_host_base}/webhook/&lt;TOKEN&gt; \\
   -H "Content-Type: application/json" \\
   -d '{{"sensor":"livingroom","temp":24.7,"ts":1715856000}}'
 # → temp &lt;= 30: Modell antwortet [NO_MESSAGE] → kein Chat-Push, nur in Datei.
@@ -6204,6 +6308,7 @@ curl -X POST ADRESSE:PORT/webhook/&lt;TOKEN&gt; \\
       }});
     }});
     </script>
+    {test_js}
     {_THEME_JS}
     </body></html>
     """
