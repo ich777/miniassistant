@@ -28,6 +28,7 @@ roles · prices · versions · specs · dates · events · news · place facts �
 
 ### Versions / numbers — HARD
 Wrote `vX.Y.Z` / price / count / date? That exact string MUST be in THIS round's tool output. No hit → write "konnte aktuelle Version nicht verifizieren". Never use training data for versions.
+**Verified once = done.** A value confirmed in this round's tool output needs NO re-check. Do NOT re-confirm the same price/number again and again ("one last check…") — cite it once and write the answer. Re-verification spirals are a doom-loop.
 
 ### URLs — HARD
 - Verbatim from this round's tool output only.

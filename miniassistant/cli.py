@@ -75,15 +75,82 @@ def config_cmd(ctx: click.Context) -> None:
         _use_q = False
 
     try:
+        # Provider-Wahl: Ollama-Schnellpfad ODER eine andere API (OpenAI-kompatibel / Cloud).
+        # Bei "andere API" delegieren wir an den vollständigen Provider-Assistenten (providers add),
+        # der base_url, optionalen API-Key und Modelle abfragt — danach nur noch Bind/Agent/Onboarding.
+        _existing = config.get("providers") or {}
+        _has_ollama_cfg = isinstance(_existing.get("ollama"), dict) and _existing["ollama"].get("type")
+        _has_nonollama = any(
+            isinstance(p, dict) and (p.get("type") or "ollama") != "ollama"
+            for p in _existing.values()
+        )
+        _default_other = _has_nonollama and not _has_ollama_cfg
+        _other_label = "OpenAI-kompatible API oder Cloud (vLLM, llama.cpp, LiteLLM, OpenAI, DeepSeek, …)"
+        if _use_q:
+            _pc = questionary.select(
+                "Womit soll der Assistent reden?",
+                choices=["Ollama (lokal/Standard)", _other_label],
+                default=(_other_label if _default_other else "Ollama (lokal/Standard)"),
+            ).ask()
+            if _pc is None:
+                console.print("\n[yellow]Abgebrochen.[/yellow]")
+                return
+            _use_ollama = _pc.startswith("Ollama")
+        else:
+            _pc = _prompt_text("Provider: [1] Ollama lokal  [2] OpenAI-kompatibel/Cloud", default=("2" if _default_other else "1"), use_questionary=False)
+            _use_ollama = _pc.strip() != "2"
+
+        if not _use_ollama:
+            # Vollständiges Provider-Setup (base_url, optionaler API-Key, Modelle) via providers add
+            ctx.invoke(providers_add)
+            config = load_config(project_dir)
+            # Restkonfig: Bind + Agent-Verzeichnis (Rest später über `miniassistant config` / YAML)
+            server = config.get("server") or {}
+            host = _prompt_text("Server-Bind (127.0.0.1 = nur localhost, 0.0.0.0 = alle)", default=server.get("host", "127.0.0.1"), use_questionary=_use_q)
+            port = _prompt_text("Port", default=str(server.get("port", DEFAULT_BIND_PORT)), use_questionary=_use_q)
+            config["server"] = dict(server)
+            config["server"]["host"] = host
+            config["server"]["port"] = int(port) if str(port).strip().isdigit() else DEFAULT_BIND_PORT
+            if not config["server"].get("token"):
+                console.print("Token wird beim ersten Start automatisch generiert (oder in der Web-UI).")
+            default_agent = config.get("agent_dir") or (str(Path(get_config_dir()).expanduser() / "agent") if not project_dir else str(Path(project_dir).resolve() / "agent"))
+            agent_dir = _prompt_text("Agent-Verzeichnis (SOUL.md, IDENTITY.md, …)", default=default_agent, use_questionary=_use_q)
+            config["agent_dir"] = _expand_path(agent_dir)
+            config["onboarding_complete"] = True
+            save_path = save_config(config, project_dir)
+            console.print(f"\n[green]Config gespeichert:[/green] {save_path}")
+            agent_path = Path(config["agent_dir"])
+            agent_path.mkdir(parents=True, exist_ok=True)
+            for _n in ("SOUL.md", "IDENTITY.md", "TOOLS.md", "USER.md"):
+                _f = agent_path / _n
+                if not _f.exists():
+                    _f.write_text(f"# {_n}\n\n", encoding="utf-8")
+                    console.print(f"  Angelegt: {_f}")
+            console.print("\n[bold]Konfiguration gespeichert.[/bold] Nächste Schritte: [cyan]miniassistant chat[/cyan] oder [cyan]miniassistant serve[/cyan]")
+            return
+
         # Provider-Struktur initialisieren
         config["providers"] = config.get("providers") or {}
         config["providers"]["ollama"] = config["providers"].get("ollama") or {}
         prov = config["providers"]["ollama"]
         prov["type"] = prov.get("type", "ollama")
 
-        # Ollama-URL
+        # Ollama-URL: zuerst auto-detecten. Antwortet die Default-/bestehende URL, übernehmen
+        # wir sie ohne Prompt — kein erzwungenes Eintippen mehr. Nur fragen wenn nicht erreichbar.
         ollama_base = prov.get("base_url") or DEFAULT_OLLAMA_BASE_URL
-        base = _prompt_text("Ollama-URL (Host:Port)", default=ollama_base, use_questionary=_use_q)
+        _detected = False
+        try:
+            from miniassistant.ollama_client import list_models as _probe_models
+            if _probe_models(ollama_base):
+                _detected = True
+        except Exception:
+            _detected = False
+        if _detected:
+            base = ollama_base
+            console.print(f"[green]✓ Ollama erkannt unter[/green] [cyan]{ollama_base}[/cyan] [dim](Enter-frei übernommen — zum Ändern: miniassistant config erneut, oder Config-Datei editieren)[/dim]")
+        else:
+            console.print(f"[yellow]Ollama unter {ollama_base} nicht erreichbar.[/yellow] URL eingeben (oder Enter für Default/Cloud-Provider später):")
+            base = _prompt_text("Ollama-URL (Host:Port)", default=ollama_base, use_questionary=_use_q)
         if "://" not in base:
             base = f"http://{base}"
         prov["base_url"] = base.rstrip("/")
@@ -288,6 +355,7 @@ def config_cmd(ctx: click.Context) -> None:
         except ValueError:
             config["max_chars_per_file"] = DEFAULT_MAX_CHARS_PER_FILE
 
+        config["onboarding_complete"] = True
         save_path = save_config(config, project_dir)
         console.print(f"\n[green]Config gespeichert:[/green] {save_path}")
 
@@ -317,15 +385,26 @@ def chat(ctx: click.Context, model: str | None, show_thinking: bool) -> None:
     project_dir = ctx.obj.get("project_dir")
     config = load_config(project_dir)
 
-    # Onboarding-Prüfung
+    # Onboarding-Prüfung: nicht am Flag blocken, sondern an der Realität.
+    # Wenn schon ein nutzbares Modell konfiguriert ist (egal welcher Provider), läuft der Chat
+    # zero-config — kein erzwungener `config`-Durchlauf. Nur blocken wenn wirklich nichts da ist.
     if not config.get("onboarding_complete", False):
-        console.print("[bold yellow]⚠ Onboarding nicht abgeschlossen.[/bold yellow]")
-        console.print("Bitte zuerst die Ersteinrichtung durchführen:")
-        console.print("  • Web-UI: [cyan]miniassistant serve[/cyan] → Setup-Seite öffnen und speichern")
-        console.print("  • CLI:    [cyan]miniassistant config[/cyan]")
-        console.print()
-        console.print("[dim]Der Chat ist erst nach dem Onboarding verfügbar.[/dim]")
-        return
+        if resolve_model(config, None):
+            # Still markieren, damit der Hinweis nicht jedes Mal kommt.
+            config["onboarding_complete"] = True
+            try:
+                from miniassistant.config import save_config
+                save_config(config, project_dir)
+            except Exception:
+                pass
+        else:
+            console.print("[bold yellow]⚠ Kein Modell konfiguriert.[/bold yellow]")
+            console.print("Es ist noch kein Provider/Modell eingerichtet. Schnellster Weg:")
+            console.print("  • Lokales Ollama läuft? → [cyan]miniassistant config[/cyan] (Enter übernimmt die Defaults)")
+            console.print("  • Web-UI: [cyan]miniassistant serve[/cyan] → Setup-Seite")
+            console.print()
+            console.print("[dim]Sobald ein Modell konfiguriert ist, startet der Chat ohne weiteres Setup.[/dim]")
+            return
 
     session = create_session(config, project_dir)
     if model:

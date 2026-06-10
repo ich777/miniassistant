@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Schlanker lokaler Assistent für Ollama mit Agent-Dateien, /model, Token-Auth, Memory und sysvinit."
 readme = "README.md"
 requires-python = ">=3.10"
-license = "MIT"
+license = "LGPL-2.1-or-later"
 authors = [{ name = "MiniAssistant" }]
 keywords = ["ollama", "assistant", "llm", "local"]
 classifiers = [
@@ -54,7 +54,7 @@ docs = ["pypdf>=4", "pypdfium2>=4", "python-docx>=1"]
 miniassistant = "miniassistant.cli:main"
 
 [project.urls]
-Repository = "https://github.com/miniassistant/miniassistant"
+Repository = "https://github.com/ich777/miniassistant"
 
 [tool.setuptools.packages.find]
 where = ["."]

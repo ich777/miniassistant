@@ -45,7 +45,7 @@ The system automatically retries each `invoke_model` call once (with 5s delay) b
 If you still receive an error after the automatic retry:
 
 1. **Retry once more** yourself — call `invoke_model` again with the same model and message. Do NOT skip this step.
-2. If it fails again: tell the user (e.g. "Subagent qwen3-coder-max ist nicht erreichbar.") and ask how to proceed.
+2. If it fails again: tell the user (e.g. "Subagent qwen3-coder-max is not reachable.") and ask how to proceed.
 3. **Never do the subagent's work yourself** after a failure — ask the user first.
 4. **Never substitute subagent results with your own knowledge** or with data from other tools (e.g. web_search). The user explicitly requested subagent execution — honor that.
 

@@ -10,24 +10,24 @@
 
 ```yaml
 email:
-  default: privat
+  default: personal
   accounts:
-    privat:
+    personal:
       imap_server: imap.gmail.com
       imap_port: 993
       smtp_server: smtp.gmail.com
       smtp_port: 587
-      username: ich@gmail.com
-      password: app_passwort
+      username: me@gmail.com
+      password: app_password
       ssl: true
-      name: Max Mustermann
-    arbeit:
-      imap_server: imap.firma.de
+      name: John Doe
+    work:
+      imap_server: imap.company.com
       imap_port: 993
-      smtp_server: smtp.firma.de
+      smtp_server: smtp.company.com
       smtp_port: 587
-      username: max@firma.de
-      password: passwort
+      username: john@company.com
+      password: password
       ssl: true
 ```
 
@@ -38,21 +38,21 @@ Use the **`send_email` tool** — do NOT write Python scripts, do NOT use `exec`
 **When the user asks to write/send an email:**
 
 1. **Pick the account** — use the account the user named, or omit `account` for default
-2. **Generate a subject** — short keywords only (3–6 words max), never the full message text. e.g. "Kurze Begrüßung" or "Frage wegen Projekt X"
+2. **Generate a subject** — short keywords only (3–6 words max), never the full message text. e.g. "Quick hello" or "Question about project X"
 3. **Write the email** — compose the full text based on the user's request; make it natural and appropriate (formal/casual depending on context)
 4. **Send it** via `send_email(to, subject, body, account?)` — credentials are loaded automatically
 5. **Confirm** — tell the user: sent from which account, to whom, subject
 
 **Examples:**
 ```
-send_email(to="xyz@example.com", subject="Kurze Begrüßung", body="Hallo Christoph, ...")
-send_email(to="chef@firma.de", subject="Update Projekt X", body="...", account="arbeit")
+send_email(to="xyz@example.com", subject="Quick hello", body="Hi Chris, ...")
+send_email(to="boss@company.com", subject="Update project X", body="...", account="work")
 ```
 
 **User says → what to do:**
-- "Schreib eine Mail an xyz@xyz.xyz und bedanke dich für..." → compose thank-you email, generate subject, send from default account
-- "Schreib von meinem Account 'arbeit' an ..." → use `account="arbeit"`
-- "Schreib eine formelle/informelle Mail an ..." → adjust tone accordingly
+- "Write an email to xyz@xyz.xyz and thank them for..." → compose thank-you email, generate subject, send from default account
+- "Send from my account 'work' to ..." → use `account="work"`
+- "Write a formal/informal email to ..." → adjust tone accordingly
 - Subject not mentioned by user → generate one from context — always short keywords, never a full sentence
 
 ## Reading email
@@ -67,29 +67,29 @@ Use the **`read_email` tool** — do NOT write Python scripts.
 - `mark_read` — mark fetched emails as read on server (default: true)
 
 **IMAP search criteria — use the right one:**
-- User says "ungelesene Mails" / "neue Mails" → `filter="UNSEEN"`
-- User says "gelesene Mails" → `filter="SEEN"`
-- User says "alle Mails" / "Posteingang" → `filter="ALL"`
-- User says "Mails von xyz@..." → `filter="FROM \"xyz@...\""`
-- User says "Mails mit Betreff ..." → `filter="SUBJECT \"...\""`
+- User asks for "unread mails" / "new mails" → `filter="UNSEEN"`
+- User asks for "read mails" → `filter="SEEN"`
+- User asks for "all mails" / "inbox" → `filter="ALL"`
+- User asks for "mails from xyz@..." → `filter="FROM \"xyz@...\""`
+- User asks for "mails with subject ..." → `filter="SUBJECT \"...\""`
 
 **Examples:**
 ```
 read_email()                                          # unread, default account
 read_email(filter="ALL", count=10)                    # last 10, all
-read_email(filter="FROM \"chef@firma.de\"", account="arbeit")  # from boss, work account
+read_email(filter="FROM \"boss@company.com\"", account="work")  # from boss, work account
 read_email(filter="UNSEEN", mark_read=false)          # peek without marking as read
 ```
 
 ## Scheduled email monitoring
 
-For recurring email checks (e.g. "prüf meine Mails alle 30 Minuten"), use `schedule` with a prompt that calls `read_email`.
+For recurring email checks (e.g. "check my mail every 30 minutes"), use `schedule` with a prompt that calls `read_email`.
 
 **How tracking works:** `read_email` with `filter="UNSEEN"` + `mark_read=true` (default) automatically tracks which emails are new — fetched emails are marked as SEEN on the server and won't appear again on the next check.
 
 **Schedule examples:**
 
-User says "prüf meine Mails alle 30 Minuten":
+User says "check my mail every 30 minutes":
 ```
 schedule(
   action='create',
@@ -98,23 +98,23 @@ schedule(
 )
 ```
 
-User says "prüf mein Arbeit-Konto alle 15 Minuten":
+User says "check my work account every 15 minutes":
 ```
 schedule(
   action='create',
   when='*/15 * * * *',
-  prompt='Use read_email(filter="UNSEEN", account="arbeit") to check for new emails on the "arbeit" account. Summarize each new message. If none: respond with EXACTLY [NO_MESSAGE] (scheduler suppresses it).'
+  prompt='Use read_email(filter="UNSEEN", account="work") to check for new emails on the "work" account. Summarize each new message. If none: respond with EXACTLY [NO_MESSAGE] (scheduler suppresses it).'
 )
 ```
 
 ## Auto-reply (via schedule)
 
-User says "richte einen Auto-Responder für Mails von chef@firma.de ein":
+User says "set up an auto-responder for emails from boss@company.com":
 ```
 schedule(
   action='create',
   when='*/15 * * * *',
-  prompt='Use read_email(filter="UNSEEN FROM \"chef@firma.de\"", account="arbeit") to check for new emails from chef@firma.de. For each new email: send an auto-reply using send_email(to=sender_address, subject="Re: " + original_subject, body="Nachricht erhalten, ich melde mich innerhalb von 24 Stunden.", account="arbeit"). mark_read=true ensures no duplicate replies.'
+  prompt='Use read_email(filter="UNSEEN FROM \"boss@company.com\"", account="work") to check for new emails from boss@company.com. For each new email: send an auto-reply using send_email(to=sender_address, subject="Re: " + original_subject, body="Message received, I will get back to you within 24 hours.", account="work"). mark_read=true ensures no duplicate replies.'
 )
 ```
 

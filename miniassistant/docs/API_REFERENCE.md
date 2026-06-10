@@ -9,7 +9,7 @@ Base URL: `http://<HOST>:<PORT>` (from `server.host` and `server.port` in config
 curl -s -X POST http://localhost:8765/api/chat \
   -H "Authorization: Bearer SECRET" \
   -H "Content-Type: application/json" \
-  -d '{"message": "Wie wird das Wetter morgen?"}'
+  -d '{"message": "What is the weather tomorrow?"}'
 ```
 
 Response: `{ "response": "...", "session_id": "...", "thinking": "..." }`
@@ -22,7 +22,7 @@ Use `session_id` in subsequent requests to continue the conversation.
 curl -s -N -X POST http://localhost:8765/api/chat/stream \
   -H "Authorization: Bearer SECRET" \
   -H "Content-Type: application/json" \
-  -d '{"message": "Erkläre Docker", "session_id": "optional-id"}'
+  -d '{"message": "Explain Docker", "session_id": "optional-id"}'
 ```
 
 Returns NDJSON lines: `{"type":"thinking","content":"..."}`, `{"type":"content","content":"..."}`, `{"type":"done",...}`.
@@ -43,31 +43,31 @@ curl -s http://localhost:8765/api/ollama/models \
   -H "Authorization: Bearer SECRET"
 ```
 
-## OpenAI-kompatible API
+## OpenAI-compatible API
 
-MiniAssistant bietet unter `/v1/` eine OpenAI-kompatible Schnittstelle mit vollem Tool-Support
-(exec, web_search, read_url, etc.). Damit funktionieren Tools wie Open WebUI, Continue.dev,
-Cursor, Chatbox (Android/iOS), Cumbersome (iOS) und das openai Python SDK direkt.
+MiniAssistant exposes an OpenAI-compatible interface under `/v1/` with full tool support
+(exec, web_search, read_url, etc.). This lets tools like Open WebUI, Continue.dev,
+Cursor, Chatbox (Android/iOS), Cumbersome (iOS) and the openai Python SDK work directly.
 
 ```bash
-# Modelle auflisten (inkl. Aliases/Kurznamen)
+# List models (incl. aliases/short names)
 curl -s http://localhost:8765/v1/models \
   -H "Authorization: Bearer SECRET"
 
-# Chat Completion (model kann ein Alias wie "fast" sein)
+# Chat completion (model can be an alias like "fast")
 curl -s http://localhost:8765/v1/chat/completions \
   -H "Authorization: Bearer SECRET" \
   -H "Content-Type: application/json" \
-  -d '{"model": "fast", "messages": [{"role": "user", "content": "Hallo!"}]}'
+  -d '{"model": "fast", "messages": [{"role": "user", "content": "Hello!"}]}'
 
 # Streaming
 curl -s -N http://localhost:8765/v1/chat/completions \
   -H "Authorization: Bearer SECRET" \
   -H "Content-Type: application/json" \
-  -d '{"model": "fast", "stream": true, "messages": [{"role": "user", "content": "Hallo!"}]}'
+  -d '{"model": "fast", "stream": true, "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
-Der Agent-Kontext (SOUL, IDENTITY, TOOLS, USER, Memory) wird automatisch als System-Prompt vorgeschaltet.
+The agent context (SOUL, IDENTITY, TOOLS, USER, Memory) is automatically prepended as the system prompt.
 Details: [OPENAI_API.md](../../OPENAI_API.md)
 
 ## Client-side tool execution
@@ -95,5 +95,5 @@ In a schedule prompt, the assistant runs with full tool access. To trigger from 
 curl -s -X POST http://localhost:8765/api/chat \
   -H "Authorization: Bearer SECRET" \
   -H "Content-Type: application/json" \
-  -d '{"message": "Das Backup ist fertig. Bitte prüfe ob /backup/latest aktuell ist."}'
+  -d '{"message": "The backup finished. Please check whether /backup/latest is up to date."}'
 ```

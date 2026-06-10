@@ -442,7 +442,7 @@ def _require_token(request: Request) -> str:
     raise HTTPException(status_code=401, detail="Invalid or missing token")
 
 
-_TOKEN_COOKIE_PAGES = {"/", "/chat", "/chats", "/config", "/config/raw", "/schedules", "/webhooks", "/rooms", "/onboarding", "/logs", "/nutzung", "/workspace"}
+_TOKEN_COOKIE_PAGES = {"/", "/chat", "/chats", "/config", "/config/raw", "/schedules", "/webhooks", "/rooms", "/onboarding", "/logs", "/nutzung", "/workspace", "/agent"}
 
 
 @app.middleware("http")
@@ -599,7 +599,7 @@ async def index(request: Request):
         cc = cfg.get("chat_clients") or {}
         rooms_visible = bool((cc.get("matrix") or {}).get("enabled") or (cc.get("discord") or {}).get("enabled"))
         rooms_link = ('<li><a href="/rooms' + tq + '">Räume &amp; Channels</a></li>') if rooms_visible else ""
-        config_links = '<li><a href="/config' + tq + '">Konfiguration</a></li><li><a href="/nutzung' + tq + '">Nutzung</a></li><li><a href="/schedules' + tq + '">Geplante Jobs</a></li>' + wh_link + rooms_link + '<li><a href="/workspace' + tq + '">Workspace Explorer</a></li><li><a href="/logs' + tq + '">Logs</a></li>'
+        config_links = '<li><a href="/config' + tq + '">Konfiguration</a></li><li><a href="/nutzung' + tq + '">Nutzung</a></li><li><a href="/schedules' + tq + '">Geplante Jobs</a></li>' + wh_link + rooms_link + '<li><a href="/agent' + tq + '">Vorgaben &amp; Dateien</a></li><li><a href="/workspace' + tq + '">Workspace Explorer</a></li><li><a href="/logs' + tq + '">Logs</a></li>'
     logout_btn = '<button type="button" class="btn btn-outline" id="logout-btn" style="margin-left:0.5em;">Logout</button>' if is_authed else ""
     html = f"""
     <!DOCTYPE html>
@@ -1072,6 +1072,8 @@ async def config_form_page(request: Request):
         {{ n:"respond_in_input_language", t:"bool", l:"respond_in_input_language" }},
         {{ n:"doc_max_chars", t:"int", l:"doc_max_chars" }},
         {{ n:"doc_max_pages_render", t:"int", l:"doc_max_pages_render" }},
+        {{ n:"image_edit_strength", t:"float", l:"image_edit_strength (global, 0-1; 1.0 = voller Denoise. Pro Modell via model_options im Raw-YAML)" }},
+        {{ n:"image_edit_max_edge", t:"int", l:"image_edit_max_edge (max. Kantenlänge Quellbild beim Edit, Default 2048)" }},
     ]}},
   ];
 
@@ -2922,7 +2924,8 @@ def _chat_stream_generator(session_id: str, session: dict, message: str, images:
 def _chat_stream_generator_locked(session_id: str, session: dict, message: str, images: list | None = None):
     """Interner Generator (mit Session-Lock gehalten)."""
     import json as _json
-    for ev in chat_round_stream(
+    from miniassistant.secret_mask import mask_stream_events as _mask_stream_events
+    for ev in _mask_stream_events(chat_round_stream(
         config=session["config"],
         messages=session["messages"],
         system_prompt=session["system_prompt"],
@@ -2930,7 +2933,7 @@ def _chat_stream_generator_locked(session_id: str, session: dict, message: str, 
         user_content=message,
         project_dir=session.get("project_dir"),
         images=images,
-    ):
+    ), session["config"]):
         out = dict(ev, session_id=session_id)
         if ev.get("type") == "done":
             _done_msgs = ev.get("new_messages", session["messages"])
@@ -4518,6 +4521,10 @@ async def workspace_page(request: Request):
 .ws-sort-bar select {{font-size:0.75rem;padding:0.15rem 0.3rem;border:1px solid var(--border);border-radius:3px;background:var(--bg);color:var(--text);cursor:pointer}}
 .ws-sort-bar button {{font-size:0.75rem;padding:0.15rem 0.4rem;border:1px solid var(--border);border-radius:3px;background:var(--bg);color:var(--text);cursor:pointer;line-height:1;white-space:nowrap}}
 .ws-sort-bar button:hover {{color:var(--primary);border-color:var(--primary)}}
+.ws-modal {{position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:10000;display:flex;align-items:center;justify-content:center}}
+.ws-modal-box {{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:1.3rem;max-width:420px;box-shadow:var(--shadow)}}
+.ws-modal-msg {{margin-bottom:1rem;color:var(--text);font-size:0.95rem;word-break:break-word}}
+.ws-modal-btns {{display:flex;gap:0.6rem;justify-content:flex-end}}
 </style>
 <script src="/static/marked.umd.js"></script>
     <script src="/static/purify.min.js"></script>
@@ -4553,9 +4560,31 @@ async def workspace_page(request: Request):
   </div>
 </div>
 </div>
+<div id="ws-modal" class="ws-modal" style="display:none">
+  <div class="ws-modal-box">
+    <div id="ws-modal-msg" class="ws-modal-msg"></div>
+    <div class="ws-modal-btns">
+      <button id="ws-modal-no" class="btn btn-outline">Abbrechen</button>
+      <button id="ws-modal-yes" class="btn btn-primary">Ja</button>
+    </div>
+  </div>
+</div>
 <script>
 var WS_TOKEN = {repr(token_val)};
 var WS_CURRENT_PATH = '';
+
+function wsConfirm(msg) {{
+  return new Promise(function(resolve) {{
+    var m = document.getElementById('ws-modal');
+    document.getElementById('ws-modal-msg').textContent = msg;
+    m.style.display = 'flex';
+    var yes = document.getElementById('ws-modal-yes');
+    var no = document.getElementById('ws-modal-no');
+    function cleanup(val) {{ m.style.display = 'none'; yes.onclick = null; no.onclick = null; resolve(val); }}
+    yes.onclick = function() {{ cleanup(true); }};
+    no.onclick = function() {{ cleanup(false); }};
+  }});
+}}
 
 function wsGetSort() {{
   return {{
@@ -4732,8 +4761,8 @@ function wsLoadTrash() {{
     .catch(function(err) {{ tree.innerHTML = '<div class="ws-empty">Fehler: ' + wsEscape(String(err)) + '</div>'; }});
 }}
 
-function wsDeleteFile(path) {{
-  if (!confirm('Datei in den Papierkorb verschieben?')) return;
+async function wsDeleteFile(path) {{
+  if (!(await wsConfirm('Datei „' + path + '“ in den Papierkorb verschieben?'))) return;
   fetch(wsApiUrl('delete'), {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{path:path}})}})
     .then(function(r) {{ return r.json(); }})
     .then(function(data) {{
@@ -4744,8 +4773,8 @@ function wsDeleteFile(path) {{
     .catch(function(err) {{ alert('Fehler: ' + err); }});
 }}
 
-function wsEmptyTrash() {{
-  if (!confirm('Papierkorb wirklich leeren? Alle Dateien werden endgültig gelöscht.')) return;
+async function wsEmptyTrash() {{
+  if (!(await wsConfirm('Papierkorb wirklich leeren? Alle Dateien werden endgültig gelöscht.'))) return;
   fetch(wsApiUrl('trash/empty'), {{method:'POST',headers:{{'Content-Type':'application/json'}}}})
     .then(function(r) {{ return r.json(); }})
     .then(function(data) {{
@@ -5063,6 +5092,361 @@ async def api_workspace_trash_empty(request: Request):
         else:
             item.unlink()
     return JSONResponse({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Vorgaben-Editor: SOUL/IDENTITY/TOOLS/USER, basic_rules, directions, docs, prefs
+# bearbeiten (token-authed, Pfad-validiert, explizites Speichern + Bestätigung im UI).
+# ---------------------------------------------------------------------------
+_AGENT_EDIT_EXTS = {".md", ".txt", ".yaml", ".yml"}
+# (Label, Unterverzeichnis | "" = top-level, neue Dateien erlauben, löschbar→Papierkorb)
+# Reihenfolge = Anzeige-Reihenfolge. Neue Dateien + Löschen nur bei Prefs/Directions:
+# Basics + Regeln sind fix, Docs werden vom agent_loader aus einer festen Liste geladen.
+_AGENT_EDIT_ROOTS = [
+    ("Basics", "", False, False),
+    ("Docs", "docs", False, False),
+    ("Regeln", "basic_rules", False, False),
+    ("Prefs", "prefs", True, True),
+    ("Directions", "directions", True, True),
+]
+_AGENT_EDIT_SUBS = {r[1] for r in _AGENT_EDIT_ROOTS}
+_AGENT_DELETABLE_SUBS = {r[1] for r in _AGENT_EDIT_ROOTS if r[3]}
+
+
+def _agent_dir_resolved(config: dict) -> "Path | None":
+    ad = (config.get("agent_dir") or "").strip()
+    return Path(ad).expanduser().resolve() if ad else None
+
+
+def _agent_safe_target(config: dict, rel: str) -> "Path | None":
+    """Validiert rel-Pfad: innerhalb agent_dir, erlaubte Extension, in erlaubtem Root.
+    Verhindert Path-Traversal und Schreiben in memory/mempalace/binäre Dateien."""
+    base = _agent_dir_resolved(config)
+    if not base:
+        return None
+    rel = (rel or "").strip().lstrip("/")
+    if not rel:
+        return None
+    target = (base / rel).resolve()
+    if not _is_path_within(target, base):
+        return None
+    if target.suffix.lower() not in _AGENT_EDIT_EXTS:
+        return None
+    try:
+        parts = target.relative_to(base).parts
+    except ValueError:
+        return None
+    if len(parts) == 1:
+        sub = ""  # top-level (SOUL.md etc.)
+    elif len(parts) == 2:
+        sub = parts[0]
+    else:
+        return None  # nur eine Verzeichnisebene tief
+    if sub not in _AGENT_EDIT_SUBS:
+        return None
+    return target
+
+
+@app.get("/api/agent/files")
+async def api_agent_files(request: Request):
+    """Listet die editierbaren Vorgaben-Dateien, gruppiert nach Kategorie."""
+    _require_token(request)
+    config = load_config()
+    base = _agent_dir_resolved(config)
+    if not base or not base.exists():
+        return JSONResponse({"agent_dir": str(base or ""), "groups": []})
+    groups = []
+    for label, sub, allow_new, deletable in _AGENT_EDIT_ROOTS:
+        d = base if sub == "" else (base / sub)
+        items = []
+        if d.exists() and d.is_dir():
+            for p in sorted(d.iterdir(), key=lambda x: x.name.lower()):
+                if not p.is_file() or p.name.startswith("."):
+                    continue
+                if p.suffix.lower() not in _AGENT_EDIT_EXTS:
+                    continue
+                items.append({"name": p.name, "path": str(p.relative_to(base)), "bytes": p.stat().st_size})
+        groups.append({"label": label, "sub": sub, "allow_new": allow_new, "deletable": deletable, "items": items})
+    return JSONResponse({"agent_dir": str(base), "groups": groups})
+
+
+@app.get("/api/agent/file")
+async def api_agent_file_get(request: Request):
+    """Liefert den Inhalt einer Vorgaben-Datei."""
+    _require_token(request)
+    config = load_config()
+    target = _agent_safe_target(config, request.query_params.get("path", ""))
+    if not target:
+        raise HTTPException(status_code=400, detail="invalid path")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        content = target.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return JSONResponse({"path": request.query_params.get("path", ""), "content": content, "bytes": target.stat().st_size})
+
+
+@app.post("/api/agent/file")
+async def api_agent_file_save(request: Request):
+    """Speichert eine Vorgaben-Datei (atomar). Legt neue Dateien in erlaubten Roots an."""
+    _require_token(request)
+    config = load_config()
+    body = await request.json()
+    rel = (body.get("path") or "").strip()
+    content = body.get("content")
+    if not isinstance(content, str):
+        raise HTTPException(status_code=400, detail="content required")
+    if len(content.encode("utf-8")) > 1_000_000:
+        raise HTTPException(status_code=413, detail="content too large (max 1 MB)")
+    target = _agent_safe_target(config, rel)
+    if not target:
+        raise HTTPException(status_code=400, detail="invalid path")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(str(tmp), str(target))
+    except Exception as e:
+        _log.error("Vorgaben-Datei speichern fehlgeschlagen: %s", e)
+        raise HTTPException(status_code=500, detail="save failed")
+    return JSONResponse({"ok": True, "path": rel, "bytes": target.stat().st_size})
+
+
+@app.post("/api/agent/delete")
+async def api_agent_file_delete(request: Request):
+    """Verschiebt eine Vorgaben-Datei in den Papierkorb. NUR für prefs/ und directions/ erlaubt."""
+    _require_token(request)
+    config = load_config()
+    body = await request.json()
+    rel = (body.get("path") or "").strip()
+    target = _agent_safe_target(config, rel)
+    if not target:
+        raise HTTPException(status_code=400, detail="invalid path")
+    base = _agent_dir_resolved(config)
+    parts = target.relative_to(base).parts
+    sub = parts[0] if len(parts) == 2 else ""
+    if sub not in _AGENT_DELETABLE_SUBS:
+        raise HTTPException(status_code=403, detail="deletion not allowed for this category")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    trash_dir = Path(config.get("trash_dir") or "~/.trash").expanduser().resolve()
+    trash_dir.mkdir(parents=True, exist_ok=True)
+    dest = trash_dir / target.name
+    i = 1
+    while dest.exists():
+        dest = trash_dir / f"{target.stem}_{i}{target.suffix}"
+        i += 1
+    try:
+        shutil.move(str(target), str(dest))
+    except Exception as e:
+        _log.error("Vorgaben-Datei löschen fehlgeschlagen: %s", e)
+        raise HTTPException(status_code=500, detail="delete failed")
+    return JSONResponse({"ok": True, "trashed": str(dest.name)})
+
+
+_AGENT_PAGE_TEMPLATE = """<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Vorgaben – MiniAssistant</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="/favicon.ico">
+<style>
+__COMMON_CSS__
+.container { max-width: 1200px !important; }
+.ag-layout { display:flex; gap:1rem; align-items:flex-start; height:calc(100vh - 170px); }
+.ag-list { width:260px; flex-shrink:0; background:var(--card); border:1px solid var(--border); border-radius:var(--radius); overflow-y:auto; height:100%; }
+.ag-editor { flex:1; min-width:0; display:flex; flex-direction:column; height:100%; }
+.ag-ghdr { font-size:0.72rem; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); padding:0.7rem 0.85rem 0.2rem; font-weight:700; }
+.ag-list a { display:block; padding:0.4rem 0.9rem; color:var(--text); text-decoration:none; font-size:0.86rem; cursor:pointer; border-left:3px solid transparent; word-break:break-all; }
+.ag-list a:hover { background:var(--border); color:var(--primary); }
+.ag-list a.active { background:var(--primary); color:#fff; border-left-color:var(--primary); }
+.ag-frow { display:flex; align-items:stretch; }
+.ag-frow > a { flex:1; min-width:0; }
+.ag-del { background:none; border:none; cursor:pointer; padding:0 0.7rem; color:var(--muted); font-size:0.82rem; flex-shrink:0; line-height:1; }
+.ag-del:hover { color:var(--danger); }
+.ag-newbtn { display:block; width:calc(100% - 1.7rem); margin:0.35rem 0.85rem 0.5rem; padding:0.35rem; font-size:0.78rem; background:transparent; border:1px dashed var(--border); border-radius:var(--radius); color:var(--muted); cursor:pointer; }
+.ag-newbtn:hover { color:var(--primary); border-color:var(--primary); }
+.ag-ta { flex:1; width:100%; font-family:'SF Mono','Fira Code','Cascadia Code',monospace; font-size:13px; padding:0.8rem; border:1.5px solid var(--border); border-radius:var(--radius); background:var(--card); color:var(--text); outline:none; resize:none; line-height:1.5; white-space:pre; overflow:auto; }
+.ag-ta:focus { border-color:var(--primary); }
+.ag-bar { display:flex; align-items:center; gap:0.8rem; margin-top:0.6rem; flex-shrink:0; }
+.ag-fname { font-weight:600; color:var(--primary); font-size:0.92rem; word-break:break-all; flex:1; }
+.ag-status { font-size:0.85rem; color:var(--muted); white-space:nowrap; }
+.ag-status.dirty { color:var(--warning); }
+.ag-status.ok { color:var(--success); }
+.ag-empty { color:var(--muted); padding:1rem; font-size:0.9rem; }
+.ag-modal { position:fixed; inset:0; background:rgba(0,0,0,0.45); z-index:10000; display:flex; align-items:center; justify-content:center; }
+.ag-modal-box { background:var(--card); border:1px solid var(--border); border-radius:var(--radius); padding:1.3rem; max-width:420px; width:90%; box-shadow:var(--shadow); }
+.ag-modal-msg { margin-bottom:0.9rem; color:var(--text); font-size:0.95rem; word-break:break-word; }
+.ag-modal-box input { width:100%; margin-bottom:0.9rem; }
+.ag-modal-btns { display:flex; gap:0.6rem; justify-content:flex-end; }
+</style>
+</head>
+<body>
+<div class="container">
+<div class="card">
+  <div style="display:flex; align-items:center; gap:0.6rem; margin-bottom:1rem;">
+    <img src="/static/miniassistant.png" alt="Logo" style="height:2rem;width:auto">
+    <h1 style="flex:1; margin:0; font-size:1.4em;">Vorgaben &amp; Dateien</h1>
+    <a href="/__TQ__" class="btn btn-outline">Startseite</a>
+  </div>
+  <p class="text-muted" style="margin-top:-0.4rem">SOUL, IDENTITY, Regeln, Directions, Docs &amp; Prefs bearbeiten. Änderungen werden erst nach <b>Speichern</b> (mit Rückfrage) übernommen. Kein Löschen.</p>
+  <div class="ag-layout">
+    <div class="ag-list" id="ag-list"><div class="ag-empty">Lade…</div></div>
+    <div class="ag-editor">
+      <textarea class="ag-ta" id="ag-ta" placeholder="Datei links auswählen…" spellcheck="false" disabled></textarea>
+      <div class="ag-bar">
+        <span class="ag-fname" id="ag-fname">Keine Datei</span>
+        <span class="ag-status" id="ag-status"></span>
+        <span class="ag-confirm" id="ag-confirm" style="display:none; align-items:center; gap:0.5rem;">
+          <span style="font-size:0.85rem; color:var(--warning);">Wirklich speichern?</span>
+          <button class="btn btn-primary" id="ag-confirm-yes">Ja</button>
+          <button class="btn btn-outline" id="ag-confirm-no">Abbrechen</button>
+        </span>
+        <button class="btn btn-primary" id="ag-save" disabled>Speichern</button>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+<div id="ag-modal" class="ag-modal" style="display:none">
+  <div class="ag-modal-box">
+    <div id="ag-modal-msg" class="ag-modal-msg"></div>
+    <input type="text" id="ag-modal-input" style="display:none" spellcheck="false" autocomplete="off">
+    <div class="ag-modal-btns">
+      <button id="ag-modal-no" class="btn btn-outline">Abbrechen</button>
+      <button id="ag-modal-yes" class="btn btn-primary">OK</button>
+    </div>
+  </div>
+</div>
+<script>
+var TOKEN = __TOKEN__;
+var curPath = null, origContent = "", dirty = false;
+function hq(p){ return TOKEN ? (p + (p.indexOf('?')>=0?'&':'?') + 'token=' + encodeURIComponent(TOKEN)) : p; }
+function esc(s){ var d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+function agModal(opts){
+  return new Promise(function(resolve){
+    var m=document.getElementById('ag-modal');
+    document.getElementById('ag-modal-msg').textContent = opts.message;
+    var inp=document.getElementById('ag-modal-input');
+    inp.style.display = opts.input ? 'block' : 'none';
+    inp.value = opts.value || '';
+    var yes=document.getElementById('ag-modal-yes'), no=document.getElementById('ag-modal-no');
+    yes.textContent = opts.okLabel || 'OK';
+    m.style.display='flex';
+    if(opts.input) setTimeout(function(){ inp.focus(); }, 30);
+    function cleanup(val){ m.style.display='none'; yes.onclick=null; no.onclick=null; inp.onkeydown=null; resolve(val); }
+    yes.onclick=function(){ cleanup(opts.input ? (inp.value.trim()||null) : true); };
+    no.onclick=function(){ cleanup(opts.input ? null : false); };
+    if(opts.input) inp.onkeydown=function(e){ if(e.key==='Enter'){ e.preventDefault(); yes.onclick(); } else if(e.key==='Escape'){ no.onclick(); } };
+  });
+}
+function setStatus(t, cls){ var s=document.getElementById('ag-status'); s.textContent=t; s.className='ag-status'+(cls?' '+cls:''); }
+function setDirty(d){ dirty=d; document.getElementById('ag-save').disabled = !d || curPath===null; if(d) setStatus('● ungespeichert','dirty'); else setStatus(''); }
+async function loadList(){
+  var r, d;
+  try { r = await fetch(hq('/api/agent/files')); d = await r.json(); } catch(e){ document.getElementById('ag-list').innerHTML='<div class=ag-empty>Fehler beim Laden.</div>'; return; }
+  var el = document.getElementById('ag-list'); el.innerHTML='';
+  if(!d.agent_dir){ el.innerHTML='<div class=ag-empty>Kein agent_dir konfiguriert.</div>'; return; }
+  (d.groups||[]).forEach(function(g){
+    if((!g.items || g.items.length===0) && !g.allow_new) return; // leere, nicht-erweiterbare Gruppe ausblenden
+    var h=document.createElement('div'); h.className='ag-ghdr'; h.textContent=g.label; el.appendChild(h);
+    (g.items||[]).forEach(function(it){
+      var a=document.createElement('a'); a.textContent=it.name; a.title=it.path;
+      a.onclick=function(){ openFile(it.path, a); };
+      if(g.deletable){
+        var row=document.createElement('div'); row.className='ag-frow';
+        row.appendChild(a);
+        var db=document.createElement('button'); db.className='ag-del'; db.textContent='🗑'; db.title='In Papierkorb verschieben';
+        db.onclick=function(ev){ ev.stopPropagation(); deleteFile(it.path); };
+        row.appendChild(db); el.appendChild(row);
+      } else {
+        el.appendChild(a);
+      }
+    });
+    if(g.allow_new){
+      var nb=document.createElement('button'); nb.className='ag-newbtn'; nb.textContent='+ Neue Datei';
+      nb.onclick=function(){ newFile(g.sub); }; el.appendChild(nb);
+    }
+  });
+}
+async function openFile(path, aEl){
+  if(dirty && !(await agModal({message:'Ungespeicherte Änderungen verwerfen?', okLabel:'Verwerfen'}))) return;
+  var r;
+  try { r = await fetch(hq('/api/agent/file?path='+encodeURIComponent(path))); } catch(e){ setStatus('Fehler','dirty'); return; }
+  if(!r.ok){ setStatus('Fehler beim Laden','dirty'); return; }
+  var d = await r.json();
+  curPath = path; origContent = d.content;
+  var ta=document.getElementById('ag-ta'); ta.value=d.content; ta.disabled=false;
+  document.getElementById('ag-fname').textContent=path;
+  document.querySelectorAll('.ag-list a').forEach(function(x){ x.classList.remove('active'); });
+  if(aEl) aEl.classList.add('active');
+  setDirty(false);
+}
+async function newFile(sub){
+  if(dirty && !(await agModal({message:'Ungespeicherte Änderungen verwerfen?', okLabel:'Verwerfen'}))) return;
+  var name = await agModal({message:'Dateiname für die neue Datei (z.B. notiz.md):', input:true, okLabel:'Anlegen'});
+  if(!name) return; name = name.trim();
+  if(!/\\.(md|txt|ya?ml)$/i.test(name)) name += '.md';
+  if(!/^[A-Za-z0-9._-]+$/.test(name)){ await agModal({message:'Ungültiger Name. Nur Buchstaben, Zahlen, . _ - erlaubt.'}); return; }
+  curPath = sub ? (sub+'/'+name) : name; origContent = "";
+  var ta=document.getElementById('ag-ta'); ta.value=""; ta.disabled=false; ta.focus();
+  document.getElementById('ag-fname').textContent=curPath+' (neu)';
+  document.querySelectorAll('.ag-list a').forEach(function(x){ x.classList.remove('active'); });
+  setDirty(true);
+}
+async function deleteFile(path){
+  if(!(await agModal({message:'Datei „'+path+'“ in den Papierkorb verschieben?', okLabel:'Löschen'}))) return;
+  var r;
+  try { r=await fetch(hq('/api/agent/delete'), {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:path})}); }
+  catch(e){ setStatus('Netzwerkfehler','dirty'); return; }
+  if(r.ok){
+    if(curPath===path){ curPath=null; origContent=''; var ta=document.getElementById('ag-ta'); ta.value=''; ta.disabled=true; document.getElementById('ag-fname').textContent='Keine Datei'; setDirty(false); }
+    setStatus('✓ in Papierkorb verschoben','ok'); await loadList();
+  } else { var e={}; try{ e=await r.json(); }catch(_){} setStatus('Fehler: '+(e.detail||r.status),'dirty'); }
+}
+document.getElementById('ag-ta').addEventListener('input', function(){ setDirty(this.value !== origContent); });
+function showConfirm(on){
+  document.getElementById('ag-confirm').style.display = on ? 'inline-flex' : 'none';
+  document.getElementById('ag-save').style.display = on ? 'none' : 'inline-block';
+}
+document.getElementById('ag-save').addEventListener('click', function(){
+  if(curPath===null) return;
+  showConfirm(true);   // inline-Bestätigung statt Browser-Popup
+});
+document.getElementById('ag-confirm-no').addEventListener('click', function(){ showConfirm(false); });
+document.getElementById('ag-confirm-yes').addEventListener('click', async function(){
+  showConfirm(false);
+  if(curPath===null) return;
+  var content = document.getElementById('ag-ta').value;
+  setStatus('speichere…');
+  var r;
+  try { r = await fetch(hq('/api/agent/file'), {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:curPath, content:content})}); }
+  catch(e){ setStatus('Netzwerkfehler','dirty'); return; }
+  if(r.ok){ origContent=content; setDirty(false); setStatus('✓ gespeichert','ok'); await loadList(); }
+  else { var e={}; try{ e=await r.json(); }catch(_){} setStatus('Fehler: '+(e.detail||r.status),'dirty'); }
+});
+window.addEventListener('beforeunload', function(e){ if(dirty){ e.preventDefault(); e.returnValue=''; } });
+loadList();
+</script>
+__THEME_JS__
+</body>
+</html>"""
+
+
+@app.get("/agent", response_class=HTMLResponse)
+async def agent_files_page(request: Request):
+    """Vorgaben-Editor: Agent-Dateien (SOUL/IDENTITY/…, Regeln, Directions, Docs, Prefs) bearbeiten."""
+    _require_token(request)
+    import json as _json
+    token = request.query_params.get("token", "") or request.cookies.get("ma_token", "")
+    tq = _token_query(token)
+    token_val = token.replace("?token=", "").replace("&token=", "")
+    html = (_AGENT_PAGE_TEMPLATE
+            .replace("__COMMON_CSS__", _COMMON_CSS)
+            .replace("__THEME_JS__", _THEME_JS)
+            .replace("__TOKEN__", _json.dumps(token_val))
+            .replace("__TQ__", tq))
+    return HTMLResponse(html)
 
 
 @app.get("/chats", response_class=HTMLResponse)

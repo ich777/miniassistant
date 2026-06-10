@@ -22,6 +22,7 @@ from miniassistant.ollama_client import (
     chat_stream as ollama_chat_stream,
     get_api_key_for_model,
     get_base_url_for_model,
+    get_image_edit_strength_for_model,
     get_num_ctx_for_model,
     get_options_for_model,
     get_provider_config,
@@ -272,12 +273,15 @@ class _LoopDetector:
 
     def __init__(self, max_consecutive: int = 4, min_phrase_len: int = 15,
                  buf_segment_repeats: int = 5, buf_segment_len: int = 40,
-                 buf_max_chars: int = 2000):
+                 buf_max_chars: int = 2000, freq_window: int = 30,
+                 freq_threshold: int = 5):
         self._max_consecutive = max_consecutive
         self._min_phrase_len = min_phrase_len
         self._buf_segment_repeats = buf_segment_repeats
         self._buf_segment_len = buf_segment_len
         self._buf_max_chars = buf_max_chars
+        self._freq_window = freq_window
+        self._freq_threshold = freq_threshold
         self._recent: list[str] = []
         self._buf: str = ""
         self.reason: str | None = None
@@ -322,6 +326,17 @@ class _LoopDetector:
                     if len(set(win)) <= 8:
                         self.reason = f"nur {len(set(win))} unterschiedliche Zeilen in letzten 24"
                         return True
+                # Frequenz-Check: EINE Zeile wiederholt sich oft im Fenster, auch wenn
+                # variierende Noise-Zeilen dazwischenstehen (z.B. qwen "I will address him"
+                # + wechselnde Preiszeile → tarnt den Loop vor Block-/Diversitäts-Check).
+                if len(self._recent) >= self._freq_window:
+                    win = self._recent[-self._freq_window:]
+                    _top = max(set(win), key=win.count)
+                    _cnt = win.count(_top)
+                    if _cnt >= self._freq_threshold:
+                        self.reason = (f"Zeile {_cnt}× in letzten {self._freq_window} "
+                                       f"(Noise-getarnter Loop)")
+                        return True
         if len(self._buf) > self._buf_segment_len * 4:
             seg = self._buf[-self._buf_segment_len:]
             if len(self._norm(seg)) >= self._buf_segment_len // 2:
@@ -331,6 +346,276 @@ class _LoopDetector:
         if len(self._buf) > self._buf_max_chars:
             self._buf = self._buf[-self._buf_max_chars:]
         return False
+
+
+# ── URL-Halluzinations-Guard ─────────────────────────────────────────────
+# Modelle (besonders kleine) erfinden Links: sie konstruieren plausibel
+# aussehende URLs (geizhals.de/…, amazon.de/dp/…) die NIE in einem Tool-Ergebnis
+# standen. Regel "URLs — HARD" (knowledge_verification.md) verbietet das, aber
+# kleine Modelle ignorieren Prompt-Regeln. Hier wird es programmatisch erzwungen:
+# jede URL im finalen Content MUSS in einem Tool-Ergebnis dieser Runde vorgekommen
+# sein (web_search-Treffer oder per read_url/check_url geöffnet), sonst wird der
+# Link entfernt (Markdown-Linktext bleibt, nackte URL fliegt raus). Kostet KEINE
+# Kontext-Tokens — reine Python-Nachbearbeitung.
+_URL_RE = _re.compile(r'https?://[^\s<>()\[\]"\'`]+', _re.IGNORECASE)
+# Markdown-Link: [text](url)  — url evtl. mit "title" dahinter
+_MD_LINK_RE = _re.compile(r'\[([^\]]*)\]\(\s*(https?://[^\s)]+)(?:\s+"[^"]*")?\s*\)', _re.IGNORECASE)
+
+
+def _norm_url(u: str) -> str:
+    """URL auf Vergleichsform: scheme+host+path+query, lowercased host,
+    ohne Fragment, ohne nachgestellte Satzzeichen / trailing slash."""
+    u = u.strip().rstrip('.,;:!?)\'"»>')
+    m = _re.match(r'(https?)://([^/\s]+)(/[^?#\s]*)?(\?[^#\s]*)?', u, _re.IGNORECASE)
+    if not m:
+        return u.lower()
+    scheme, host, path, query = m.group(1).lower(), m.group(2).lower(), m.group(3) or "", m.group(4) or ""
+    host = host[4:] if host.startswith("www.") else host
+    path = path.rstrip('/') or ""
+    return f"{scheme}://{host}{path}{query}"
+
+
+def _harvest_urls(text: str) -> set[str]:
+    """Alle URLs aus einem (Tool-Ergebnis-)Text als normalisierte Menge."""
+    if not text:
+        return set()
+    return {_norm_url(m.group(0)) for m in _URL_RE.finditer(text)}
+
+
+def _strip_unverified_urls(text: str, seen: set[str]) -> tuple[str, list[str]]:
+    """Entfernt Links aus `text`, deren normalisierte URL NICHT in `seen` steht.
+
+    - Markdown-Link `[txt](badurl)` → nur `txt` (Link entfernt, Text bleibt).
+    - Nackte `https://badurl` → komplett raus.
+    Gibt (bereinigter_text, [entfernte_urls]) zurück.
+    """
+    if not text:
+        return text, []
+    removed: list[str] = []
+
+    def _md(m: "_re.Match[str]") -> str:
+        label, url = m.group(1), m.group(2)
+        if _norm_url(url) in seen:
+            return m.group(0)
+        removed.append(url)
+        return label  # Linktext behalten, URL droppen
+
+    text = _MD_LINK_RE.sub(_md, text)
+
+    def _bare(m: "_re.Match[str]") -> str:
+        url = m.group(0)
+        if _norm_url(url) in seen:
+            return url
+        removed.append(url.rstrip('.,;:!?)\'"»>'))
+        return ""  # erfundene nackte URL entfernen
+
+    text = _URL_RE.sub(_bare, text)
+    # doppelte Leerzeichen nach Entfernung glätten
+    text = _re.sub(r'[ \t]{2,}', ' ', text)
+    text = _re.sub(r' +([.,;:!?])', r'\1', text)
+    return text, removed
+
+
+# ── Link-Resolution-Guard (Tier-B) ───────────────────────────────────────
+# Der URL-Guard (Tier A) lässt Links durch die im Tool-Output vorkamen — aber ein
+# web_search-Snippet kann eine URL liefern die 404t (stale/falsch). Hier wird jeder
+# zitierte Link über den ROBUSTEN Fetcher (curl_cffi Safari-Impersonation, wie read_url —
+# kommt durch Bot-Schutz wie geizhals/Anubis) geprüft und NUR bei definitivem 404/410
+# entfernt. 403/Timeout/5xx/Fehler → behalten (real-aber-geblockt/transient).
+def _cited_urls(text: str) -> list[str]:
+    """URLs aus finalem Content robust extrahieren, inkl. Markdown-Links mit balancierten
+    Klammern (z.B. mindfactory 'Grafikkarten+(VGA).html')."""
+    urls: list[str] = []
+    for m in _re.finditer(r'\]\((https?://)', text):
+        i = m.start(1); depth = 1; j = m.end(1)
+        while j < len(text):
+            ch = text[j]
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            elif ch in ' \n\t':
+                break
+            j += 1
+        urls.append(text[i:j])
+    for m in _re.finditer(r'(?<!\()https?://[^\s)\]"*]+', text):
+        urls.append(m.group(0).rstrip('.,;:!?'))
+    return list(dict.fromkeys(urls))
+
+
+def _link_resolves(url: str, timeout: float = 12.0) -> bool:
+    """True = behalten. False NUR bei definitivem 404/410 (robuster Fetcher mit Safari-
+    Impersonation). Im Zweifel (Timeout/403/5xx/Exception) → True (nicht strippen)."""
+    try:
+        from miniassistant.tools import _curl_cffi_safe_get
+        r = _curl_cffi_safe_get(url, impersonate="safari17_0", timeout=timeout)
+        return getattr(r, "status_code", 200) not in (404, 410)
+    except Exception:
+        return True
+
+
+def _strip_dead_links(text: str, max_links: int = 10, timeout: float = 12.0) -> tuple[str, list[str]]:
+    """Zitierte Links parallel auflösen; nur definitiv tote (404/410) aus dem Text entfernen
+    (Markdown-Link → Linktext, nackte URL → weg). Gibt (bereinigt, [entfernte])."""
+    if not text or ("http://" not in text and "https://" not in text):
+        return text, []
+    urls = _cited_urls(text)[:max_links]
+    if not urls:
+        return text, []
+    from concurrent.futures import ThreadPoolExecutor
+    dead: list[str] = []
+    with ThreadPoolExecutor(max_workers=min(6, len(urls))) as ex:
+        for u, ok in zip(urls, ex.map(lambda u: _link_resolves(u, timeout), urls)):
+            if not ok:
+                dead.append(u)
+    if not dead:
+        return text, []
+    for u in dead:
+        esc = _re.escape(u)
+        # Markdown [label](deadurl) → label
+        text = _re.sub(r'\[([^\]]*)\]\(\s*' + esc + r'(?:\s+"[^"]*")?\s*\)', r'\1', text)
+        # nackte URL → weg
+        text = text.replace(u, "")
+    text = _re.sub(r'[ \t]{2,}', ' ', text)
+    text = _re.sub(r' +([.,;:!?])', r'\1', text)
+    return text, dead
+
+
+# ── Research-Gate ────────────────────────────────────────────────────────
+# Tools die als "Daten beschafft" zählen → Gate feuert NICHT. exec deckt curl/API-Calls
+# (z.B. GitHub-Download-Zahlen), invoke_model deckt Subagenten-Recherche. Sonst feuert das
+# Gate fälschlich wenn das Modell Fakten via exec/curl statt web_search holt.
+_RESEARCH_SATISFYING_TOOLS = frozenset({
+    "exec", "web_search", "web_search_multi", "read_url", "check_url",
+    "read_email", "invoke_model", "download_file", "search_memory",
+})
+# Claim-Fragen (Preise/Specs/Versionen/News/Verfügbarkeit/Kaufberatung) MÜSSEN
+# recherchiert werden — knowledge_verification.md sagt das, aber kleine Modelle
+# überspringen die Regel unter Last. Hier wird sie programmatisch erzwungen:
+# erkennt der Detektor eine Claim-Frage und das Modell will ohne web_search
+# antworten → Antwort verwerfen, Such-Nudge, retry.
+_CLAIM_KEYWORDS_DEFAULT = (
+    # Preise / Kauf
+    "preis", "kostet", "kosten", "günstig", "guenstig", "teuer", "kaufen", "angebot",
+    "rabatt", "gutschein", "deal", "€", " eur", "dollar",
+    # Empfehlung / Produktvergleich
+    "empfehl", "welche grafikkarte", "welches modell", "welcher cpu", "beste ", "bester ",
+    "günstigste", "guenstigste", "vergleich", "lohnt sich", "soll ich kaufen", "kaufberatung",
+    # Versionen / Aktualität
+    "aktuelle ", "aktueller ", "aktuellste", "neueste", "neuste", "neuesten",
+    "erscheint", "erschienen", "welche version", "version von", "specs", "spezifikation",
+    "technische daten", "benchmark",
+    # Verfügbarkeit / News
+    "verfügbar", "verfuegbar", "lieferbar", "auf dem markt", "wo kann ich", "wo gibt es",
+    "was kostet", "wie viel kostet", "wieviel kostet", "wie teuer",
+)
+# Klar nicht-faktische Anfragen → Gate NICHT auslösen (Kreatives, Sprache, Code).
+_NONCLAIM_KEYWORDS = (
+    "schreib", "gedicht", "witz", "erzähl", "erzaehl", "übersetze", "uebersetze",
+    "fasse zusammen", "zusammenfassung", "programmier", "code", "debug", "erkläre mir wie",
+    "erklär mir wie", "wie funktioniert", "rezept", "korrigier", "formulier",
+)
+
+
+def _is_claim_question(text: str, keywords: tuple[str, ...] = _CLAIM_KEYWORDS_DEFAULT) -> bool:
+    """Heuristik: braucht die Frage frische, verifizierbare Fakten (→ Recherche-Pflicht)?
+    Konservativ-aber-nützlich: Claim-Keyword vorhanden UND kein klares Nicht-Claim-Signal.
+    False-Positive kostet nur eine unnötige Suche (~1s); False-Negative = Halluzination."""
+    if not text:
+        return False
+    t = text.lower()
+    if len(t) < 8:
+        return False
+    if any(nk in t for nk in _NONCLAIM_KEYWORDS):
+        return False
+    if any(k in t for k in keywords):
+        return True
+    # Spec-Pattern: Zahl direkt vor Tech-Einheit (z.B. "32gb", "144hz", "750watt") →
+    # starkes Hardware-/Spec-Signal, auch ohne explizites Claim-Keyword.
+    if _re.search(r'\b\d+\s?(gb|tb|ghz|mhz|hz|watt|w|mp|fps|nm|zoll|inch|mah)\b', t):
+        return True
+    return False
+
+
+# ── Tool-Lazy-Load ───────────────────────────────────────────────────────
+# Alle 22 Tool-Schemas immer mitzuschicken kostet ~6.4k Tokens fix. Selten genutzte
+# Tools (email/schedule/webhook/...) nur laden wenn die User-Nachricht sie andeutet.
+# CORE = täglicher Agent-Loop, immer da. Opt-in via config lazy_tools (default aus,
+# reliability-first: ein nicht-geladenes Tool kann das Modell diese Runde nicht rufen).
+_LAZY_CORE_TOOLS = {
+    "exec", "web_search", "web_search_multi", "read_url", "check_url",
+    "invoke_model", "send_image", "download_file", "status_update", "wait",
+}
+_LAZY_TOOL_GROUPS: dict[str, tuple[set[str], tuple[str, ...]]] = {
+    "email":    ({"send_email", "read_email"},
+                 ("email", "e-mail", " mail", "postfach", "gmail", "imap", "smtp",
+                  "schreib an", "sende an", "schick an", "verschick")),
+    "schedule": ({"schedule"},
+                 ("erinner", "schedule", "täglich", "taeglich", "jeden", "jede woche",
+                  "stündlich", "stuendlich", "cron", "timer", " uhr", "morgen",
+                  "übermorgen", "uebermorgen", "wöchentlich", "woechentlich",
+                  "regelmäßig", "regelmaessig", "plan mir")),
+    "watch":    ({"watch"},
+                 ("hintergrund", "background", "benachrichtig", "überwach", "ueberwach",
+                  "watch", "bescheid wenn", "sag bescheid")),
+    "webhook":  ({"webhook"},
+                 ("webhook", "http trigger", "endpoint", "post url")),
+    "debate":   ({"debate"},
+                 ("debatt", "debate", "pro und contra", "pro/contra",
+                  "streitgespräch", "streitgespraech")),
+    "config":   ({"save_config"},
+                 ("config", "konfig", "einstellung", "setting", "modell wechsel",
+                  "wechsel das modell", "alias", "provider", "num_ctx", "temperature",
+                  "stell ein")),
+    "memory":   ({"search_memory"},
+                 ("erinnerst du", "weißt du noch", "weisst du noch", "letztes mal",
+                  "früher gesagt", "frueher gesagt", "vorhin gesagt", "gedächtnis",
+                  "gedaechtnis", "memory")),
+    "history":  ({"search_chat_history", "read_recent_messages", "get_user_profile",
+                  "get_room_last_fire"},
+                 ("verlauf", "history", "letzte nachricht", "wer hat", "profil",
+                  "was haben wir", "worüber haben wir", "worueber haben wir")),
+    "audio":    ({"send_audio"},
+                 ("sprich", "audio", "sprachnachricht", "voice", "sag es laut",
+                  "vorlesen", "lies vor", "tts")),
+}
+
+
+def _lazy_tool_allow(config: dict[str, Any], user_content: str,
+                     base_allow: set[str] | None) -> set[str] | None:
+    """Allow-Set für get_tools_schema: CORE + per Keyword getriggerte Gruppen.
+    lazy_tools aus → base_allow unverändert. Group-Mode-Whitelist wird respektiert (Schnitt)."""
+    if not config.get("lazy_tools"):
+        return base_allow
+    t = (user_content or "").lower()
+    allow = set(_LAZY_CORE_TOOLS)
+    for names, kws in _LAZY_TOOL_GROUPS.values():
+        if any(k in t for k in kws):
+            allow |= names
+    if base_allow is not None:
+        allow &= set(base_allow)
+    return allow
+
+
+def _collapse_repetition(text: str) -> str:
+    """Schneidet einen degenerierten Wiederholungs-Tail ab: sobald dieselbe (normalisierte)
+    Zeile zum 3. Mal auftaucht, wird ab dort gekappt. Fallback für den non-stream Loop-Schutz,
+    wenn eine Korrektur-Runde nicht hilft. Behält den sauberen Anfang der Antwort."""
+    if not text:
+        return text
+    lines = text.split("\n")
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for ln in lines:
+        n = " ".join(ln.split()).strip().lower()
+        if len(n) >= 15:
+            seen[n] = seen.get(n, 0) + 1
+            if seen[n] >= 3:
+                break
+        out.append(ln)
+    return "\n".join(out).rstrip()
 
 
 def _clean_response(content: str, thinking: str) -> tuple[str, str]:
@@ -1907,6 +2192,13 @@ def _run_tool_safe(
     result = _run_tool(name, args, config, project_dir)
     if name in _EXTERNAL_CONTENT_TOOLS:
         result = _sanitize_tool_output(result, tool_name=name)
+    # Config-Secrets im Tool-Ergebnis maskieren BEVOR es in den Modell-Kontext geht
+    # (z. B. `cat config.yaml` via exec) — so sieht das Modell den Klartext gar nicht erst.
+    try:
+        from miniassistant.secret_mask import mask_text as _mask_secret
+        result = _mask_secret(result, config)
+    except Exception:
+        pass
     _aal.log_tool_result(config, name, result, elapsed_s=time.monotonic() - _t0)
     return result
 
@@ -4285,12 +4577,21 @@ def _run_subagent_openai(
                             _log.info("Image editing: size = %dx%d, aspect preserved%s", _sw, _sh, _cap_note)
                     except Exception as _res_err:
                         _log.warning("Image editing: source resolution read failed (%s) — backend default used", _res_err)
-                # Default strength=0.85 wenn nicht explizit gesetzt — bei sd-server distill-models
-                # (flux klein, qwen-image-edit) ist 0.3-0.5 zu schwach: Output sieht ~identisch zum Input aus.
-                # 0.85 = klare Transformation bei erhaltener Komposition.
+                # Strength-Default pro Modell auflösen wenn nicht explizit (Tool-Param/Prompt) gesetzt.
+                # Präzedenz: model_options[model].image_edit_strength > provider > top-level > 1.0.
+                # WICHTIG für qwen-image-edit (+ andere Edit-Pipelines auf sd-server):
+                # Das Verhalten ist ~bimodal. Bei strength<1.0 startet das Sampling vom
+                # Input-Latent (IMG2IMG, partial denoise). Da die Qwen-Edit-Pipeline das
+                # Quellbild ZUSÄTZLICH als Referenz-Conditioning injiziert, ankert der Output
+                # doppelt am Input → Ergebnis ~identisch zum Input, Instruktion wird ignoriert.
+                # Nur strength=1.0 (voller Denoise ab reinem Rauschen) lässt die Edit-Instruktion
+                # greifen, während die Referenz-Conditioning die Komposition erhält.
+                # Empirisch (10.0.0.2 sd-server, qwen-image-edit-turbo): 0.85 → kein Edit, 1.0 → Edit.
+                # Andere Backends (echte img2img) wollen evtl. < 1.0 → darum pro Modell konfigurierbar.
                 if "strength" not in _img_kwargs:
-                    _img_kwargs["strength"] = 0.85
-                    _log.info("Image editing: strength not set → default 0.85 (sd-server distill model)")
+                    _img_kwargs["strength"] = get_image_edit_strength_for_model(config, resolved_name)
+                    _log.info("Image editing: strength not set → %.2f for %s (per-model default)",
+                              _img_kwargs["strength"], resolved_name)
                 # KEINE t_enc-Kompensation mehr: der vom User genannte steps-Wert wird VERBATIM
                 # gesendet (20 → 20), nicht hochskaliert. Wenn das Backend (sd-server) effektiv
                 # weniger Steps fährt, ist das Backend-Sache — wir verfälschen die Eingabe nicht.
@@ -5336,7 +5637,18 @@ def chat_round(
             _log.debug("slot_cache restore skipped: %s", _e)
     _gm_ctx = config.get("_chat_context") or {}
     _gm_allow = set(_gm_ctx.get("tools_allow") or []) if _gm_ctx.get("group_mode") else None
-    tools_schema = get_tools_schema(config, allow=_gm_allow)
+    tools_schema = get_tools_schema(config, allow=_lazy_tool_allow(config, user_content, _gm_allow))
+    # Reliability-Guards (gleich wie chat_round_stream — Matrix/Discord laufen über DIESEN Pfad)
+    _seen_urls: set[str] = set()
+    _url_guard_enabled = bool(config.get("url_hallucination_guard", True))
+    _research_gate_enabled = bool(config.get("research_gate", True))
+    _research_gate_max = int(config.get("research_gate_max") or 1)
+    _research_gate_attempts = 0
+    _web_search_count = 0
+    _read_url_count = 0
+    _data_tool_count = 0          # alle daten-beschaffenden Tools (exec/curl, invoke_model, ...) — Research-Gate
+    _has_search = bool(config.get("search_engines"))
+    _claim_kw = tuple(config.get("research_gate_keywords") or _CLAIM_KEYWORDS_DEFAULT)
     debug = (config.get("server") or {}).get("debug", False)
     models_cfg = config.get("models") or {}
     per_prov_fb = [resolve_model(config, fb) or fb for fb in (models_cfg.get("fallbacks") or []) if fb]
@@ -5495,6 +5807,27 @@ def chat_round(
                     _display_content = _strip_tool_call_tags(_msg_content)
 
                 if not tool_calls:
+                    # Research-Gate: Claim-Frage ohne Recherche → Antwort verwerfen, Such-Nudge, retry
+                    if (_research_gate_enabled
+                            and _research_gate_attempts < _research_gate_max
+                            and _has_search
+                            and _data_tool_count == 0
+                            and (_msg_content or "").strip()
+                            and rounds < max_tool_rounds - 1
+                            and _is_claim_question(user_content, _claim_kw)):
+                        _research_gate_attempts += 1
+                        _log.info("Research-Gate (chat_round): Claim-Frage ohne Recherche — erzwinge web_search (Versuch %d/%d, Runde %d)",
+                                  _research_gate_attempts, _research_gate_max, rounds)
+                        msgs.append({"role": "assistant", "content": _msg_content or "", "thinking": msg.get("thinking") or ""})
+                        msgs.append({"role": "user", "content": (
+                            "STOP. Das ist eine Faktenfrage (Preise/Specs/Versionen/News/Verfügbarkeit/Kaufberatung). "
+                            "Du hast aus dem Gedächtnis geantwortet OHNE zu recherchieren. Das ist nicht erlaubt. "
+                            "Rufe JETZT `web_search` auf (min. 1×, dann `read_url` für die relevanten Treffer) und "
+                            "antworte erst dann — mit verifizierten Fakten und konkreten Quell-Links aus den Tool-Ergebnissen. "
+                            "Keine Zahlen/Preise/Versionen aus dem Gedächtnis."
+                        )})
+                        rounds += 1
+                        continue
                     # Halluziniertes Bild erkannt (base64 oder fake URL)? → strippen, Korrektur-Runde starten
                     if _has_hallucinated_image(_msg_content) and rounds < max_tool_rounds:
                         _log.info("Halluziniertes Bild erkannt — sende Korrektur-Nudge (Runde %d)", rounds)
@@ -5566,6 +5899,16 @@ def chat_round(
                 tool_results = _run_tools_maybe_concurrent(tool_calls, config, project_dir)
                 for name, args, result in tool_results:
                     msgs.append({"role": "tool", "tool_name": name, "content": result})
+                    if name in ("web_search", "web_search_multi"):
+                        _web_search_count += 1
+                    if name in ("read_url", "check_url"):
+                        _read_url_count += 1
+                    if name in _RESEARCH_SATISFYING_TOOLS:
+                        _data_tool_count += 1
+                    if _url_guard_enabled:
+                        _seen_urls |= _harvest_urls(result if isinstance(result, str) else str(result))
+                        if name in ("read_url", "check_url") and isinstance(args, dict) and args.get("url"):
+                            _seen_urls.add(_norm_url(args["url"]))
                     if name == "invoke_model" and _is_subagent_failure(result):
                         _subagent_failed = True
                     if name in ("send_image", "send_audio"):
@@ -5728,6 +6071,93 @@ def chat_round(
     # Strip inline <think> tags from content (phi4-reasoning, deepseek-r1 ohne API-think)
     _final_content, _final_thinking = _clean_response(total_content.strip(), total_thinking.strip())
 
+    # Post-hoc Doom-Loop-Schutz (non-stream): der Stream-Loop-Detector kann hier nicht greifen
+    # (Antwort kommt in einem Stück). Finale Antwort auf Repetition prüfen; bei Loop EINE
+    # Korrektur-Runde, sonst repetitiven Tail abschneiden. Greift nur wenn tatsächlich geloopt.
+    if _final_content.strip():
+        _ld = _LoopDetector()
+        _ld.feed(_final_content)
+        if _ld.reason:
+            _log.warning("chat_round: Doom-Loop in finaler Antwort (%s) — Korrektur-Runde", _ld.reason)
+            _fixed = ""
+            try:
+                _fix_msgs = (msgs_final or msgs) + [{"role": "user", "content": (
+                    "STOP. Deine letzte Antwort hing in einer Wiederholungs-Schleife (immer wieder "
+                    "derselbe Satz/Block). Antworte JETZT knapp und vollständig OHNE jede Wiederholung. "
+                    "Gib nur die Antwort aus."
+                )}]
+                _fix = _dispatch_chat(config, effective_model, _fix_msgs,
+                                      system=system_prompt, think=False,
+                                      timeout=float(config.get("api_timeout") or 900))
+                _fix_c = _strip_tool_call_tags((_fix.get("message", {}).get("content") or "").strip())
+                _ld2 = _LoopDetector(); _ld2.feed(_fix_c)
+                if _fix_c and len(_fix_c) > 20 and not _ld2.reason:
+                    _fixed = _fix_c
+                    _log.info("chat_round: Loop-Recovery erfolgreich (%d chars)", len(_fixed))
+            except Exception as _fix_err:
+                _log.warning("chat_round: Loop-Recovery-Runde fehlgeschlagen: %s", _fix_err)
+            # Korrektur ok → übernehmen; sonst repetitiven Tail hart abschneiden
+            _final_content = _fixed if _fixed else _collapse_repetition(_final_content)
+            for _m in reversed(msgs_final or []):
+                if _m.get("role") == "assistant":
+                    _m["content"] = _final_content
+                    break
+
+    # URL-Halluzinations-Guard (siehe chat_round_stream): nicht-verifizierte Links strippen
+    if _url_guard_enabled and _final_content and ("http://" in _final_content or "https://" in _final_content):
+        for _m in (msgs_final or []):
+            if _m.get("role") in ("tool", "user") and _m.get("content"):
+                _c = _m["content"]
+                _seen_urls |= _harvest_urls(_c if isinstance(_c, str) else str(_c))
+        _final_content, _removed_urls = _strip_unverified_urls(_final_content, _seen_urls)
+        if _removed_urls:
+            _log.warning("URL-Guard (chat_round): %d nicht-verifizierte URL(s) entfernt: %s",
+                         len(_removed_urls), ", ".join(_removed_urls[:10]))
+
+    # Link-Resolution-Guard (Tier-B): zitierte Links auflösen, definitiv tote (404/410) strippen
+    if config.get("link_resolution_guard", True) and _final_content and "http" in _final_content:
+        _final_content, _dead_links = _strip_dead_links(_final_content)
+        if _dead_links:
+            _log.warning("Link-Guard (chat_round): %d tote(r) Link(s) (404/410) entfernt: %s",
+                         len(_dead_links), ", ".join(_dead_links[:8]))
+            for _m in reversed(msgs_final or []):
+                if _m.get("role") == "assistant":
+                    _m["content"] = _final_content
+                    break
+
+    # Reflexions-Pass (opt-in research_reflection): Self-Check gegen Tool-Ergebnisse
+    if (config.get("research_reflection")
+            and _final_content.strip()
+            and _web_search_count > 0
+            and not _sent_image
+            and len(_final_content.strip()) > 40):
+        try:
+            _log.info("Research-Reflection (chat_round): running self-check (web_search_count=%d)", _web_search_count)
+            _reflect_msgs = (msgs_final or []) + [{"role": "user", "content": (
+                "SELF-CHECK (intern, nicht an den User): Prüfe deine letzte Antwort gegen die "
+                "Tool-Ergebnisse (web_search/read_url) in diesem Verlauf. Entferne oder korrigiere "
+                "JEDEN Fakten-Claim (Preis, Spec, Zahl, Datum, Version), der nicht durch ein "
+                "Tool-Ergebnis gedeckt ist. Behalte verifizierte Fakten + Links unverändert. "
+                "Gib NUR die korrigierte finale Antwort aus — keine Meta-Kommentare."
+            )}]
+            _refl = _dispatch_chat(config, effective_model, _reflect_msgs,
+                                   system=system_prompt, think=False,
+                                   timeout=float(config.get("api_timeout") or 900))
+            _refl_c = _strip_tool_call_tags((_refl.get("message", {}).get("content") or "").strip())
+            if _refl_c and 20 < len(_refl_c) < len(_final_content) * 1.5 + 200:
+                if _url_guard_enabled:
+                    _refl_c, _ = _strip_unverified_urls(_refl_c, _seen_urls)
+                if _refl_c.strip() and _refl_c.strip() != _final_content.strip():
+                    _log.info("Research-Reflection (chat_round): Antwort überarbeitet (%d→%d chars)",
+                              len(_final_content), len(_refl_c))
+                    _final_content = _refl_c.strip()
+                    for _m in reversed(msgs_final or []):
+                        if _m.get("role") == "assistant":
+                            _m["content"] = _final_content
+                            break
+        except Exception as _refl_err:
+            _log.warning("Research-Reflection (chat_round) fehlgeschlagen (ignoriert): %s", _refl_err)
+
     # Pending Images injizieren (send_image/Bildgenerierung für Web/API)
     # Discord/Matrix senden Bilder direkt via notify.py, nicht als Markdown
     _pending_imgs = config.pop("_pending_images", [])
@@ -5771,6 +6201,13 @@ def chat_round(
             ).start()
         except Exception as _e:
             _log.debug("slot_cache save spawn skipped: %s", _e)
+    # Safety-Net: bekannte Config-Secrets im finalen Output maskieren (alle Plattformen)
+    try:
+        from miniassistant.secret_mask import mask_text as _mask_secret
+        _final_content = _mask_secret(_final_content, config)
+        _final_thinking = _mask_secret(_final_thinking, config)
+    except Exception:
+        pass
     return _final_content, _final_thinking, msgs_final, debug_info, switch_info
 
 
@@ -5806,7 +6243,7 @@ def chat_round_stream(
             _log.debug("slot_cache restore (stream) skipped: %s", _e)
     _gm_ctx = config.get("_chat_context") or {}
     _gm_allow = set(_gm_ctx.get("tools_allow") or []) if _gm_ctx.get("group_mode") else None
-    tools_schema = get_tools_schema(config, allow=_gm_allow)
+    tools_schema = get_tools_schema(config, allow=_lazy_tool_allow(config, user_content, _gm_allow))
     models_cfg = config.get("models") or {}
     per_prov_fb = [resolve_model(config, fb) or fb for fb in (models_cfg.get("fallbacks") or []) if fb]
     global_fb = [resolve_model(config, fb) or fb for fb in (config.get("fallbacks") or []) if fb]
@@ -5890,6 +6327,17 @@ def chat_round_stream(
     _seen_tool_keys: dict[str, str] = {}  # dedup: tool-key → short result preview
     _dedup_enabled = bool(config.get("tool_call_dedup", True))
     _DEDUP_TOOLS = {"web_search", "read_url", "check_url"}
+    _seen_urls: set[str] = set()   # alle URLs aus Tool-Ergebnissen dieser Runde (Anti-Halluzination)
+    _url_guard_enabled = bool(config.get("url_hallucination_guard", True))
+    # Research-Gate: Claim-Frage muss recherchiert werden, sonst Antwort verwerfen + retry
+    _research_gate_enabled = bool(config.get("research_gate", True))
+    _research_gate_max = int(config.get("research_gate_max") or 1)
+    _research_gate_attempts = 0
+    _web_search_count = 0          # web_search-Aufrufe in dieser Runde (für Research-Gate)
+    _read_url_count = 0            # read_url/check_url-Aufrufe (zählt auch als Recherche)
+    _data_tool_count = 0          # alle daten-beschaffenden Tools (exec/curl, invoke_model, ...) — Research-Gate
+    _has_search = bool(config.get("search_engines"))
+    _claim_kw = tuple(config.get("research_gate_keywords") or _CLAIM_KEYWORDS_DEFAULT)
 
     while rounds < max_tool_rounds:
         # Per-round smart compaction: after round 0, check if tool results grew context past budget.
@@ -5982,6 +6430,8 @@ def chat_round_stream(
                     _stall_warned = False
                     _loop_detector = _LoopDetector(
                         max_consecutive=int(config.get("stream_loop_max_consecutive") or 4),
+                        freq_window=int(config.get("stream_loop_freq_window") or 30),
+                        freq_threshold=int(config.get("stream_loop_freq_threshold") or 5),
                     )
                     _loop_detected = False
                     _loop_reason = ""
@@ -6247,6 +6697,34 @@ def chat_round_stream(
         if not tool_calls:
             _rc = round_content or full_msg.get("content") or ""
             _rt = round_thinking or full_msg.get("thinking") or ""
+
+            # Research-Gate: Claim-Frage (Preise/Specs/Versionen/News/Kaufberatung), aber das
+            # Modell will OHNE web_search aus dem Gedächtnis antworten → Antwort verwerfen,
+            # Such-Nudge, retry. Programmatisch erzwungen (kleine Modelle ignorieren die
+            # knowledge_verification-Regel sonst). Nur wenn Suche verfügbar + noch nicht erschöpft.
+            if (_research_gate_enabled
+                    and _research_gate_attempts < _research_gate_max
+                    and _has_search
+                    and _data_tool_count == 0
+                    and _rc.strip()
+                    and rounds < max_tool_rounds - 1
+                    and _is_claim_question(user_content, _claim_kw)):
+                _research_gate_attempts += 1
+                _log.info("Research-Gate: Claim-Frage ohne web_search — erzwinge Recherche (Versuch %d/%d, Runde %d)",
+                          _research_gate_attempts, _research_gate_max, rounds)
+                yield {"type": "status", "message": "🔎 Faktenfrage erkannt — verifiziere erst per Websuche"}
+                if _rc in total_content:
+                    total_content = total_content.replace(_rc, "")
+                msgs.append({"role": "assistant", "content": _rc, "thinking": _rt})
+                msgs.append({"role": "user", "content": (
+                    "STOP. Das ist eine Faktenfrage (Preise/Specs/Versionen/News/Verfügbarkeit/Kaufberatung). "
+                    "Du hast aus dem Gedächtnis geantwortet OHNE zu recherchieren. Das ist nicht erlaubt. "
+                    "Rufe JETZT `web_search` auf (min. 1×, dann `read_url` für die relevanten Treffer) und "
+                    "antworte erst dann — mit verifizierten Fakten und konkreten Quell-Links aus den Tool-Ergebnissen. "
+                    "Keine Zahlen/Preise/Versionen aus dem Gedächtnis."
+                )})
+                rounds += 1
+                continue
 
             # Halluziniertes Bild erkannt (base64 oder fake URL)? → strippen, Korrektur-Runde starten
             if _has_hallucinated_image(_rc) and rounds < max_tool_rounds:
@@ -6569,6 +7047,15 @@ def chat_round_stream(
             config.pop("_tool_status_callback", None)
             for name, args, result in (tool_results or []):
                 msgs.append({"role": "tool", "tool_name": name, "content": result})
+                if name in ("web_search", "web_search_multi"):
+                    _web_search_count += 1
+                if name in ("read_url", "check_url"):
+                    _read_url_count += 1
+                if _url_guard_enabled:
+                    # URLs aus Tool-Ergebnis ernten + die explizit gelesene/geprüfte URL
+                    _seen_urls |= _harvest_urls(result if isinstance(result, str) else str(result))
+                    if name in ("read_url", "check_url") and isinstance(args, dict) and args.get("url"):
+                        _seen_urls.add(_norm_url(args["url"]))
                 if name == "invoke_model" and _is_subagent_failure(result):
                     _subagent_failed = True
                 if name in ("send_image", "send_audio"):
@@ -6664,6 +7151,82 @@ def chat_round_stream(
         config["_response_handled_via_side_effect"] = True
     _final_content, _final_thinking = _clean_response(
         "" if _sent_image else total_content.strip(), total_thinking.strip())
+
+    # URL-Halluzinations-Guard: jede URL im finalen Content MUSS in einem
+    # Tool-Ergebnis dieser Runde vorgekommen sein. Sicherheitsnetz: zusätzlich
+    # ALLE role:tool-Messages scannen (fängt Subagent-/Nudge-/Fallback-Ergebnisse,
+    # die nicht über den Haupt-Tool-Loop geerntet wurden).
+    if _url_guard_enabled and _final_content and ("http://" in _final_content or "https://" in _final_content):
+        # tool = verifizierte Quellen; user = vom User selbst gepostete Links (nie strippen)
+        for _m in msgs:
+            if _m.get("role") in ("tool", "user") and _m.get("content"):
+                _c = _m["content"]
+                _seen_urls |= _harvest_urls(_c if isinstance(_c, str) else str(_c))
+        _final_content, _removed_urls = _strip_unverified_urls(_final_content, _seen_urls)
+        if _removed_urls:
+            _log.warning("URL-Guard: %d nicht-verifizierte URL(s) aus Antwort entfernt "
+                         "(nie in Tool-Ergebnis gesehen): %s",
+                         len(_removed_urls), ", ".join(_removed_urls[:10]))
+            try:
+                _aal.log_tool_call(config, "url_guard",
+                                   {"removed": len(_removed_urls)},
+                                   "stripped hallucinated URLs: " + ", ".join(_removed_urls[:20]))
+            except Exception:
+                pass
+            yield {"type": "status", "message": f"🔒 {len(_removed_urls)} nicht-verifizierte(n) Link(s) entfernt (nicht in Suchergebnissen gefunden)"}
+
+    # Link-Resolution-Guard (Tier-B): zitierte Links auflösen, definitiv tote (404/410) strippen
+    if config.get("link_resolution_guard", True) and _final_content and "http" in _final_content:
+        _final_content, _dead_links = _strip_dead_links(_final_content)
+        if _dead_links:
+            _log.warning("Link-Guard: %d tote(r) Link(s) (404/410) entfernt: %s",
+                         len(_dead_links), ", ".join(_dead_links[:8]))
+            for _m in reversed(msgs):
+                if _m.get("role") == "assistant":
+                    _m["content"] = _final_content
+                    break
+            yield {"type": "status", "message": f"🔗 {len(_dead_links)} toten Link(s) entfernt (404)"}
+
+    # Reflexions-Pass (opt-in, research_reflection): bei Research-Antworten ein billiger
+    # Self-Check — Modell entfernt/korrigiert Fakten-Claims, die nicht durch die
+    # Tool-Ergebnisse gedeckt sind. Kostet einen extra Round (Latenz) → default aus.
+    if (config.get("research_reflection")
+            and _final_content.strip()
+            and _web_search_count > 0
+            and not _sent_image
+            and len(_final_content.strip()) > 40):
+        try:
+            _log.info("Research-Reflection: running self-check (web_search_count=%d, content_len=%d)",
+                      _web_search_count, len(_final_content))
+            yield {"type": "status", "message": "🔍 Self-Check: prüfe Antwort gegen Quellen"}
+            _reflect_msgs = msgs + [{"role": "user", "content": (
+                "SELF-CHECK (intern, nicht an den User): Prüfe deine letzte Antwort gegen die "
+                "Tool-Ergebnisse (web_search/read_url) in diesem Verlauf. Entferne oder korrigiere "
+                "JEDEN Fakten-Claim (Preis, Spec, Zahl, Datum, Version), der nicht durch ein "
+                "Tool-Ergebnis gedeckt ist. Behalte verifizierte Fakten + Links unverändert. "
+                "Gib NUR die korrigierte finale Antwort aus — keine Meta-Kommentare, keine Erklärung."
+            )}]
+            _refl = _dispatch_chat(config, try_model, _reflect_msgs,
+                                   system=system_effective, think=False,
+                                   options=options or None, timeout=_stream_timeout)
+            _refl_c = _strip_tool_call_tags((_refl.get("message", {}).get("content") or "").strip())
+            # Plausibilitätscheck: nicht leer, nicht absurd länger (kein Geschwafel/Loop)
+            if _refl_c and 20 < len(_refl_c) < len(_final_content) * 1.5 + 200:
+                if _url_guard_enabled:
+                    _refl_c, _rr_removed = _strip_unverified_urls(_refl_c, _seen_urls)
+                else:
+                    _rr_removed = []
+                if _refl_c.strip() and _refl_c.strip() != _final_content.strip():
+                    _log.info("Research-Reflection: Antwort überarbeitet (%d→%d chars, %d URLs entfernt)",
+                              len(_final_content), len(_refl_c), len(_rr_removed))
+                    _final_content = _refl_c.strip()
+                    # letzte Assistant-Message in History konsistent halten
+                    for _m in reversed(msgs):
+                        if _m.get("role") == "assistant":
+                            _m["content"] = _final_content
+                            break
+        except Exception as _refl_err:
+            _log.warning("Research-Reflection fehlgeschlagen (ignoriert): %s", _refl_err)
 
     # Pending Images: Bilder die via send_image/Bildgenerierung erzeugt wurden,
     # werden hier in den finalen Content injiziert (NICHT in Tool-Response,

@@ -1,56 +1,56 @@
-# Debate — Strukturierte KI-Debatte
+# Debate — Structured AI Debate
 
-Das `debate`-Tool startet eine mehrrundige, strukturierte Diskussion zwischen zwei KI-Perspektiven zu einem Thema. Beide Seiten werden von Subagent-Modellen argumentiert.
+The `debate` tool runs a multi-round, structured discussion between two AI perspectives on a topic. Both sides are argued by subagent models.
 
-## Ablauf
+## Flow
 
-1. **Hauptagent** ruft `debate(topic, perspective_a, perspective_b, model, ...)` auf
-2. Für jede Runde:
-   - **Seite A** argumentiert (bekommt Zusammenfassung bisheriger Runden + letztes B-Argument)
-   - **Seite B** antwortet (bekommt Zusammenfassung + aktuelles A-Argument)
-   - Runde wird **automatisch zusammengefasst** → kompakter Kontext für nächste Runde
-3. Nach allen Runden: **neutrales Fazit** wird generiert
-4. Vollständiges Transkript → Markdown-Datei im Workspace
+1. **Main agent** calls `debate(topic, perspective_a, perspective_b, model, ...)`
+2. For each round:
+   - **Side A** argues (gets a summary of prior rounds + B's last argument)
+   - **Side B** replies (gets the summary + A's current argument)
+   - The round is **summarized automatically** → compact context for the next round
+3. After all rounds: a **neutral conclusion** is generated
+4. Full transcript → Markdown file in the workspace
 
-## Warum Zusammenfassungen?
+## Why summaries?
 
-Kleine Modelle haben begrenzten Kontext. Statt den gesamten Debattenverlauf mitzuschicken (was nach 2-3 Runden den Kontext sprengt), bekommt jede Seite:
-- Eine **kompakte Zusammenfassung** aller bisherigen Runden (~150 Wörter)
-- Das **letzte Argument** der Gegenseite (vollständig)
+Small models have limited context. Instead of sending the entire debate history (which blows the context after 2-3 rounds), each side gets:
+- A **compact summary** of all prior rounds (~150 words)
+- The **last argument** of the other side (in full)
 
-So bleibt der Kontext überschaubar, auch bei 5-10 Runden.
+This keeps the context manageable even across 5-10 rounds.
 
-## Parameter
+## Parameters
 
-| Parameter | Pflicht | Beschreibung |
-|-----------|---------|-------------|
-| `topic` | ✅ | Das Debattenthema oder die Fragestellung |
-| `perspective_a` | ✅ | Position/Standpunkt von Seite A (z.B. "Pro Kernenergie") |
-| `perspective_b` | ✅ | Position/Standpunkt von Seite B (z.B. "Contra Kernenergie") |
-| `model` | ✅ | Subagent-Modell für Seite A (und B, wenn `model_b` nicht gesetzt) |
-| `model_b` | ❌ | Optionales anderes Modell für Seite B |
-| `rounds` | ❌ | Anzahl Hin-und-Her-Runden (1-10, Standard: 3) |
-| `language` | ❌ | Antwortsprache (Standard: Deutsch) |
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `topic` | ✅ | The debate topic or question |
+| `perspective_a` | ✅ | Position of side A (e.g. "Pro nuclear power") |
+| `perspective_b` | ✅ | Position of side B (e.g. "Against nuclear power") |
+| `model` | ✅ | Subagent model for side A (and B if `model_b` is unset) |
+| `model_b` | ❌ | Optional different model for side B |
+| `rounds` | ❌ | Number of back-and-forth rounds (1-10, default: 3) |
+| `language` | ❌ | Response language (default: German) |
 
-## Beispiele
+## Examples
 
-### Gleiche Modelle, verschiedene Perspektiven
+### Same model, different perspectives
 ```
 debate(
-  topic="Sollte Deutschland Atomkraftwerke wieder einschalten?",
-  perspective_a="Pro Kernenergie: Klimaschutz, Versorgungssicherheit",
-  perspective_b="Contra Kernenergie: Sicherheitsrisiken, Endlagerproblematik",
+  topic="Should Germany switch its nuclear plants back on?",
+  perspective_a="Pro nuclear: climate protection, supply security",
+  perspective_b="Against nuclear: safety risks, waste storage",
   model="qwen3",
   rounds=3
 )
 ```
 
-### Verschiedene Modelle
+### Different models
 ```
 debate(
-  topic="Ist Open Source besser als proprietäre Software?",
-  perspective_a="Open Source: Transparenz, Freiheit, Community",
-  perspective_b="Proprietär: Support, Integration, Stabilität",
+  topic="Is open source better than proprietary software?",
+  perspective_a="Open source: transparency, freedom, community",
+  perspective_b="Proprietary: support, integration, stability",
   model="qwen3",
   model_b="ollama-online/gemma3",
   rounds=5,
@@ -60,41 +60,41 @@ debate(
 
 ## Output
 
-- **Markdown-Datei** im Workspace: `debate-{thema}-{timestamp}.md`
-  - Header mit Metadaten (Modelle, Perspektiven, Runden)
-  - Jede Runde: Argument A + Argument B
-  - Fazit am Ende
-- **Tool-Rückgabe** an den Hauptagent: Zusammenfassung + Dateipfad
+- **Markdown file** in the workspace: `debate-{topic}-{timestamp}.md`
+  - Header with metadata (models, perspectives, rounds)
+  - Each round: argument A + argument B
+  - Conclusion at the end
+- **Tool return** to the main agent: summary + file path
 
-## Schutzmechanismen
+## Safeguards
 
-- **Max 10 Runden** — Hard-Limit verhindert Endlosschleifen
-- **Cancellation** — `/stop` oder `/abort` bricht die Debatte sauber ab (bisheriges Transkript bleibt erhalten)
-- **Status-Updates** — Bei Matrix/Discord: Fortschrittsmeldungen zwischen den Runden
-- **Fehlertoleranz** — Wenn ein Modell-Call fehlschlägt, wird "(Fehler: ...)" eingetragen statt Abbruch
+- **Max 10 rounds** — hard limit prevents infinite loops
+- **Cancellation** — `/stop` or `/abort` ends the debate cleanly (the transcript so far is kept)
+- **Status updates** — on Matrix/Discord: progress messages between rounds
+- **Fault tolerance** — if a model call fails, "(error: ...)" is recorded instead of aborting
 
-## Tool-Zugriff
+## Tool access
 
-Debattierer haben die **gleichen Tools wie normale Subagents**:
-- ✅ `web_search` — für aktuelle Informationen (Wetter, News, Preise, Fakten)
-- ✅ `exec` — Shell-Befehle (z.B. Dateien inspizieren bei Code-Debatten)
-- ✅ `check_url` — URL-Überprüfung
+Debaters have the **same tools as normal subagents**:
+- ✅ `web_search` — for current info (weather, news, prices, facts)
+- ✅ `exec` — shell commands (e.g. inspect files in code debates)
+- ✅ `check_url` — URL checking
 
-Das bedeutet: Debatten über **aktuelle Themen** funktionieren — die Debattierer können vor dem Argumentieren eine Web-Suche machen, um ihre Position mit aktuellen Daten zu untermauern.
+This means debates about **current topics** work — debaters can run a web search before arguing to back their position with up-to-date data.
 
-## Kontext-Management (für kleine Modelle)
+## Context management (for small models)
 
-Jede Seite bekommt pro Runde:
+Each side gets per round:
 ```
-System: Rolle + Position + Regeln (~200 Tokens)
-User:   Zusammenfassung bisheriger Runden (~150 Wörter)
-        + letztes Gegenargument (vollständig, max ~300 Wörter)
+System: role + position + rules (~200 tokens)
+User:   summary of prior rounds (~150 words)
+        + last counter-argument (full, max ~300 words)
 ```
-Gesamt pro Call: ~400-600 Tokens — passt auch in 2K-4K-Kontextmodelle.
+Total per call: ~400-600 tokens — fits even 2K-4K context models.
 
 ## Logging
 
-Bei aktiviertem `server.log_agent_actions`:
-- `DEBATE_START` — Topic, Perspektiven, Modelle, Runden
-- `DEBATE_ROUND` — Jedes einzelne Argument (A und B)
-- `DEBATE_END` — Abschluss mit Rundenzahl und Dateipfad
+With `server.log_agent_actions` enabled:
+- `DEBATE_START` — topic, perspectives, models, rounds
+- `DEBATE_ROUND` — each individual argument (A and B)
+- `DEBATE_END` — completion with round count and file path

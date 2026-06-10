@@ -611,12 +611,13 @@ def _stream_generator(
             return buf[:_open], buf[_open:]
         return buf, ""
 
+    from miniassistant.secret_mask import mask_stream_events as _mask_stream_events
     try:
-        for ev in chat_round_stream(
+        for ev in _mask_stream_events(chat_round_stream(
             config, history_messages, system_prompt, model,
             user_content, project_dir,
             images=images,
-        ):
+        ), config):
             ev_type = ev.get("type")
             if ev_type == "thinking" and ev.get("delta"):
                 total_thinking += ev["delta"]

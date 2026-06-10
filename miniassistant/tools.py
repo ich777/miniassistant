@@ -18,6 +18,8 @@ import threading
 
 import httpx
 
+from miniassistant import anubis
+
 try:
     from curl_cffi import requests as _curl_requests
     _CURL_CFFI_AVAILABLE = True
@@ -930,6 +932,18 @@ def read_url(url: str, max_chars: int | None = 8000, timeout: float = 15.0, conf
                 r.raise_for_status()
                 content_type = r.headers.get("content-type", "")
                 if "html" in content_type:
+                    # Anubis-PoW-Challenge (kommt als HTTP 200 mit JS-Challenge-Seite)
+                    # automatisch lösen, statt die Challenge-Seite als Inhalt zu liefern.
+                    if anubis.looks_like_anubis(r.text):
+                        solved = anubis.solve_and_fetch(
+                            u, r.text, headers=headers, timeout=max(timeout, 30.0), proxy=proxy_url,
+                        )
+                        if solved is not None:
+                            _log.info("read_url: Anubis-Challenge gelöst für %s", u)
+                            text = _html_to_text(solved)
+                            return {"ok": True, "content": fallback_note + _cache_and_trim(text),
+                                    "connection": connection_name, "anubis_solved": True}
+                        _log.warning("read_url: Anubis-Challenge erkannt, aber nicht lösbar für %s", u)
                     text = _html_to_text(r.text)
                 elif "json" in content_type:
                     text = r.text
@@ -958,6 +972,14 @@ def read_url(url: str, max_chars: int | None = 8000, timeout: float = 15.0, conf
                         if cr.status_code < 400:
                             ct = cr.headers.get("content-type", "")
                             if "html" in ct:
+                                if anubis.looks_like_anubis(cr.text):
+                                    solved = anubis.solve_and_fetch(
+                                        u, cr.text, headers=headers, timeout=max(timeout, 30.0), proxy=proxy_url,
+                                    )
+                                    if solved is not None:
+                                        _log.info("read_url: Anubis-Challenge gelöst (nach curl_cffi) für %s", u)
+                                        return {"ok": True, "content": _cache_and_trim(_html_to_text(solved)),
+                                                "connection": connection_name, "anubis_solved": True}
                                 text = _html_to_text(cr.text)
                             else:
                                 text = cr.text

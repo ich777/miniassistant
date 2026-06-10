@@ -1,58 +1,58 @@
 # Task Planning
 
-## Wann?
+## When?
 
-Plan erstellen wenn die Aufgabe **3 oder mehr Aktionen** hat (Änderungen, Installationen, Recherche-Schritte etc.).
-Auch wenn der User explizit sagt: "mach einen Plan", "plane das".
+Create a plan when the task has **3 or more actions** (changes, installs, research steps, etc.).
+Also when the user explicitly says: "make a plan", "plan this".
 
-**Kein Plan** bei: einfachen Fragen, 1-2 Schritten, kurzer Recherche.
+**No plan** for: simple questions, 1-2 steps, quick lookups.
 
 ---
 
 ## Format
 
-**Ort:** `{workspace}/THEMA-plan.md`
-**Dateiname:** Kleinbuchstaben, Bindestriche (z.B. `auth-refactoring-plan.md`)
+**Location:** `{workspace}/TOPIC-plan.md`
+**Filename:** lowercase, hyphens (e.g. `auth-refactoring-plan.md`)
 
 ```markdown
-# Plan: [Kurzer Titel]
+# Plan: [Short title]
 
-**Ziel:** [Was soll am Ende erreicht sein?]
-**Erstellt:** [Datum]
+**Goal:** [What should be achieved in the end?]
+**Created:** [Date]
 
-## Schritte
+## Steps
 
-- [ ] 1. Beschreibung
-- [ ] 2. Beschreibung
-- [ ] 3. Beschreibung
+- [ ] 1. Description
+- [ ] 2. Description
+- [ ] 3. Description
 
-## Notizen
+## Notes
 
-[Erkenntnisse, Entscheidungen während der Arbeit]
+[Findings, decisions made while working]
 ```
 
-**Markierungen:** `- [ ]` offen, `- [x]` erledigt, `- [!] Grund` fehlgeschlagen.
+**Markers:** `- [ ]` open, `- [x]` done, `- [!] reason` failed.
 
 ---
 
-## Regeln
+## Rules
 
-1. **Plan aktualisieren** nach jedem erledigten Schritt — nicht erst am Ende
-2. **Schritte kurz und konkret** — keine vagen Beschreibungen
-3. **Neue Schritte einfügen** wenn nötig — bestehenden Plan erweitern, keine neue Datei
-4. **Fehler ehrlich markieren** als `- [!]` mit Grund, korrigierten Schritt einfügen
-5. **Weitermachen** solange die nächsten Schritte klar sind — nur stoppen wenn User-Input nötig ist
-6. **Fortsetzen:** Wenn der User sagt "mach weiter" oder "schau dir den Plan an": Plan lesen, Status zusammenfassen, nächsten offenen Schritt weiterarbeiten
+1. **Update the plan** after each completed step — not only at the end
+2. **Keep steps short and concrete** — no vague descriptions
+3. **Insert new steps** when needed — extend the existing plan, no new file
+4. **Mark failures honestly** as `- [!]` with a reason, then add a corrected step
+5. **Keep going** while the next steps are clear — only stop when user input is required
+6. **Resuming:** if the user says "continue" or "look at the plan": read the plan, summarize status, work the next open step
 
-## Abschluss
+## Completion
 
-1. User kurz informieren (max 5-10 Sätze) was erledigt wurde
-2. Zusammenfassung in `{workspace}/THEMA-summary.md` schreiben
-3. Plan-Datei behalten als Referenz — nur löschen wenn der User es explizit sagt
+1. Briefly inform the user (max 5-10 sentences) what was done
+2. Write a summary to `{workspace}/TOPIC-summary.md`
+3. Keep the plan file as reference — only delete it if the user explicitly says so
 
 ---
 
 ## Subagents
 
-Wenn Subagents verfügbar sind, können eigenständige Schritte delegiert werden.
-**Immer Kontext mitgeben** — der Subagent kennt den Plan nicht. Details: siehe `SUBAGENTS.md`.
+If subagents are available, independent steps can be delegated.
+**Always pass context** — the subagent doesn't know the plan. Details: see `SUBAGENTS.md`.

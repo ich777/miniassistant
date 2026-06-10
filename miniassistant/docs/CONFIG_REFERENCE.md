@@ -73,6 +73,47 @@ stream_stall_timeout: 120                 # seconds without any chunk before war
 stream_thinking_timeout: 300              # seconds of thinking without content before abort (default: 300)
 stream_round_timeout: 600                 # max wall-clock seconds per streaming round (default: 600)
 tool_execution_timeout: 900               # max seconds for a single tool execution batch (default: 900)
+# --- Doom-loop guard: detects models stuck repeating output (esp. small models) ---
+stream_loop_max_consecutive: 4            # same line N× in a row → loop (default: 4)
+stream_loop_freq_window: 30               # window of recent lines for frequency check (default: 30)
+stream_loop_freq_threshold: 5             # one line repeats N× within that window → loop, even with
+                                          #   varying noise lines between (default: 5). Catches loops
+                                          #   that block-/diversity-checks miss.
+stream_loop_recovery_max: 2               # discard-and-retry attempts before hard abort (default: 2)
+stream_thinking_token_budget: 3000        # max thinking tokens without content/tool before abort (default: 3000)
+stream_thinking_hard_timeout: 240         # seconds of thinking without content → loop abort (default: 240)
+# --- URL hallucination guard: strips invented links from the final answer ---
+url_hallucination_guard: true             # every URL in the answer MUST have appeared in this round's
+                                          #   tool output (web_search hit or read_url/check_url) or the
+                                          #   user's own message; otherwise the link is removed
+                                          #   ([text](badurl) → text, bare URL dropped). default: true.
+                                          #   Pure post-processing — costs no context tokens.
+# --- Research-Gate: forces web_search before answering fact questions ---
+research_gate: true                       # claim questions (prices/specs/versions/news/buying advice)
+                                          #   are blocked from answering-from-memory: if the model tries
+                                          #   to answer without web_search, the answer is discarded and a
+                                          #   research nudge is injected. Pure python, no context cost. default: true
+research_gate_max: 1                      # max forced-research retries before letting the answer through (default: 1)
+research_gate_keywords: []                # optional: override the claim-trigger keyword list (empty = built-in defaults)
+# --- Tool lazy-load: only send rarely-used tool schemas when the message hints at them ---
+lazy_tools: false                         # OPT-IN (reliability-first). When true, only CORE tools
+                                          #   (exec, web_search, read_url, check_url, invoke_model,
+                                          #   send_image, download_file, status_update, wait) are always sent;
+                                          #   email/schedule/watch/webhook/debate/save_config/memory/history/audio
+                                          #   tools load only when the user message contains a trigger keyword.
+                                          #   Saves ~3.7k tokens on a typical turn. Risk: a deferred tool the
+                                          #   model needs without a keyword match is unavailable that turn. default: false
+# --- Link-resolution guard: strips cited links that are genuinely dead (404/410) ---
+link_resolution_guard: true               # each cited link is resolved via the robust fetcher
+                                          #   (curl_cffi Safari impersonation — gets through bot-protection
+                                          #   like geizhals/Anubis). Removed ONLY on a definitive 404/410;
+                                          #   403/timeout/5xx are kept (real-but-blocked/transient). Catches
+                                          #   stale web_search-snippet URLs that don't resolve. ~2-5s on
+                                          #   answers with links (parallel). default: true
+# --- Research reflection: one cheap self-check round on research answers ---
+research_reflection: false                # OPT-IN. After a research answer (web_search was used), run one
+                                          #   extra round where the model removes/corrects factual claims not
+                                          #   backed by tool results. Costs one extra inference (latency). default: false
 github_token: github_pat_xxx...           # optional: any token format (ghp_..., github_pat_...) — injected as GH_TOKEN/GITHUB_TOKEN into every exec call
 
 search_engines:
@@ -104,30 +145,30 @@ chat_clients:
     bot_token: "discord-bot-token"
 
 memory:
-  max_chars_per_line: 300                    # Nur Fallback — wird NICHT genutzt wenn mempalace.enabled: true
-  days: 2                                    # Nur Fallback — wird NICHT genutzt wenn mempalace.enabled: true
-  max_tokens: 4000                           # Nur Fallback — wird NICHT genutzt wenn mempalace.enabled: true
+  max_chars_per_line: 300                    # Fallback only — NOT used when mempalace.enabled: true
+  days: 2                                    # Fallback only — NOT used when mempalace.enabled: true
+  max_tokens: 4000                           # Fallback only — NOT used when mempalace.enabled: true
 
-# mempalace — AI Memory mit semantischer Suche (optional, spart ~3500 Tokens)
-# Voraussetzung: pip install 'miniassistant[mempalace]'
-# Wenn aktiviert:
-#   - System-Prompt nutzt L0 (Identity) + L1 (Top Moments) statt raw dump → ~200 statt ~4500 Tokens
-#   - Exchanges werden parallel in ChromaDB-Drawers gespeichert (+ tägliche .md als Backup)
-#   - LLM bekommt `search_memory` Tool für semantische Suche in vergangenen Gesprächen
-#   - memory.days/max_tokens/max_chars_per_line werden NICHT mehr benutzt (nur Fallback)
-# Daten liegen LOKAL unter agent_dir/mempalace/ — es wird NICHTS an externe Server gesendet.
-# ChromaDB-Telemetrie ist explizit deaktiviert (ANONYMIZED_TELEMETRY=False).
+# mempalace — AI memory with semantic search (optional, saves ~3500 tokens)
+# Requirement: pip install 'miniassistant[mempalace]'
+# When enabled:
+#   - System prompt uses L0 (identity) + L1 (top moments) instead of a raw dump → ~200 instead of ~4500 tokens
+#   - Exchanges are stored in parallel in ChromaDB drawers (+ daily .md as backup)
+#   - The LLM gets a `search_memory` tool for semantic search over past conversations
+#   - memory.days/max_tokens/max_chars_per_line are NO longer used (fallback only)
+# Data is stored LOCALLY under agent_dir/mempalace/ — NOTHING is sent to external servers.
+# ChromaDB telemetry is explicitly disabled (ANONYMIZED_TELEMETRY=False).
 mempalace:
-  enabled: false                             # true = mempalace aktivieren (erstellt Palace beim ersten Start automatisch)
-  wing: miniassistant                        # Wing-Name für gespeicherte Gespräche
-  default_room: conversations                # Default-Room für neue Exchanges
-  max_tokens: 900                            # Token-Budget für L0+L1 im System-Prompt (~500-900)
-  language: de                               # Entity-Detection-Sprache(n); str oder Liste (z.B. [de, en]). Default leer = en.
+  enabled: false                             # true = enable mempalace (creates the palace automatically on first start)
+  wing: miniassistant                        # wing name for stored conversations
+  default_room: conversations                # default room for new exchanges
+  max_tokens: 900                            # token budget for L0+L1 in the system prompt (~500-900)
+  language: de                               # entity-detection language(s); str or list (e.g. [de, en]). Default empty = en.
   # palace_path: ~/.config/miniassistant/agent/mempalace/palace  # Default: agent_dir/mempalace/palace
-  # identity_path: ~/.config/miniassistant/agent/mempalace/identity.txt  # L0 Identity-Datei
+  # identity_path: ~/.config/miniassistant/agent/mempalace/identity.txt  # L0 identity file
 
 chat:
-  context_quota: 0.85                      # Anteil von num_ctx der genutzt wird (0.5–0.95). Bei Überschreitung: Smart Compacting
+  context_quota: 0.85                      # fraction of num_ctx that is used (0.5–0.95). On overflow: smart compacting
 
 # Vision & Image (optional)
 vision:

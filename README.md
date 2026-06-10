@@ -156,6 +156,8 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Authorization $http_authorization;
         
         # Streaming unterstuetzen
@@ -207,6 +209,18 @@ Unterschiede: `/v1/` = mit Agent-Context (MiniAssistant), `/raw/v1/` = direkter 
 
 In der Config `server.host: "0.0.0.0"` setzen (miniassistant config oder YAML). **Wichtig**: Token setzen, damit nur Berechtigte zugreifen.
 
+## Hinter einem Reverse-Proxy
+
+Wird MiniAssistant nur via Reverse-Proxy ins Internet gestellt (empfohlen), bind weiter auf `127.0.0.1` und beachte:
+
+- **`server.trust_forwarded: true` setzen.** Sonst sieht der Server jede Anfrage als vom Proxy kommend (`127.0.0.1`) — dann teilen sich *alle* Clients einen Rate-Limit- und Brute-Force-Zähler, und ein einzelner Angreifer kann mit fehlgeschlagenen Logins **alle** Nutzer für 1 h aussperren. Nur aktivieren, wenn wirklich ein vertrauenswürdiger Proxy davorsitzt (sonst kann jeder Client seine IP per Header spoofen).
+- **Der Proxy muss die echte Client-IP weiterreichen.** Im Nginx-Beispiel oben zusätzlich:
+  ```nginx
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  ```
+- **`server.rate_limit`** (Requests/Minute pro IP für `/` und `/v1`, Default `100`, `0` = aus) und **`raw_proxy.rate_limit`** greifen erst sinnvoll, wenn `trust_forwarded` aktiv ist — sonst zählt alles gegen die Proxy-IP.
+
 ## System-Erkennung
 
 Die LLM erfährt automatisch, auf welchem System sie läuft (OS, Distribution, Paketmanager, Init-System), damit sie die passenden Befehle nutzt (z. B. apt vs dnf, systemctl vs service). Erkannt werden u. a. Debian/Ubuntu, Fedora/RHEL, Arch, Alpine, openSUSE, macOS.
@@ -236,4 +250,8 @@ Siehe [MINIASSISTANT_PLAN.md](MINIASSISTANT_PLAN.md) für Features: mehrere Mode
 
 ## Lizenz
 
-MIT
+LGPL 2.1 (GNU Lesser General Public License, Version 2.1)
+
+## KI Hinweis
+
+Was als kleines KI-Projekt von Menschen begann, schreibt sich mittlerweile selbst. Die laufende Umsetzung macht inzwischen direkt die KI; Code, Doku und Fixes entstehen mit einem KI-Agenten.

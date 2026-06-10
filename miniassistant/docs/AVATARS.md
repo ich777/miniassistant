@@ -124,7 +124,7 @@ curl -s -X PATCH "https://discord.com/api/v10/users/@me" \
 ## Onboarding
 
 During onboarding, ask the user if they want to set an avatar:
-- "Hast du ein Profilbild/Avatar für den Bot? (PNG-Datei oder URL, optional)"
+- "Do you have a profile picture/avatar for the bot? (PNG file or URL, optional)"
 - If yes: download/copy to `agent_dir/avatar.png`, save path in config.
 - If no: the default logo will be used.
 
@@ -133,4 +133,4 @@ During onboarding, ask the user if they want to set an avatar:
 If the configured avatar path doesn't exist or the URL is invalid:
 1. Log a warning.
 2. Fall back to the default logo (`miniassistant/web/static/miniassistant.png`).
-3. Tell the user: "Avatar nicht gefunden. Bitte einen neuen setzen oder den Pfad in der Config prüfen."
+3. Tell the user: "Avatar not found. Please set a new one or check the path in the config."

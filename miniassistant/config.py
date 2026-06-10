@@ -639,6 +639,13 @@ def _merge_with_defaults(data: dict[str, Any]) -> dict[str, Any]:
             "host": server.get("host", DEFAULT_BIND_HOST),
             "port": server.get("port", DEFAULT_BIND_PORT),
             "token": server.get("token"),  # None = generate on first run
+            # X-Forwarded-For/X-Real-IP nur hinter vertrauenswürdigem Reverse-Proxy trusten.
+            # Default False: ohne Proxy darf kein Client seine IP spoofen (Rate-Limit/Brute-Force-Bypass).
+            "trust_forwarded": bool(server.get("trust_forwarded", False)),
+            # Requests/Minute pro IP für / und /v1 (0 = aus). raw_proxy hat eigenes Limit.
+            "rate_limit": int(server.get("rate_limit", 100) or 0),
+            # Bekannte Config-Secrets im LLM-Output + Tool-Ergebnissen maskieren (Defense-in-Depth).
+            "mask_secrets_in_output": bool(server.get("mask_secrets_in_output", True)),
             "debug": server.get("debug", False),  # true = Request/Response-JSON in API-Antwort
             "show_estimated_tokens": server.get("show_estimated_tokens", False),
             "log_agent_actions": server.get("log_agent_actions", False),
@@ -707,10 +714,18 @@ def _merge_with_defaults(data: dict[str, Any]) -> dict[str, Any]:
             "tool_execution_timeout", "subagent_execution_timeout", "schedule_timeout",
             "stream_stall_timeout", "stream_thinking_timeout", "stream_thinking_hard_timeout",
             "stream_round_timeout", "stream_loop_max_consecutive", "stream_loop_recovery_max",
+            "stream_loop_freq_window", "stream_loop_freq_threshold", "stream_thinking_token_budget",
             "max_tool_rounds", "exec_max_output_chars",
             "search_engine_strategy", "prefs_max_chars", "prefs_max_chars_per_file",
             "respond_in_input_language",
             "doc_max_chars", "doc_max_pages_render",
+            # Reliability/Context-Knobs (2026-06): Guards + Lazy-Load + Reflection
+            "url_hallucination_guard", "research_gate", "research_gate_max",
+            "research_gate_keywords", "lazy_tools", "research_reflection",
+            "link_resolution_guard", "tool_call_dedup",
+            # Image-Edit-Tuning: strength-Default (1.0 = voller Denoise, nötig damit
+            # qwen-image-edit & Co. die Instruktion anwenden); max_edge cappt Quell-Auflösung.
+            "image_edit_strength", "image_edit_max_edge",
         ) if k in data and data[k] is not None},
     }
 
@@ -782,6 +797,9 @@ def save_config(config: dict[str, Any], project_dir: str | None = None) -> Path:
             "host": config["server"].get("host", DEFAULT_BIND_HOST),
             "port": config["server"].get("port", DEFAULT_BIND_PORT),
             "token": config["server"].get("token"),
+            "trust_forwarded": bool(config["server"].get("trust_forwarded", False)),
+            "rate_limit": int(config["server"].get("rate_limit", 100) or 0),
+            "mask_secrets_in_output": bool(config["server"].get("mask_secrets_in_output", True)),
             "debug": config["server"].get("debug", False),
             "show_estimated_tokens": config["server"].get("show_estimated_tokens", False),
             "log_agent_actions": config["server"].get("log_agent_actions", False),

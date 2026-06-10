@@ -8,9 +8,9 @@ They live in `{agent_dir}/directions/` and are read on-demand — they are NOT a
 ## When to check for a directions file
 
 - The user asks you to do something that sounds like a recurring or configured task
-  (e.g. "prüf die Sonarr-Queue", "Cloudflare Analytics abrufen", "GitHub Issues checken")
+  (e.g. "check the Sonarr queue", "fetch Cloudflare analytics", "check GitHub issues")
 - A scheduled agent receives a task prompt
-- A prompt explicitly says "Lies die Anweisungen aus directions/..." or "folge der Direktive"
+- A prompt explicitly says "read the instructions from directions/..." or "follow the direction"
 
 **Always `ls directions/` first** — filenames describe the service/task.
 If a matching file exists: `cat` it, find the relevant task section, execute it.
@@ -25,15 +25,15 @@ Use when a file covers exactly one operation:
 ```markdown
 # ServiceName - Directions
 
-## Aufgabe
-What to do — action-oriented ("Hole X", "Prüfe Y", "Erstelle Z").
+## Task
+What to do — action-oriented ("Fetch X", "Check Y", "Create Z").
 
-## Methode
+## Method
 1. Step one
 2. Step two
 
-## Ausgabe-Format
-Kein Codeblock — direkt als Markdown ausgeben.
+## Output format
+No code block — output directly as Markdown.
 
 Expected output structure here (as raw Markdown, NOT inside a code block).
 ```
@@ -52,21 +52,21 @@ Separate tasks with `---`. When executing: run ONLY the task the user asked for.
 
 ## Task A: Short description
 
-### Aufgabe
+### Task
 What to do.
 
-### Methode
+### Method
 Step 1 ...
 Step 2 ...
 
-### Ausgabe-Format
-Kein Codeblock — direkt als Markdown ausgeben.
+### Output format
+No code block — output directly as Markdown.
 
 ---
 
 ## Task B: Short description
 
-### Aufgabe
+### Task
 ...
 ```
 
@@ -76,13 +76,13 @@ Kein Codeblock — direkt als Markdown ausgeben.
 
 ## What to include per task
 
-- **Aufgabe:** What the agent must DO. NOT setup language ("Erstelle einen Token...").
-- **Methode:** Exact API endpoints, commands, tool calls — no guessing needed.
+- **Task:** What the agent must DO. NOT setup language ("Create a token...").
+- **Method:** Exact API endpoints, commands, tool calls — no guessing needed.
 - **Credentials/Tokens:** Include values directly so the agent can use them in `exec: curl` immediately.
-  NEVER write "Token muss erstellt werden" — only fulfilled prerequisites belong here.
-- **Ausgabe-Format:** Exact expected output structure as raw Markdown.
+  NEVER write "a token must be created" — only fulfilled prerequisites belong here.
+- **Output format:** Exact expected output structure as raw Markdown.
   **CRITICAL:** Never show output examples inside ` ``` ` code blocks — the executing agent mirrors whatever wrapper you use.
-  Always add: `Kein Codeblock — direkt als Markdown ausgeben.`
+  Always add: `No code block — output directly as Markdown.`
 
 **What NOT to include:** Setup instructions, unmet prerequisites, references to the current session.
 
@@ -103,13 +103,13 @@ Kein Codeblock — direkt als Markdown ausgeben.
 
 If a task from a directions file should be executed by a subagent via `invoke_model`:
 - **Do NOT** pass the file path — the subagent should not have to read or discover the file itself
-- **Do** read the file yourself, extract the relevant task section (Aufgabe + Methode + Ausgabe-Format), and include it verbatim in the `invoke_model` message
+- **Do** read the file yourself, extract the relevant task section (Task + Method + Output format), and include it verbatim in the `invoke_model` message
 - The subagent message must be fully self-contained — credentials, endpoints, expected output format all included
 
 ---
 
 ## When to create a directions file
 
-- User says "speicher das als Direktive", "leg eine Directions-Datei an", "merk dir wie das geht", "speichere diese Anweisung"
+- User says "save that as a direction", "create a directions file", "remember how this works", "save this instruction"
 - A scheduled task prompt references a directions file
 - A task is too complex to encode fully in a schedule prompt

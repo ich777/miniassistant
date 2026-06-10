@@ -158,6 +158,7 @@ Web-UI und API (Bind-Adresse, **Port**, Token). Port und Host sind einstellbar (
 | `show_context` | boolean | nein | `false` | Wenn `true`: Vor jedem Ollama-Call wird der **vollständige Kontext** (System-Prompt, Messages, Token-Schätzung, verbleibende Tokens für Response/Thinking) in `$config_dir/logs/context.log` geschrieben. Format analog zu `agent_actions.log` mit Zeitstempel. Nützlich zum Debugging des Kontexts und Token-Budgets. |
 | `track_usage` | boolean | nein | `false` | Wenn `true`: Jeder LLM-Aufruf wird mit Zeitstempel, Modell, Typ und Dauer (Sekunden) in `$config_dir/usage/usage.csv` aufgezeichnet. Typen: `chat`, `vision`, `subagent`, `image` (Erfolg) sowie `chat_error`, `vision_error`, `subagent_error`, `image_error` (Timeout/Fehler – inkl. Retry-Zeit). Die Daten können in der Web-UI unter **Nutzung** (`/nutzung`) mit Zeitfiltern und Charts eingesehen werden. |
 | `rate_limit` | integer | nein | `100` | Maximale Anzahl Anfragen pro IP-Adresse **pro Minute** (Sliding-Window). Gilt für alle Endpunkte außer statischen Dateien. Bei Überschreitung: HTTP 429 mit `Retry-After: 60`. Auf `0` setzen zum Deaktivieren. |
+| `trust_forwarded` | boolean | nein | `false` | Nur hinter einem **vertrauenswürdigen** Reverse-Proxy auf `true` setzen. Dann werden `X-Forwarded-For`/`X-Real-IP` als echte Client-IP genutzt (für Rate-Limit und Brute-Force-Schutz). **Ohne diese Option** sieht der Server hinter einem Proxy jede Anfrage als von `127.0.0.1` kommend → alle Clients teilen sich einen Zähler, und ein einzelner Angreifer kann per fehlgeschlagener Logins **alle** Nutzer 1 h aussperren. **Niemals** ohne davorgeschalteten Proxy aktivieren, sonst kann jeder Client seine IP per Header fälschen. |
 
 **Body-Size-Limits (fix):** Chat-, Onboarding-, OpenAI-compat-, Raw-Proxy- und Webhook-Endpoints akzeptieren bis zu **35 MB** (Bilder/Audio/Dokumente als base64). Config + andere `/api/*` Endpoints: **1 MB**. Bei Überschreitung: HTTP 413.
 
@@ -186,6 +187,7 @@ location /api/ {
     proxy_pass http://127.0.0.1:8765;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 
     # Pflicht für SSE (Streaming)
     proxy_buffering off;
@@ -198,10 +200,14 @@ location /api/ {
 location /v1/ {
     proxy_pass http://127.0.0.1:8765;
     proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 }
 ```
 
 Der Token muss bei jedem Request im Header mitgeschickt werden: `Authorization: Bearer <token>`.
+
+> **Wichtig hinter dem Proxy:** Damit Rate-Limit und Brute-Force-Schutz die echte Client-IP sehen, muss der Proxy `X-Forwarded-For`/`X-Real-IP` setzen (siehe `proxy_set_header` oben) **und** in der Config `server.trust_forwarded: true` gesetzt sein. Ohne beides zählt jeder Request gegen die Proxy-IP (`127.0.0.1`) — dann sperrt ein einzelner Angreifer alle Nutzer aus.
 
 ---
 
@@ -646,6 +652,9 @@ server:
   token: "dein-geheimes-token"
   show_estimated_tokens: false
   rate_limit: 100       # req/min pro IP (default 100; 0 = deaktiviert)
+  # trust_forwarded: true   # NUR hinter vertrauenswuerdigem Reverse-Proxy aktivieren
+                            # (dann zaehlt Rate-Limit/Brute-Force gegen die echte Client-IP).
+                            # Ohne Proxy weglassen — sonst kann jeder Client seine IP faelschen.
 
 # Raw OpenAI Proxy (optional)
 raw_proxy:
@@ -1463,6 +1472,43 @@ image_generation:
 ```yaml
 image_generation: "stable-diffusion"
 ```
+
+#### Bild-Editing (img2img / Edit-Strength)
+
+Schickt man ein Bild mit Edit-Anweisung, läuft img2img/Edit auf dem Backend. Die **Edit-Strength**
+(Denoise-Stärke) steuert, wie stark das Quellbild verändert wird:
+
+- `1.0` = voller Denoise ab reinem Rauschen → Anweisung greift, Komposition wird via Referenz-Conditioning erhalten. **Default.**
+- `< 1.0` = startet vom Input-Latent (partial denoise) → Output bleibt näher am Original.
+
+> **Wichtig — Edit-Modelle sind oft bimodal:** `qwen-image-edit` (und andere distillierte Edit-Pipelines
+> auf sd-server / stable-diffusion.cpp) injizieren das Quellbild **zusätzlich** als Referenz-Conditioning.
+> Bei `strength < 1.0` ankert der Output doppelt am Input → das Ergebnis sieht ~identisch zum Original aus,
+> die Anweisung wird ignoriert. Für solche Modelle **muss `image_edit_strength = 1.0`** sein.
+> Echte img2img-Backends (nicht-Edit) wollen evtl. `0.5`–`0.8`.
+
+Präzedenz (spezifisch → allgemein):
+
+1. **Pro Modell** (empfohlen) — in `providers.<prov>.model_options.<modell>.image_edit_strength`:
+   ```yaml
+   providers:
+     llama-swap:
+       model_options:
+         qwen-image-edit:
+           image_edit_strength: 1.0   # bimodal → nicht runtersetzen
+         my-img2img-model:
+           image_edit_strength: 0.65  # echtes img2img → weicher
+   ```
+2. **Pro Provider** — `providers.<prov>.image_edit_strength`.
+3. **Global** — top-level `image_edit_strength` (auch im Form-Editor unter *Tuning*).
+4. Default `1.0`.
+
+Pro Request lässt sich Strength zusätzlich via Tool-Parameter `strength` bzw. einer Größe im Prompt überschreiben.
+
+| Key | Typ | Default | Beschreibung |
+|-----|-----|---------|-------------|
+| `image_edit_strength` | float | `1.0` | Denoise-Stärke beim Edit (0–1). Global / Provider / `model_options`. |
+| `image_edit_max_edge` | integer | `2048` | Längste Kante der Quelle wird beim Edit darauf gecappt (verhindert OOM bei 4K-Quellen). |
 
 ### Bekannte Vision-Modelle
 

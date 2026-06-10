@@ -129,16 +129,16 @@ Files that are typically protected:
 
 ## Email schedule examples
 
-User says "prüf meine Mails alle 30 Minuten":
+User says "check my mail every 30 minutes":
 ```
 schedule(action='create', when='*/30 * * * *',
-  prompt='Check email account "privat" for new messages. Read EMAIL.md for IMAP instructions. Track reported messages in WORKSPACE/email-track-privat.md. Send a summary for each new message (sender, subject, 2-sentence preview). If no new messages: respond with EXACTLY [NO_MESSAGE] — the scheduler recognizes this token and sends nothing to the chat.')
+  prompt='Check email account "personal" for new messages. Read EMAIL.md for IMAP instructions. Track reported messages in WORKSPACE/email-track-personal.md. Send a summary for each new message (sender, subject, 2-sentence preview). If no new messages: respond with EXACTLY [NO_MESSAGE] — the scheduler recognizes this token and sends nothing to the chat.')
 ```
 
-User says "richte einen Auto-Responder ein für Mails von chef@firma.de":
+User says "set up an auto-responder for emails from boss@company.com":
 ```
 schedule(action='create', when='*/15 * * * *',
-  prompt='Check email account "arbeit" for new messages. Read EMAIL.md for auto-reply instructions. Auto-reply to emails from chef@firma.de: "Nachricht erhalten, ich melde mich in 24h." Track replied UIDs in WORKSPACE/email-track-arbeit.md. Never reply twice to the same message.')
+  prompt='Check email account "work" for new messages. Read EMAIL.md for auto-reply instructions. Auto-reply to emails from boss@company.com: "Message received, I will get back to you within 24h." Track replied UIDs in WORKSPACE/email-track-work.md. Never reply twice to the same message.')
 ```
 
 ## Schedules that need web scraping or Playwright

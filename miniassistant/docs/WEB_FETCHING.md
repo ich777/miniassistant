@@ -125,3 +125,23 @@ read_url(url="https://example.com", proxy="vpn1")
 - Site is unreachable from the direct connection
 
 **Combined (JS + proxy):** Playwright does not use proxies (browser runs locally). The proxy only applies to the normal httpx fetch.
+
+---
+
+## Anti-Bot / Bot-Detection (automatic)
+
+`read_url` bypasses common bot walls on its own — no flag needed:
+
+1. **Cloudflare/CDN TLS fingerprint (HTTP 403/429):** on a block, `curl_cffi` with
+   Safari TLS impersonation is retried automatically. Needs the `browser` extra
+   (`pip install 'miniassistant[browser]'`, default since install.sh).
+2. **Anubis Proof-of-Work / preact challenge:** Anubis returns HTTP 200 with a
+   JS challenge page. `read_url` detects it (content sniff), solves the challenge in
+   pure Python (`miniassistant/anubis.py`) and fetches the real page — no browser.
+   - `fast`/`slow`: SHA-256 nonce brute-force until `difficulty` leading zero hex chars.
+   - `preact`: single SHA-256 + server-side time lock (`difficulty*80ms`).
+   Success sets `anubis_solved: true` in the result. Only beats open PoW walls —
+   Cloudflare Turnstile and similar are out of scope (use `js: true` if needed).
+
+Everything degrades cleanly: if `curl_cffi` is missing or the challenge is unknown, the
+normal error/content is returned.

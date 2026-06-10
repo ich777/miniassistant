@@ -243,10 +243,38 @@ def get_options_for_model(config: dict[str, Any], model_name: str) -> dict[str, 
     base.pop("think", None)
     # 'slot_cache' ist ein MA-internes Flag — nicht an Ollama/llama.cpp senden
     base.pop("slot_cache", None)
+    # 'image_edit_strength' ist MA-intern (Image-Edit) — kein Chat-Option
+    base.pop("image_edit_strength", None)
     # num_ctx=0 bedeutet "nicht setzen, Server-Default nutzen"
     if "num_ctx" in base and not base["num_ctx"]:
         base.pop("num_ctx")
     return base
+
+
+def get_image_edit_strength_for_model(config: dict[str, Any], model_name: str) -> float:
+    """Edit-Strength (img2img denoise) für ein Image-Edit-Modell.
+
+    Präzedenz (spezifisch → allgemein):
+      1. model_options[model].image_edit_strength  (pro Modell — empfohlen)
+      2. provider.image_edit_strength              (pro Provider)
+      3. top-level config.image_edit_strength      (global)
+      4. 1.0                                        (Default: voller Denoise)
+
+    Hintergrund: qwen-image-edit & andere Edit-Pipelines auf sd-server sind ~bimodal —
+    <1.0 ankert am Input (kein Edit), 1.0 lässt die Instruktion greifen. Andere Backends
+    (echte img2img) wollen evtl. 0.5-0.8. Darum pro Modell konfigurierbar."""
+    prov, clean = get_provider_config(config, model_name)
+    per_model = prov.get("model_options") or {}
+    lookup = clean or model_name
+    if isinstance(per_model, dict) and lookup:
+        overlay = per_model.get(lookup)
+        if isinstance(overlay, dict) and overlay.get("image_edit_strength") is not None:
+            return float(overlay["image_edit_strength"])
+    if prov.get("image_edit_strength") is not None:
+        return float(prov["image_edit_strength"])
+    if config.get("image_edit_strength") is not None:
+        return float(config["image_edit_strength"])
+    return 1.0
 
 
 def get_base_url_for_model(config: dict[str, Any], model_name: str) -> str:
