@@ -21,6 +21,30 @@ DEFAULT_AGENT_DIR = "agent"
 DEFAULT_MAX_CHARS_PER_FILE = 500
 CONFIG_FILENAME = "config.yaml"
 
+# Top-level Tuning-/Reliability-Keys, die als optionale Passthrough-Keys behandelt werden:
+# beim Laden nur übernommen wenn in der YAML gesetzt, beim Speichern nur geschrieben wenn gesetzt.
+# EINE Quelle für Laden UND Speichern — sonst droppt save_config Keys, die _merge_with_defaults
+# akzeptiert (genau diese Bug-Klasse: image_edit_*, stream_loop_*, research_gate, … gingen über
+# die Form-/save_config-UI verloren, obwohl die Raw-YAML-Bearbeitung sie behielt).
+_PASSTHROUGH_TUNING_KEYS = (
+    "api_timeout", "subagent_api_timeout", "invoke_model_timeout",
+    "tool_execution_timeout", "subagent_execution_timeout", "schedule_timeout",
+    "stream_stall_timeout", "stream_thinking_timeout", "stream_thinking_hard_timeout",
+    "stream_round_timeout", "stream_loop_max_consecutive", "stream_loop_recovery_max",
+    "stream_loop_freq_window", "stream_loop_freq_threshold", "stream_thinking_token_budget",
+    "max_tool_rounds", "exec_max_output_chars", "exec_timeout_seconds",
+    "search_engine_strategy", "prefs_max_chars", "prefs_max_chars_per_file",
+    "respond_in_input_language",
+    "doc_max_chars", "doc_max_pages_render", "doc_response_reserve",
+    # Reliability/Context-Knobs: Guards + Lazy-Load + Reflection
+    "url_hallucination_guard", "research_gate", "research_gate_max",
+    "research_gate_keywords", "lazy_tools", "research_reflection",
+    "link_resolution_guard", "tool_call_dedup",
+    # Image-Edit-Tuning: strength-Default (1.0 = voller Denoise, nötig damit qwen-image-edit
+    # & Co. die Instruktion anwenden); max_edge cappt Quell-Auflösung.
+    "image_edit_strength", "image_edit_max_edge",
+)
+
 # ---------------------------------------------------------------------------
 # Config-RAM-Cache: vermeidet Disk-I/O + YAML-Parse bei jedem Aufruf.
 # Invalidiert automatisch nach _CONFIG_CACHE_TTL Sekunden und bei save_config.
@@ -709,24 +733,7 @@ def _merge_with_defaults(data: dict[str, Any]) -> dict[str, Any]:
             "language": _normalize_mempalace_language((data.get("mempalace") or {}).get("language")),
         },
         # Top-level Tuning-Keys: nur einfügen wenn in YAML gesetzt (Key fehlt → Caller-Default greift)
-        **{k: data[k] for k in (
-            "api_timeout", "subagent_api_timeout", "invoke_model_timeout",
-            "tool_execution_timeout", "subagent_execution_timeout", "schedule_timeout",
-            "stream_stall_timeout", "stream_thinking_timeout", "stream_thinking_hard_timeout",
-            "stream_round_timeout", "stream_loop_max_consecutive", "stream_loop_recovery_max",
-            "stream_loop_freq_window", "stream_loop_freq_threshold", "stream_thinking_token_budget",
-            "max_tool_rounds", "exec_max_output_chars",
-            "search_engine_strategy", "prefs_max_chars", "prefs_max_chars_per_file",
-            "respond_in_input_language",
-            "doc_max_chars", "doc_max_pages_render",
-            # Reliability/Context-Knobs (2026-06): Guards + Lazy-Load + Reflection
-            "url_hallucination_guard", "research_gate", "research_gate_max",
-            "research_gate_keywords", "lazy_tools", "research_reflection",
-            "link_resolution_guard", "tool_call_dedup",
-            # Image-Edit-Tuning: strength-Default (1.0 = voller Denoise, nötig damit
-            # qwen-image-edit & Co. die Instruktion anwenden); max_edge cappt Quell-Auflösung.
-            "image_edit_strength", "image_edit_max_edge",
-        ) if k in data and data[k] is not None},
+        **{k: data[k] for k in _PASSTHROUGH_TUNING_KEYS if k in data and data[k] is not None},
     }
 
 
@@ -845,16 +852,10 @@ def save_config(config: dict[str, Any], project_dir: str | None = None) -> Path:
         out["github_token"] = config["github_token"]
     if config.get("voice"):
         out["voice"] = config["voice"]
-    # Top-level Tuning-Keys: nur schreiben wenn gesetzt (kein Default-Spam in YAML)
-    for _k in (
-        "api_timeout", "subagent_api_timeout", "invoke_model_timeout",
-        "tool_execution_timeout", "subagent_execution_timeout", "schedule_timeout",
-        "stream_stall_timeout", "stream_thinking_timeout", "stream_round_timeout",
-        "max_tool_rounds", "exec_max_output_chars",
-        "search_engine_strategy", "prefs_max_chars", "prefs_max_chars_per_file",
-        "respond_in_input_language",
-        "doc_max_chars", "doc_max_pages_render",
-    ):
+    # Top-level Tuning-Keys: nur schreiben wenn gesetzt (kein Default-Spam in YAML).
+    # Gleiche Key-Liste wie beim Laden (_PASSTHROUGH_TUNING_KEYS) — sonst droppt Speichern Keys,
+    # die das Laden akzeptiert (z. B. image_edit_*, stream_loop_*, research_gate via Form-UI).
+    for _k in _PASSTHROUGH_TUNING_KEYS:
         _v = config.get(_k)
         if _v is not None:
             out[_k] = _v

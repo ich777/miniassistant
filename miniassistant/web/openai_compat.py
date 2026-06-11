@@ -247,6 +247,12 @@ def _make_response(
     return resp
 
 
+# OpenAI/llama.cpp senden auf JEDEM Chunk ein system_fingerprint. Der Raw-Proxy reicht es durch,
+# der Agent-Pfad nicht — das war der letzte strukturelle Unterschied zum funktionierenden Raw-Stream
+# (Verdacht: OpenWebUI knüpft die ⓘ-Generation-Info daran). Wert ist opak, nur Präsenz zählt.
+_SYSTEM_FINGERPRINT = "fp_miniassistant"
+
+
 def _make_stream_chunk(
     completion_id: str,
     model: str,
@@ -268,6 +274,7 @@ def _make_stream_chunk(
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": model,
+        "system_fingerprint": _SYSTEM_FINGERPRINT,
         "choices": [
             {
                 "index": 0,
@@ -549,13 +556,16 @@ def _stream_generator(
     persist_exchange: bool = False,
 ):
     """SSE-Stream-Generator im OpenAI-Format (data: {...}\\n\\n).
-    Nutzt chat_round_stream für vollständige Tool-Execution."""
+    Nutzt chat_round_stream für vollständige Tool-Execution.
+    Am Stream-Ende wird IMMER ein finaler usage/timings-Chunk gesendet (siehe unten) — wie llama.cpp,
+    damit OpenWebUI seine ⓘ-Generation-Info anzeigt (es sendet kein stream_options.include_usage)."""
     # Erster Chunk: role
     first_chunk = {
         "id": completion_id,
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": model_display,
+        "system_fingerprint": _SYSTEM_FINGERPRINT,
         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
     }
     yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n"
@@ -581,6 +591,11 @@ def _stream_generator(
     total_content = ""
     total_thinking = ""
     _audio_buf = ""  # Buffer für <audio>-Tag-Erkennung über Chunk-Grenzen
+    _final_ctx: list[int] = []  # [used, max] aus dem done-Event (für usage-Chunk)
+    _final_tps: float = 0.0     # tokens/sec aus dem done-Event (für timings im usage-Chunk)
+    _gen_start = time.time()    # Wall-Clock-Start für tps-Fallback wenn done-Event keine tps liefert
+    _raw_usage: dict | None = None    # echte Upstream-usage (llama.cpp) — verbatim durchreichen wenn da
+    _raw_timings: dict | None = None  # echte Upstream-timings — byte-identisch zum Raw-Proxy
 
     _api_base = (config.get("_chat_context") or {}).get("_api_base_url", "")
 
@@ -629,8 +644,14 @@ def _stream_generator(
                     total_content += _emit
                     yield _make_stream_chunk(completion_id, model_display, content=_emit)
             elif ev_type == "status":
-                # Keepalive: leerer Delta-Chunk hält den Socket offen
-                yield _make_stream_chunk(completion_id, model_display)
+                # Status (z. B. "Komprimiere Chat-Verlauf…") als thinking-Delta sichtbar machen:
+                # Clients mit Reasoning-Anzeige (OpenWebUI etc.) zeigen es, ohne die finale Antwort
+                # zu verschmutzen. Ohne Message: leerer Keepalive-Chunk hält nur den Socket offen.
+                _smsg = (ev.get("message") or "").strip()
+                if _smsg:
+                    yield _make_stream_chunk(completion_id, model_display, thinking=_smsg + "\n")
+                else:
+                    yield _make_stream_chunk(completion_id, model_display)
             elif ev_type == "done":
                 # Buffer flushen
                 if _audio_buf:
@@ -655,6 +676,17 @@ def _stream_generator(
                     for _i in range(0, len(text), _SSE_CHUNK):
                         yield _make_stream_chunk(completion_id, model_display, content=text[_i:_i + _SSE_CHUNK])
 
+                _ctx_done = ev.get("ctx")
+                if isinstance(_ctx_done, (list, tuple)) and len(_ctx_done) >= 1:
+                    _final_ctx = list(_ctx_done)
+                try:
+                    _final_tps = float(ev.get("tps") or 0.0)
+                except (TypeError, ValueError):
+                    _final_tps = 0.0
+                if isinstance(ev.get("usage"), dict):
+                    _raw_usage = ev["usage"]
+                if isinstance(ev.get("timings"), dict):
+                    _raw_timings = ev["timings"]
                 final_content = ev.get("content") or total_content
                 final_thinking = ev.get("thinking") or total_thinking
                 for _img in (ev.get("images") or []):
@@ -680,4 +712,46 @@ def _stream_generator(
 
     # Finish-Chunk
     yield _make_stream_chunk(completion_id, model_display, finish_reason="stop")
+
+    # Finaler usage/timings-Chunk — IMMER senden (nicht hinter stream_options.include_usage).
+    # Grund: llama.cpp (und damit der Raw-Proxy) hängt `timings`+`usage` UNKONDITIONAL an den
+    # finalen Chunk, egal ob der Client include_usage anfordert. OpenWebUI knüpft seine ⓘ-Anzeige
+    # daran und schickt für die Connection KEIN include_usage — der gated Chunk fehlte daher und das
+    # ⓘ blieb aus, während raw (unkonditional) es zeigte.
+    _usage_chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model_display,
+        "system_fingerprint": _SYSTEM_FINGERPRINT,
+        "choices": [],
+    }
+    if _raw_usage:
+        # Echte Upstream-usage + timings (llama.cpp) verbatim durchreichen — byte-identisch zum
+        # Raw-Proxy, den OpenWebUI nachweislich akzeptiert. Kein Nachbauen/Schätzen nötig.
+        _usage_chunk["usage"] = _raw_usage
+        if _raw_timings:
+            _usage_chunk["timings"] = _raw_timings
+    else:
+        # Fallback (z. B. Provider liefert keine usage): aus ctx/tps synthetisieren.
+        _prompt_tok = int(_final_ctx[0]) if _final_ctx else max(1, len(system_prompt) // 4)
+        _completion_tok = max(1, len((total_content or "") + (total_thinking or "")) // 4)
+        _usage_chunk["usage"] = {
+            "prompt_tokens": _prompt_tok,
+            "completion_tokens": _completion_tok,
+            "total_tokens": _prompt_tok + _completion_tok,
+            "prompt_tokens_details": {"cached_tokens": 0},
+        }
+        _tps = _final_tps if (_final_tps and _final_tps > 0) else (
+            _completion_tok / max(0.001, time.time() - _gen_start)
+        )
+        _pred_ms = round((_completion_tok / _tps) * 1000.0, 2) if _tps > 0 else 0.0
+        _usage_chunk["timings"] = {
+            "prompt_n": _prompt_tok,
+            "predicted_n": _completion_tok,
+            "predicted_ms": _pred_ms,
+            "predicted_per_second": round(_tps, 2),
+        }
+    yield f"data: {json.dumps(_usage_chunk, ensure_ascii=False)}\n\n"
+
     yield "data: [DONE]\n\n"

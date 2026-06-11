@@ -203,8 +203,35 @@ def format_auto_context(messages: list[dict[str, Any]], max_chars: int, bot_send
     if not messages:
         return ""
     import datetime as _dt
+    now = _dt.datetime.now()
+    today = now.date()
+    yesterday = today - _dt.timedelta(days=1)
+    _GAP_SECONDS = 7200  # >2h zwischen zwei Nachrichten ⇒ wahrscheinlich anderes Gespräch
+
+    def _ts_label(ts_ms: int) -> "tuple[str, _dt.datetime | None]":
+        """Timestamp-Label datums-bewusst: heute → 'HH:MM', gestern → 'gestern HH:MM',
+        älter (gleiches Jahr) → 'DD.MM. HH:MM', anderes Jahr → 'DD.MM.YYYY HH:MM'.
+        Verhindert dass eine Nachricht von gestern 17:29 vor heute 12:42 als zusammenhängend
+        gelesen wird (Modell verwechselte sonst altes Thema mit aktuellem)."""
+        if not ts_ms:
+            return "", None
+        try:
+            dt = _dt.datetime.fromtimestamp(ts_ms / 1000)
+        except Exception:
+            return "", None
+        d = dt.date()
+        hm = dt.strftime("%H:%M")
+        if d == today:
+            return hm, dt
+        if d == yesterday:
+            return f"gestern {hm}", dt
+        if d.year == today.year:
+            return dt.strftime("%d.%m. ") + hm, dt
+        return dt.strftime("%d.%m.%Y ") + hm, dt
+
     lines: list[str] = []
     bot_max = max(60, max_chars // 2)
+    _prev_dt: "_dt.datetime | None" = None
     for m in messages:
         sender = m.get("sender") or ""
         body = (m.get("body") or "").strip().replace("\n", " ")
@@ -217,11 +244,14 @@ def format_auto_context(messages: list[dict[str, Any]], max_chars: int, bot_send
         who = m.get("display") or sender.split(":")[0].lstrip("@") or "?"
         if is_bot:
             who = f"{who} (you)"
-        ts_ms = m.get("ts") or 0
-        try:
-            tstr = _dt.datetime.fromtimestamp(ts_ms / 1000).strftime("%H:%M")
-        except Exception:
-            tstr = ""
+        tstr, _cur_dt = _ts_label(m.get("ts") or 0)
+        # Gesprächslücken-Marker: große Zeitlücke oder Tageswechsel ⇒ Trennzeile, damit das Modell
+        # weiß dass die folgenden Nachrichten evtl. ein anderes Thema sind (nicht vermischen).
+        if _prev_dt is not None and _cur_dt is not None:
+            if (_cur_dt - _prev_dt).total_seconds() > _GAP_SECONDS or _cur_dt.date() != _prev_dt.date():
+                lines.append("[⏸ längere Pause — die folgenden Nachrichten sind evtl. ein neues/anderes Thema]")
+        if _cur_dt is not None:
+            _prev_dt = _cur_dt
         prefix = f"[{tstr}] " if tstr else ""
         lines.append(f"{prefix}{who}: {body}")
     if not lines:

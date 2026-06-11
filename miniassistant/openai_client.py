@@ -613,6 +613,57 @@ def api_chat_stream(
 # Image Generation (DALL-E)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _build_sd_cpp_extra_args(
+    *,
+    steps: int | None = None,
+    cfg_scale: float | None = None,
+    guidance: float | None = None,
+    strength: float | None = None,
+    sampler: str | None = None,
+    scheduler: str | None = None,
+    seed: int | None = None,
+    negative_prompt: str | None = None,
+) -> dict[str, Any]:
+    """Baut das <sd_cpp_extra_args>-JSON für sd-server (stable-diffusion.cpp).
+
+    Neues Schema (sd.cpp master, examples/common/common.cpp from_json_str):
+    seed/strength/negative_prompt top-level; steps/sampler/scheduler/cfg verschachtelt
+    unter sample_params (sample_steps, sample_method, scheduler, guidance.txt_cfg /
+    guidance.distilled_guidance). Legacy-Flachkeys (steps, cfg_scale, …) werden
+    ZUSÄTZLICH gesetzt — ältere sd-server-Builds lesen die, neue ignorieren
+    unbekannte Keys stumm. Doppelt senden ist daher safe.
+    """
+    extra: dict[str, Any] = {}
+    sample_params: dict[str, Any] = {}
+    guidance_obj: dict[str, Any] = {}
+    if steps is not None:
+        extra["steps"] = steps  # legacy
+        sample_params["sample_steps"] = int(steps)
+    if cfg_scale is not None:
+        extra["cfg_scale"] = cfg_scale  # legacy
+        guidance_obj["txt_cfg"] = float(cfg_scale)
+    if guidance is not None:
+        extra["guidance"] = guidance  # legacy (flux distilled guidance)
+        guidance_obj["distilled_guidance"] = float(guidance)
+    if sampler is not None:
+        extra["sample_method"] = sampler  # legacy
+        sample_params["sample_method"] = sampler
+    if scheduler is not None:
+        extra["scheduler"] = scheduler  # legacy
+        sample_params["scheduler"] = scheduler
+    if guidance_obj:
+        sample_params["guidance"] = guidance_obj
+    if sample_params:
+        extra["sample_params"] = sample_params
+    if seed is not None:
+        extra["seed"] = seed
+    if strength is not None:
+        extra["strength"] = strength
+    if negative_prompt is not None:
+        extra["negative_prompt"] = negative_prompt
+    return extra
+
+
 def api_generate_image(
     prompt: str,
     *,
@@ -645,21 +696,11 @@ def api_generate_image(
     # da sd-server (stable-diffusion.cpp) steps/cfg_scale/etc. im JSON-Body ignoriert.
     api_prompt = prompt
     if not is_openai:
-        extra: dict[str, Any] = {}
-        if steps is not None:
-            extra["steps"] = steps
-        if cfg_scale is not None:
-            extra["cfg_scale"] = cfg_scale
-        if guidance is not None:
-            extra["guidance"] = guidance
-        if sampler is not None:
-            extra["sample_method"] = sampler
-        if scheduler is not None:
-            extra["scheduler"] = scheduler
-        if seed is not None:
-            extra["seed"] = seed
-        if negative_prompt is not None:
-            extra["negative_prompt"] = negative_prompt
+        extra = _build_sd_cpp_extra_args(
+            steps=steps, cfg_scale=cfg_scale, guidance=guidance,
+            sampler=sampler, scheduler=scheduler, seed=seed,
+            negative_prompt=negative_prompt,
+        )
         if extra:
             api_prompt = f"{prompt}<sd_cpp_extra_args>{json.dumps(extra)}</sd_cpp_extra_args>"
 
@@ -829,35 +870,20 @@ def api_edit_image(
         # 2) ZUSÄTZLICH als <sd_cpp_extra_args>-Tag im Prompt — für Wrapper die das parsen.
         # Unbekannte Form-Fields ignoriert der Server, daher ist Doppel-Senden safe.
         _prompt = prompt
-        _extra: dict[str, Any] = {}
         _files: dict[str, Any] = {"image": (img_p.name, img_bytes, img_mime)}
         _form: dict[str, Any] = {"prompt": prompt, "model": model, "size": size}
         if not is_openai:
+            _extra = _build_sd_cpp_extra_args(
+                steps=steps, cfg_scale=cfg_scale, guidance=guidance,
+                strength=strength, sampler=sampler, scheduler=scheduler,
+                seed=seed, negative_prompt=negative_prompt,
+            )
+            # Flache Form-Fields zusätzlich — ältere Builds lasen die, neue ignorieren sie.
+            for _fk, _fv in _extra.items():
+                if not isinstance(_fv, dict):
+                    _form[_fk] = str(_fv)
             if steps is not None:
-                _extra["steps"] = steps
-                _form["steps"] = str(steps)
-                _form["sample_steps"] = str(steps)  # leejet sd-server field name
-            if cfg_scale is not None:
-                _extra["cfg_scale"] = cfg_scale
-                _form["cfg_scale"] = str(cfg_scale)
-            if guidance is not None:
-                _extra["guidance"] = guidance
-                _form["guidance"] = str(guidance)
-            if strength is not None:
-                _extra["strength"] = strength
-                _form["strength"] = str(strength)
-            if sampler is not None:
-                _extra["sample_method"] = sampler
-                _form["sample_method"] = str(sampler)
-            if scheduler is not None:
-                _extra["scheduler"] = scheduler
-                _form["scheduler"] = str(scheduler)
-            if seed is not None:
-                _extra["seed"] = seed
-                _form["seed"] = str(seed)
-            if negative_prompt is not None:
-                _extra["negative_prompt"] = negative_prompt
-                _form["negative_prompt"] = str(negative_prompt)
+                _form["sample_steps"] = str(steps)  # leejet sd-server legacy field name
             if _extra:
                 _prompt = f"{prompt}<sd_cpp_extra_args>{json.dumps(_extra)}</sd_cpp_extra_args>"
                 _form["prompt"] = _prompt

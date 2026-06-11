@@ -5266,7 +5266,7 @@ __COMMON_CSS__
 .ag-del:hover { color:var(--danger); }
 .ag-newbtn { display:block; width:calc(100% - 1.7rem); margin:0.35rem 0.85rem 0.5rem; padding:0.35rem; font-size:0.78rem; background:transparent; border:1px dashed var(--border); border-radius:var(--radius); color:var(--muted); cursor:pointer; }
 .ag-newbtn:hover { color:var(--primary); border-color:var(--primary); }
-.ag-ta { flex:1; width:100%; font-family:'SF Mono','Fira Code','Cascadia Code',monospace; font-size:13px; padding:0.8rem; border:1.5px solid var(--border); border-radius:var(--radius); background:var(--card); color:var(--text); outline:none; resize:none; line-height:1.5; white-space:pre; overflow:auto; }
+.ag-ta { flex:1; width:100%; font-family:'SF Mono','Fira Code','Cascadia Code',monospace; font-size:13px; padding:0.8rem; border:1.5px solid var(--border); border-radius:var(--radius); background:var(--card); color:var(--text); outline:none; resize:none; line-height:1.5; white-space:pre-wrap; overflow-wrap:break-word; overflow:auto; }
 .ag-ta:focus { border-color:var(--primary); }
 .ag-bar { display:flex; align-items:center; gap:0.8rem; margin-top:0.6rem; flex-shrink:0; }
 .ag-fname { font-weight:600; color:var(--primary); font-size:0.92rem; word-break:break-all; flex:1; }

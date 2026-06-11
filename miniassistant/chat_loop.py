@@ -7,6 +7,7 @@ import json
 import logging
 import threading
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -346,6 +347,31 @@ class _LoopDetector:
         if len(self._buf) > self._buf_max_chars:
             self._buf = self._buf[-self._buf_max_chars:]
         return False
+
+
+def _detect_loop_in_text(text: str) -> str | None:
+    """Post-hoc Doom-Loop-Check für komplette (non-stream) Antworten.
+
+    Zweistufig: (1) zeilen-basierter _LoopDetector (gleiche Heuristiken wie im
+    Stream-Pfad; trailing newline flusht die letzte Zeile), (2) Entropie-Check
+    via zlib-Kompressionsratio + Buchstaben-Anteil — fängt hochfrequentes
+    Zahlen-Rauschen (z. B. GLM-Degeneration "16:17:16:00…"), dessen Zeilen
+    noisy-unique sind und an Stufe 1 vorbeigehen. Gemessen an echten Samples:
+    Garbage zlib≤0.28/letters≤0.42, legitimes zahlenlastiges Thinking
+    zlib≥0.32/letters≥0.60."""
+    if not text or not text.strip():
+        return None
+    det = _LoopDetector()
+    if det.feed(text) or det.feed("\n"):
+        return det.reason
+    t = text.strip()
+    if len(t) >= 800:
+        b = t.encode("utf-8", errors="replace")
+        zr = len(zlib.compress(b, 6)) / len(b)
+        letters = sum(c.isalpha() for c in t) / len(t)
+        if zr < 0.22 or (zr < 0.32 and letters < 0.25):
+            return f"degenerierter Output (zlib={zr:.2f}, letters={letters:.2f})"
+    return None
 
 
 # ── URL-Halluzinations-Guard ─────────────────────────────────────────────
@@ -5649,6 +5675,16 @@ def chat_round(
     _data_tool_count = 0          # alle daten-beschaffenden Tools (exec/curl, invoke_model, ...) — Research-Gate
     _has_search = bool(config.get("search_engines"))
     _claim_kw = tuple(config.get("research_gate_keywords") or _CLAIM_KEYWORDS_DEFAULT)
+    # Tool-Call-Dedup (Parität mit chat_round_stream): identische research-Calls 2× → block statt erneut ausführen.
+    # Verhindert Cross-Round-Loops (z. B. gleicher web_search 50× hintereinander) im Matrix/Discord/Scheduler-Pfad.
+    _seen_tool_keys: dict[str, str] = {}
+    _dedup_enabled = bool(config.get("tool_call_dedup", True))
+    _DEDUP_TOOLS = {"web_search", "read_url", "check_url"}
+    # Doom-Loop-Recovery (Parität mit chat_round_stream): degenerierter Round-Output
+    # (auch reines Thinking ohne Content) wird verworfen + Korrektur-Nudge gesendet;
+    # nach _loop_recovery_max erschöpften Versuchen harter Abbruch mit User-Message.
+    _loop_recovery_attempts = 0
+    _loop_recovery_max = int(config.get("stream_loop_recovery_max") or 2)
     debug = (config.get("server") or {}).get("debug", False)
     models_cfg = config.get("models") or {}
     per_prov_fb = [resolve_model(config, fb) or fb for fb in (models_cfg.get("fallbacks") or []) if fb]
@@ -5711,9 +5747,38 @@ def chat_round(
         _sent_image = False
         _response_logged = False
         rounds = 0
+        # Per-round-Compaction-Tracking (Parität mit Stream): echte prompt_eval_count der letzten
+        # Antwort + Delta-Schätzung der seither neuen Messages.
+        _last_real_ctx_cr: int | None = None
+        _msgs_len_at_call_cr: int = len(msgs)
         think = get_think_for_model(config, try_model)
         try:
             while rounds < max_tool_rounds:
+                # Per-round smart compaction (Parität mit Stream): wenn Tool-Ergebnisse den Kontext
+                # über das Budget treiben, History zusammenfassen statt nur hart zu trimmen.
+                if rounds > 0 and len(msgs) >= 4:
+                    _new_delta_cr = _messages_token_estimate(msgs[_msgs_len_at_call_cr:])
+                    _ctx_for_check_cr = (
+                        (_last_real_ctx_cr + _new_delta_cr) if _last_real_ctx_cr is not None
+                        else (
+                            _estimate_tokens(system_prompt)
+                            + _estimate_tokens(json.dumps(tools_schema or [], ensure_ascii=False))
+                            + _messages_token_estimate(msgs)
+                        )
+                    )
+                    if _ctx_for_check_cr > _context_budget(config, _compact_num_ctx):
+                        _log.info("Per-round compact (chat_round): round=%d, ctx=%d, budget=%d",
+                                  rounds, _ctx_for_check_cr, _context_budget(config, _compact_num_ctx))
+                        _notify_chat_compaction_start(config)
+                        msgs, _new_sum_cr = _compact_history(
+                            config, msgs, try_model, system_prompt, tools_schema, _compact_num_ctx,
+                            prior_summary=_chat_summary,
+                        )
+                        if _new_sum_cr:
+                            _chat_summary = _new_sum_cr
+                        _notify_chat_compaction_done(config)
+                        _last_real_ctx_cr = None
+                        _msgs_len_at_call_cr = len(msgs)
                 # Cancel-Check VOR jedem API-Call (sonst stecken wir 3x retry × api_timeout fest)
                 _chat_ctx_pre = config.get("_chat_context") or {}
                 if _chat_ctx_pre:
@@ -5743,6 +5808,7 @@ def chat_round(
                 config["_active_num_ctx"] = num_ctx  # für dynamischen read_url-Cap im Tool-Handler
                 msgs = _trim_messages_to_fit(system_effective, msgs, num_ctx, reserve_tokens=1024, tools=tools)
                 last_msgs_before_call = list(msgs)
+                _msgs_len_at_call_cr = len(msgs)  # Snapshot für per-round Delta-Schätzung
                 if rounds == 0:
                     _log_estimated_tokens(config, system_effective, msgs, tools)
                     _aal.log_prompt(config, try_model, user_content, len(system_effective), len(msgs))
@@ -5795,7 +5861,38 @@ def chat_round(
                 except Exception:
                     pass
                 last_response = response
+                _last_real_ctx_cr = response.get("prompt_eval_count") or _last_real_ctx_cr
                 msg = response.get("message") or {}
+                # Doom-Loop-Guard (Parität mit Stream-Pfad): non-stream kommt die Antwort
+                # am Stück → post-hoc prüfen statt auf Deltas. Greift auch bei Loop im
+                # Thinking mit leerem Content (der finale Content-Check weiter unten nicht).
+                # Bei Loop: Round-Output verwerfen (NICHT in History/total_thinking),
+                # Korrektur-Nudge senden, retry.
+                _loop_reason_cr = _detect_loop_in_text(
+                    (msg.get("thinking") or "") + "\n" + (msg.get("content") or ""))
+                if _loop_reason_cr:
+                    _loop_recovery_attempts += 1
+                    _log.warning("Doom-loop detected (chat_round): %s — recovery %d/%d (model: %s, round: %d)",
+                                 _loop_reason_cr, _loop_recovery_attempts, _loop_recovery_max, try_model, rounds)
+                    _aal.log_thinking(config, f"[DOOM-LOOP verworfen: {_loop_reason_cr} — Recovery {_loop_recovery_attempts}/{_loop_recovery_max}]")
+                    if _loop_recovery_attempts > _loop_recovery_max:
+                        _abort_msg = (f"⚠️ Modell ({try_model}) hängt in Endlos-Schleife fest "
+                                      f"({_loop_reason_cr}). {_loop_recovery_max} Recovery-Versuche fehlgeschlagen. "
+                                      f"Bitte erneut fragen oder anderes Modell wählen.")
+                        _log.error("Loop recovery exhausted (chat_round) — aborting conversation")
+                        total_content = (total_content.rstrip() + "\n\n" + _abort_msg) if total_content.strip() else _abort_msg
+                        msgs.append({"role": "assistant", "content": total_content.strip()})
+                        break
+                    msgs.append({"role": "user", "content": (
+                        f"SYSTEM: You were stuck in a loop ({_loop_reason_cr}). Your previous "
+                        "output was aborted and discarded. Try again NOW — if you need a tool, "
+                        "emit the tool call IMMEDIATELY (no long thinking, no repetition). "
+                        "If no tool is needed, answer directly and briefly with the final result. "
+                        "Keep thinking minimal. Use what you already know — do not re-search "
+                        "the same query you already ran."
+                    )})
+                    rounds += 1
+                    continue
                 total_thinking += (msg.get("thinking") or "")
                 _msg_content = msg.get("content") or ""
                 tool_calls = _extract_tool_calls(msg)
@@ -5896,7 +5993,63 @@ def chat_round(
                 for _wb_name, _wb_args, _wb_result in _wait_blocked:
                     msgs.append({"role": "tool", "tool_name": _wb_name, "content": _wb_result})
 
-                tool_results = _run_tools_maybe_concurrent(tool_calls, config, project_dir)
+                # Tool-Call-Dedup (Parität mit Stream): identische research-Calls blocken statt
+                # erneut ausführen. Jeder geblockte Call kriegt trotzdem ein tool-Result (DEDUP-BLOCK),
+                # damit zu jedem tool_call eine Antwort in der History steht.
+                if _dedup_enabled and tool_calls:
+                    _fresh_calls: list[tuple[str, Any]] = []
+                    for _dn, _da in tool_calls:
+                        if _dn not in _DEDUP_TOOLS:
+                            _fresh_calls.append((_dn, _da))
+                            continue
+                        try:
+                            _dkey = f"{_dn}::{json.dumps(_da, sort_keys=True, ensure_ascii=False).lower()}"
+                        except Exception:
+                            _fresh_calls.append((_dn, _da))
+                            continue
+                        if _dkey in _seen_tool_keys:
+                            _hint = (_da.get("query") or _da.get("url") or "") if isinstance(_da, dict) else ""
+                            _log.warning("Tool-Call-Dedup (chat_round): %s mit identischen Args bereits ausgeführt — blockiere", _dn)
+                            msgs.append({"role": "tool", "tool_name": _dn, "content": (
+                                f"[DEDUP-BLOCK] You already called {_dn} with the same arguments earlier "
+                                f"in this conversation ({_hint!r}). The result is in the message history above. "
+                                f"DO NOT repeat the same call — use the prior result, try a DIFFERENT query/URL, "
+                                f"or answer the user with what you already know."
+                            )})
+                        else:
+                            _fresh_calls.append((_dn, _da))
+                            _seen_tool_keys[_dkey] = ""
+                    tool_calls = _fresh_calls
+
+                # Tool-Execution mit Gesamt-Timeout (Parität mit Stream): hängende Subagents/Tools
+                # nicht unbegrenzt blockieren lassen (sonst tippt der Matrix/Discord-Bot ewig).
+                # Gleiche Config-Keys + Defaults wie im Stream-Pfad, damit tool_execution_timeout /
+                # subagent_execution_timeout BEIDE Pfade einheitlich steuern.
+                if tool_calls:
+                    _has_subagent_call = any(_n == "invoke_model" for _n, _ in tool_calls)
+                    _tool_max_timeout = (
+                        float(config.get("subagent_execution_timeout") or 2700)
+                        if _has_subagent_call
+                        else float(config.get("tool_execution_timeout") or 2700)
+                    )
+                    tool_results = None
+                    try:
+                        for _item in _call_with_keepalive(
+                            lambda: _run_tools_maybe_concurrent(tool_calls, config, project_dir),
+                            max_timeout=_tool_max_timeout,
+                        ):
+                            if _item is not None:
+                                tool_results = _item
+                    except TimeoutError as _te:
+                        _log.warning("Tool-Batch Timeout (chat_round) nach %.0fs (%d Tool(s)): %s",
+                                     _tool_max_timeout, len(tool_calls), _te)
+                        tool_results = [
+                            (_n, _a, f"[Tool-Timeout nach {int(_tool_max_timeout)}s — keine Ergebnisse von diesem Aufruf. Frühere Tool-Ergebnisse aus dieser Session bleiben in der History.]")
+                            for _n, _a in tool_calls
+                        ]
+                    tool_results = tool_results or []
+                else:
+                    tool_results = []
                 for name, args, result in tool_results:
                     msgs.append({"role": "tool", "tool_name": name, "content": result})
                     if name in ("web_search", "web_search_multi"):
@@ -6075,10 +6228,9 @@ def chat_round(
     # (Antwort kommt in einem Stück). Finale Antwort auf Repetition prüfen; bei Loop EINE
     # Korrektur-Runde, sonst repetitiven Tail abschneiden. Greift nur wenn tatsächlich geloopt.
     if _final_content.strip():
-        _ld = _LoopDetector()
-        _ld.feed(_final_content)
-        if _ld.reason:
-            _log.warning("chat_round: Doom-Loop in finaler Antwort (%s) — Korrektur-Runde", _ld.reason)
+        _ld_reason = _detect_loop_in_text(_final_content)
+        if _ld_reason:
+            _log.warning("chat_round: Doom-Loop in finaler Antwort (%s) — Korrektur-Runde", _ld_reason)
             _fixed = ""
             try:
                 _fix_msgs = (msgs_final or msgs) + [{"role": "user", "content": (
@@ -6090,8 +6242,7 @@ def chat_round(
                                       system=system_prompt, think=False,
                                       timeout=float(config.get("api_timeout") or 900))
                 _fix_c = _strip_tool_call_tags((_fix.get("message", {}).get("content") or "").strip())
-                _ld2 = _LoopDetector(); _ld2.feed(_fix_c)
-                if _fix_c and len(_fix_c) > 20 and not _ld2.reason:
+                if _fix_c and len(_fix_c) > 20 and not _detect_loop_in_text(_fix_c):
                     _fixed = _fix_c
                     _log.info("chat_round: Loop-Recovery erfolgreich (%d chars)", len(_fixed))
             except Exception as _fix_err:
@@ -6880,7 +7031,7 @@ def chat_round_stream(
                     ).start()
                 except Exception as _e:
                     _log.debug("slot_cache save (stream) spawn skipped: %s", _e)
-            yield {"type": "done", "thinking": _done_thinking, "content": _done_content, "images": _pending_imgs, "audio": _pending_auds, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info, "tps": _done_tps, "ctx": [_ctx_used, _ctx_max]}
+            yield {"type": "done", "thinking": _done_thinking, "content": _done_content, "images": _pending_imgs, "audio": _pending_auds, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info, "tps": _done_tps, "ctx": [_ctx_used, _ctx_max], "usage": last_response.get("usage"), "timings": last_response.get("timings")}
             return
 
         _tool_names = [
@@ -7252,7 +7403,7 @@ def chat_round_stream(
 
     _final_tps = _aal.extract_tps(last_response, time.monotonic() - _t0_stream, _final_content, _final_thinking)
     _stream_log.finish(_final_tps)
-    yield {"type": "done", "thinking": _final_thinking, "content": _final_content, "images": _pending_imgs, "audio": _pending_auds, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info, "tps": _final_tps, "ctx": [_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs), _ctx_max]}
+    yield {"type": "done", "thinking": _final_thinking, "content": _final_content, "images": _pending_imgs, "audio": _pending_auds, "new_messages": msgs, "debug_info": debug_info, "switch_info": switch_info, "tps": _final_tps, "ctx": [_estimate_tokens(system_effective or "") + _messages_token_estimate(msgs), _ctx_max], "usage": last_response.get("usage"), "timings": last_response.get("timings")}
 
 
 def _normalize_cmd(raw: str) -> str:

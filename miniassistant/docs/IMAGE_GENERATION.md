@@ -45,7 +45,7 @@ invoke_model(model='EXACT_NAME_FROM_LIST', message='make the sky sunset orange',
 - `0.1–0.3` = subtle changes (color correction, minor touch-ups)
 - `0.4–0.6` = moderate changes (style transfer, object modifications)
 - `0.7–1.0` = major changes (heavy transformation, almost new image)
-- **System default when omitted on edit calls: `0.85`** — distill models (`flux-klein`, `qwen-image-edit`) need high strength for visible transformation; lower values often return the input nearly unchanged. Pass an explicit lower value only when the user asks for subtle changes.
+- **System default when omitted on edit calls: `1.0`** (configurable via `image_edit_strength`, per model/provider/global) — distill edit models (`flux-klein`, `qwen-image-edit`) behave ~bimodal: values below 1.0 often return the input nearly unchanged. Pass an explicit lower value only when the user asks for subtle changes.
 
 **Edit model auto-selection:** when `image_path` is set and `model` is not specified, the system uses the FIRST model in the `image_generation:` config list (user controls ordering). Explicit `model='…'` is always honored.
 
