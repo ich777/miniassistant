@@ -1238,6 +1238,44 @@ def _configured_model_names(config: dict[str, Any]) -> list[str]:
     return out
 
 
+def _group_allowed_model_names(config: dict[str, Any], models_allow: list[str]) -> list[str]:
+    """Wählbare Modelle in einem Group-Raum: explizite allowlist aus room_settings,
+    leere Liste = alle konfigurierten Modelle (Owner hat den Switch ja explizit aktiviert)."""
+    return list(models_allow) if models_allow else _configured_model_names(config)
+
+
+def _group_display_model(config: dict[str, Any], models_allow: list[str], model: str) -> str:
+    """Zeigt ein Raum-Modell in der Form aus der Freigabe-Liste — Alias statt aufgelöstem
+    vollen Namen ('gemma' statt 'gemma-4-26b-a4b'), damit Raum-Mitglieder nur die
+    freigegebenen Namen sehen. Fallback: Name unverändert."""
+    if not model:
+        return model
+    cands = _group_allowed_model_names(config, models_allow)
+    if model in cands:
+        return model
+    resolved = resolve_model(config, model) or model
+    for c in cands:
+        if c == resolved or (resolve_model(config, c) or c) == resolved:
+            return c
+    return model
+
+
+def _group_model_allowed(config: dict[str, Any], models_allow: list[str], model: str) -> bool:
+    """True wenn model (roh oder via Alias aufgelöst) in der Raum-Auswahl liegt.
+    Matcht sowohl den rohen Namen als auch die resolve_model-Form, damit Alias
+    und Zielmodell beide funktionieren ('/model fast' wie '/model qwen3:8b')."""
+    if not model:
+        return False
+    cands = _group_allowed_model_names(config, models_allow)
+    if model in cands:
+        return True
+    resolved = resolve_model(config, model) or model
+    for c in cands:
+        if c == resolved or (resolve_model(config, c) or c) == resolved:
+            return True
+    return False
+
+
 # Kontext-Kürzung: Token-Schätzung (konservativ ~3 Zeichen/Token) und Trim auf num_ctx
 def _estimate_tokens(text: str) -> int:
     """Konservative Token-Schätzung ohne Tokenizer (ca. 3 Zeichen/Token für gemischte Sprachen)."""
@@ -2162,13 +2200,62 @@ _EXTERNAL_CONTENT_TOOLS = frozenset({"exec", "web_search", "read_url", "check_ur
 _IMG_DELIVER_LOCK = threading.Lock()
 
 
+# Multi-Bild-Absicht: nur explizite Formulierungen heben das 1-Bild-Default an.
+_MULTI_NUM_WORDS = {
+    "zwei": 2, "drei": 3, "vier": 4, "fünf": 5, "fuenf": 5, "sechs": 6,
+    "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+}
+_MULTI_IMAGE_HINTS = (
+    "mehrere bilder", "mehrere varianten", "mehrere versionen", "mehrere motive",
+    "mehrere davon", "verschiedene bilder", "verschiedene varianten", "ein paar bilder",
+    "ein paar davon", "einige bilder", "noch mehr davon",
+    "multiple images", "several images", "a few images", "variations", "varianten",
+    "versionen davon",
+)
+# Zahl (Ziffer/Wort) direkt vor einem Bild-Nomen: "3 bilder", "vier varianten", "2 versionen".
+_MULTI_IMAGE_NUM_RE = _re.compile(
+    r'\b(\d{1,2}|zwei|drei|vier|f(?:ü|ue)nf|sechs|two|three|four|five|six)\s*'
+    r'(?:verschiedene\s+|unterschiedliche\s+)?'
+    r'(?:bilder|varianten|versionen|motive|images|pics?|pictures?|st(?:ü|ue)ck)\b',
+    _re.IGNORECASE,
+)
+
+
+def _current_user_message(text: str) -> str:
+    """Nur die AKTUELLE User-Nachricht aus dem (ggf. kontext-angereicherten) user_content.
+    Gruppen-/DM-Pfad prependen Verlauf + '[Current message from X]:\\n<msg>'. Multi-Bild-
+    Absicht NUR hieraus lesen — sonst triggert ein altes '3 bilder' im Verlauf den Loop erneut."""
+    if not text:
+        return ""
+    idx = text.rfind("[Current message from")
+    if idx != -1:
+        end = text.find("]:", idx)
+        if end != -1:
+            return text[end + 2:].strip()
+    return text
+
+
 def _image_turn_cap(config: dict[str, Any]) -> int:
-    """Max Bilder pro Turn (auto-deliver + send_image zusammen). Verhindert Edit-Retry-Spam,
-    erlaubt aber Multi-Bild-Generierung. Default 4, konfigurierbar via images_max_per_turn."""
+    """Max Bilder pro User-Nachricht (auto-deliver + send_image zusammen).
+
+    Default **1 Bild pro Anfrage** — verhindert den Doom-Loop, bei dem das Modell den Bild-Prompt
+    von sich aus jede Runde umformuliert und neu generiert (Auto-Deliver sendet jede Gen sofort).
+    Verlangt der User in DIESER Nachricht aber explizit mehrere Bilder ("3 bilder", "mehrere
+    varianten", …), wird bis `images_max_per_turn` (default 4, Sicherheits-Ceiling) erlaubt.
+    Counter resettet pro Nachricht (matrix_bot/discord_bot shallow-copyen config je Turn)."""
     try:
-        return max(1, int(config.get("images_max_per_turn") or 4))
+        ceiling = max(1, int(config.get("images_max_per_turn") or 4))
     except (TypeError, ValueError):
-        return 4
+        ceiling = 4
+    text = _current_user_message(config.get("_user_request_text") or "")
+    m = _MULTI_IMAGE_NUM_RE.search(text)
+    if m:
+        g = m.group(1).lower()
+        n = int(g) if g.isdigit() else _MULTI_NUM_WORDS.get(g, 2)
+        return max(1, min(n, ceiling))
+    if any(h in text.lower() for h in _MULTI_IMAGE_HINTS):
+        return ceiling
+    return 1
 
 
 def _auto_deliver_group_image(config: dict[str, Any], host_path: str, caption: str = "") -> str | None:
@@ -4521,6 +4608,21 @@ def _run_subagent_openai(
     _img_gen_models = get_image_generation_models(config)
     _is_img_gen = _oai_img_gen(api_model) or api_model in _img_gen_models or resolved_name in _img_gen_models
     if _is_img_gen:
+        # Loop-Guard (prompt-UNABHÄNGIG): hat das Modell in diesem Turn schon ein Bild geliefert,
+        # KEIN weiteres generieren. Schwache Modelle formulieren den Prompt sonst jede Runde um
+        # (→ neuer Dedup-Key → Prompt-Dedup verfehlt) und re-generieren dasselbe Motiv → kam 2-4×
+        # im Raum an. Greift VOR der teuren Generierung (qwen-image-edit ~5min/Call). Counter
+        # resettet pro Nachricht; Limit via images_max_per_turn (default 1).
+        if int(config.get("_send_image_count_this_turn") or 0) >= _image_turn_cap(config):
+            _done = (
+                "STOP: In diesem Turn wurde bereits ein Bild generiert und direkt in den Raum "
+                "gesendet (Limit erreicht). Es wurde KEIN weiteres Bild erzeugt. Die Aufgabe ist "
+                "ABGESCHLOSSEN — antworte dem User JETZT mit einer kurzen Bestätigung (KEIN weiterer "
+                "Tool-Call, kein send_image). Generiere nur dann erneut, wenn der User in einer "
+                "NEUEN Nachricht ausdrücklich ein weiteres oder geändertes Bild verlangt."
+            )
+            _aal.log_subagent_result(config, resolved_name, _done, "")
+            return _done
         try:
             from miniassistant.openai_client import api_generate_image, api_edit_image
             import base64 as _b64
@@ -4688,7 +4790,13 @@ def _run_subagent_openai(
                 if _img_platform in ("matrix", "discord") and _img_ctx.get("group_mode"):
                     _st = _auto_deliver_group_image(config, str(fpath), _caption)
                     if _st == "sent":
-                        result = f"Bild {_op_de} und direkt in den Raum gesendet. Rufe send_image NICHT auf."
+                        result = (
+                            f"Bild {_op_de} und wurde BEREITS in den Raum gesendet — der User SIEHT es "
+                            "jetzt. Aufgabe ABGESCHLOSSEN. Generiere KEIN weiteres Bild zum 'Verbessern' "
+                            "oder Umformulieren: JEDE Generierung wird sofort gesendet → der User bekäme "
+                            "Doppel-Bilder. Rufe NICHT send_image. Antworte dem User JETZT mit einer "
+                            "kurzen Bestätigung (keine weiteren Tool-Calls)."
+                        )
                     elif _st == "cap":
                         result = f"Bild {_op_de} und gespeichert: `{_display_fpath}` — Turn-Bildlimit erreicht, nicht gesendet."
                     elif _st == "dup":
@@ -4698,6 +4806,9 @@ def _run_subagent_openai(
                 elif _img_platform in ("matrix", "discord"):
                     result = f"Bild {_op_de} und gespeichert: `{_display_fpath}`\nCall `send_image(image_path='{_display_fpath}')` to deliver."
                 else:
+                    # Web/API: Bild wird inline injiziert (gilt als geliefert) → mitzählen,
+                    # damit der prompt-unabhängige Loop-Guard auch hier greift.
+                    config["_send_image_count_this_turn"] = int(config.get("_send_image_count_this_turn") or 0) + 1
                     result = f"Bild {_op_de} und gespeichert: `{_display_fpath}` (wird dem User inline angezeigt)"
                 if r.get("revised_prompt"):
                     result += f"\n\nRevisierter Prompt: {r['revised_prompt']}"
@@ -5679,7 +5790,10 @@ def chat_round(
     # Verhindert Cross-Round-Loops (z. B. gleicher web_search 50× hintereinander) im Matrix/Discord/Scheduler-Pfad.
     _seen_tool_keys: dict[str, str] = {}
     _dedup_enabled = bool(config.get("tool_call_dedup", True))
-    _DEDUP_TOOLS = {"web_search", "read_url", "check_url"}
+    # invoke_model mit drin: schwache Modelle re-feuern identische Bild-Gen-Calls, weil das
+    # auto-deliver-Result ("...direkt gesendet, send_image NICHT") kein hartes DONE-Signal ist
+    # → Bild 2×/3× generiert+gesendet. Identischer Call = blocken (Key = name+args).
+    _DEDUP_TOOLS = {"web_search", "read_url", "check_url", "invoke_model"}
     # Doom-Loop-Recovery (Parität mit chat_round_stream): degenerierter Round-Output
     # (auch reines Thinking ohne Content) wird verworfen + Korrektur-Nudge gesendet;
     # nach _loop_recovery_max erschöpften Versuchen harter Abbruch mit User-Message.
@@ -6064,6 +6178,15 @@ def chat_round(
                             _seen_urls.add(_norm_url(args["url"]))
                     if name == "invoke_model" and _is_subagent_failure(result):
                         _subagent_failed = True
+                        # Fehlgeschlagenen invoke_model NICHT dedup-sperren: transienter
+                        # Subagent-Fehler (Timeout/503) darf mit identischen Args erneut
+                        # versucht werden. Nur ERFOLGREICHE Calls bleiben gesperrt (Loop-Schutz).
+                        if _dedup_enabled:
+                            try:
+                                _seen_tool_keys.pop(
+                                    f"{name}::{json.dumps(args, sort_keys=True, ensure_ascii=False).lower()}", None)
+                            except Exception:
+                                pass
                     if name in ("send_image", "send_audio"):
                         _img_platform = (config.get("_chat_context") or {}).get("platform")
                         if _img_platform not in ("web", "api"):
@@ -6477,7 +6600,9 @@ def chat_round_stream(
     _announce_nudge_fired = False  # rate-limit announce-without-doing nudge to 1x per request
     _seen_tool_keys: dict[str, str] = {}  # dedup: tool-key → short result preview
     _dedup_enabled = bool(config.get("tool_call_dedup", True))
-    _DEDUP_TOOLS = {"web_search", "read_url", "check_url"}
+    # invoke_model mit drin: identische Bild-Gen-Calls (gleicher Prompt+Model) sonst ungebremst
+    # → Bild doppelt/dreifach gesendet (auto-deliver-Result ist kein hartes DONE-Signal).
+    _DEDUP_TOOLS = {"web_search", "read_url", "check_url", "invoke_model"}
     _seen_urls: set[str] = set()   # alle URLs aus Tool-Ergebnissen dieser Runde (Anti-Halluzination)
     _url_guard_enabled = bool(config.get("url_hallucination_guard", True))
     # Research-Gate: Claim-Frage muss recherchiert werden, sonst Antwort verwerfen + retry
@@ -7209,6 +7334,15 @@ def chat_round_stream(
                         _seen_urls.add(_norm_url(args["url"]))
                 if name == "invoke_model" and _is_subagent_failure(result):
                     _subagent_failed = True
+                    # Fehlgeschlagenen invoke_model NICHT dedup-sperren: transienter
+                    # Subagent-Fehler (Timeout/503) darf mit identischen Args erneut
+                    # versucht werden. Nur ERFOLGREICHE Calls bleiben gesperrt (Loop-Schutz).
+                    if _dedup_enabled:
+                        try:
+                            _seen_tool_keys.pop(
+                                f"{name}::{json.dumps(args, sort_keys=True, ensure_ascii=False).lower()}", None)
+                        except Exception:
+                            pass
                 if name in ("send_image", "send_audio"):
                     _img_platform = (config.get("_chat_context") or {}).get("platform")
                     if _img_platform not in ("web", "api"):
@@ -7426,11 +7560,18 @@ def is_chat_command(user_input: str) -> bool:
     if parse_models_command(raw)[0]:
         return True
     # /new auch mit leading bot-mention prefix (z.B. "clawi: :new clawi" von Matrix Element)
+    # und Matrix-Edit-Marker ('* /model x' — editierte Nachrichten haben '* '-Fallback-Body)
     import re as _re_isc
-    _no_prefix = _normalize_cmd(_re_isc.sub(r"^[@]?[a-zA-Z][a-zA-Z0-9_-]{1,30}\s*[:,]?\s+", "", raw, count=1).strip()).lower()
+    _no_edit_raw = _normalize_cmd(_re_isc.sub(r"^\*\s+", "", raw, count=1).strip())
+    _no_prefix = _normalize_cmd(_re_isc.sub(r"^[@]?[a-zA-Z][a-zA-Z0-9_-]{1,30}\s*[:,]?\s+", "", _no_edit_raw, count=1).strip()).lower()
     if lower in ("/new", "/neu") or lower.startswith(("/new ", "/neu ")):
         return True
     if _no_prefix in ("/new", "/neu") or _no_prefix.startswith(("/new ", "/neu ")):
+        return True
+    # /model & /models ebenfalls mit Mention-Prefix erkennen ("@clawi /model qwen" in
+    # mention-Mode-Gruppenräumen) — sonst wird Auto-Context geprefixt und der Befehl
+    # landet als Prompt beim LLM statt im Command-Handler.
+    if _no_prefix == "/model" or parse_model_switch(_no_prefix)[0] is not None or parse_models_command(_no_prefix)[0]:
         return True
     if lower in ("/schedules", "/aufgaben", "/jobs"):
         return True
@@ -7451,6 +7592,13 @@ def create_session(config: dict[str, Any] | None = None, project_dir: str | None
     # user_id aus _chat_context extrahieren und an build_system_prompt weitergeben
     chat_ctx = config.get("_chat_context") or {}
     user_id = chat_ctx.get("user_id")
+    # Group-Raum mit aktiviertem model_switch: persistiertes Raum-Modell statt Default.
+    # Re-Validierung gegen allowlist — Owner kann die Liste nachträglich verkleinert haben,
+    # dann fällt der Raum still auf das Default-Modell zurück.
+    if chat_ctx.get("group_mode") and chat_ctx.get("group_model"):
+        _gm = chat_ctx["group_model"]
+        if _group_model_allowed(config, chat_ctx.get("group_models_allow") or [], _gm):
+            model = resolve_model(config, _gm) or _gm
     system_prompt = build_system_prompt(config, project_dir, current_model=model)
     return {
         "config": config,
@@ -7480,6 +7628,108 @@ def _should_append_exchange_to_memory(session: dict[str, Any], config: dict[str,
     return True
 
 
+def _handle_group_model_command(
+    session: dict[str, Any],
+    config: dict[str, Any],
+    ctx: dict[str, Any],
+    raw: str,
+) -> tuple[str, dict[str, Any], dict[str, Any] | None, str | None, str | None, dict[str, Any] | None]:
+    """Group-Raum mit model_switch=true: /model (anzeigen), /models (allowlist-gefiltert listen),
+    /model NAME (raumweit wechseln). Persistiert in room_settings/channel_settings — Group-Sessions
+    sind stateless, die Config ist der einzige persistente Ort. Kein Warmup, kein Verlauf-Löschen
+    (Group-Sessions haben keinen persistenten Verlauf). Wechsel gilt für ALLE im Raum."""
+    allow = ctx.get("group_models_allow") or []
+    lower = raw.lower()
+    # Anzeige immer in der freigegebenen Form (Alias), nicht als aufgelöster voller Name
+    current_raw = session.get("model") or resolve_model(config, None) or ""
+    current = _group_display_model(config, allow, current_raw) or "(keins)"
+
+    if lower == "/model":
+        return (
+            f"Aktuelles Raum-Modell: `{current}`\n\n*Wechseln: `/model NAME` (gilt für den ganzen Raum) · Liste: `/models`*",
+            session, None, None, None, None,
+        )
+
+    is_models, _prov = parse_models_command(raw)
+    if is_models:
+        # Provider-Filter bewusst ignoriert: im Group-Raum nur die freigegebene Liste,
+        # keine Provider-Details/base_urls an Raum-Mitglieder leaken.
+        names = _group_allowed_model_names(config, allow)
+        cur_resolved = resolve_model(config, current_raw) or current_raw
+        lines = [f"**Aktuelles Raum-Modell:** `{current}`", ""]
+        if names:
+            lines.append("**Verfügbare Modelle:**")
+            for n in names:
+                marker = " *(aktuell)*" if n == current or (resolve_model(config, n) or n) == cur_resolved else ""
+                lines.append(f"- `{n}`{marker}")
+        else:
+            lines.append("*(keine Modelle freigegeben)*")
+        lines.append("")
+        lines.append("*Wechseln: `/model NAME` — gilt für den ganzen Raum*")
+        return "\n".join(lines), session, None, None, None, None
+
+    requested, _rest = parse_model_switch(raw)
+    if requested is None:
+        return (
+            f"Aktuelles Raum-Modell: `{current}`\n\n*Wechseln: `/model NAME` · Liste: `/models`*",
+            session, None, None, None, None,
+        )
+    # Modellnamen/Aliase enthalten keine Leerzeichen — erstes Token nehmen. Fängt
+    # Trailing-Mentions ab ("/model gemma clawi" in mention-Mode-Räumen).
+    requested = requested.split()[0].lstrip("@")
+    if not _group_model_allowed(config, allow, requested):
+        names = _group_allowed_model_names(config, allow)
+        avail = ", ".join(f"`{n}`" for n in names) if names else "(keine)"
+        return (
+            f"Modell `{requested}` ist in diesem Raum nicht freigegeben. Verfügbar: {avail}",
+            session, None, None, None, None,
+        )
+    resolved = resolve_model(config, requested) or requested
+    # Verfügbarkeit beim Provider prüfen (gleicher Check wie Owner-Pfad)
+    _, api_name = get_provider_config(config, resolved)
+    api_name = api_name or resolved
+    from miniassistant.ollama_client import _split_provider_prefix
+    prov_prefix, _clean = _split_provider_prefix(resolved)
+    available, err_msg = _ollama_available_models(config, provider_name=prov_prefix)
+    if err_msg:
+        return f"Modellwechsel abgebrochen: {err_msg}.", session, None, None, None, None
+    if api_name not in available:
+        return f"Modell `{resolved}` ist beim Provider gerade nicht verfügbar. Wechsel abgebrochen.", session, None, None, None, None
+
+    platform = str(ctx.get("platform") or "").strip().lower()
+    target_id = ctx.get("room_id") or ctx.get("channel_id") or ""
+    store_key = "room_settings" if platform == "matrix" else "channel_settings"
+    # In der freigegebenen Form persistieren & anzeigen (Alias bleibt Alias) — zeigt
+    # Raum-Mitgliedern keine vollen Modellnamen und überlebt Alias-Retargeting des Owners.
+    store_model = _group_display_model(config, allow, requested)
+    if platform in ("matrix", "discord") and target_id:
+        # In-Memory setzen: chat_clients ist als nested dict mit der Bot-Basis-Config geteilt
+        # (Bots machen pro Turn nur shallow copy) → nächster Turn sieht den Wechsel sofort.
+        try:
+            _store = config.setdefault("chat_clients", {}).setdefault(platform, {}).setdefault(store_key, {})
+            _entry = _store.setdefault(target_id, {})
+            if isinstance(_entry, dict):
+                _entry["model"] = store_model
+        except Exception:
+            pass
+        # Atomic persistieren — gleiches no-clobber-Pattern wie ensure_default_group_settings.
+        try:
+            from miniassistant.config import save_config_atomic as _save_atomic
+            def _apply(cfg: dict) -> None:
+                _st = cfg.setdefault("chat_clients", {}).setdefault(platform, {}).setdefault(store_key, {})
+                _e = _st.setdefault(target_id, {})
+                if isinstance(_e, dict):
+                    _e["model"] = store_model
+            _save_atomic(_apply)
+        except Exception as e:
+            _log.warning("group model switch: persist failed: %s", e)
+    session["model"] = resolved
+    return (
+        f"Raum-Modell gewechselt: `{store_model}` *(gilt für alle in diesem Raum)*",
+        session, None, None, None, None,
+    )
+
+
 def handle_user_input(
     session: dict[str, Any],
     user_input: str,
@@ -7498,22 +7748,40 @@ def handle_user_input(
     project_dir = session.get("project_dir")
 
     # Owner-only slash commands: in Gruppenräumen blocken (Owner-DMs + Web/API bleiben offen).
+    # Ausnahme: /model & /models wenn der Owner model_switch für den Raum aktiviert hat —
+    # dann laufen sie über den Group-Pfad (allowlist-gefiltert, persistiert in room_settings).
     _ctx = config.get("_chat_context") or {}
     if _ctx.get("group_mode"):
         _raw_chk = _normalize_cmd((user_input or "").strip())
         _lower = _raw_chk.lower()
+        # Mention-Prefix abstrippen ("@clawi /model qwen", "clawi: /models") — in
+        # mention-Mode-Räumen MUSS der Bot markiert werden, der Prefix darf den
+        # Command-Parser nicht aushebeln. Gleiche Regex wie beim /new-Handling.
+        # Zusätzlich Matrix-Edit-Marker: editierte Nachrichten kommen als '* /model x' an.
+        import re as _re_grp
+        _no_edit = _normalize_cmd(_re_grp.sub(r"^\*\s+", "", _raw_chk, count=1).strip())
+        _stripped_chk = _normalize_cmd(_re_grp.sub(r"^[@]?[a-zA-Z][a-zA-Z0-9_-]{1,30}\s*[:,]?\s+", "", _no_edit, count=1).strip())
+
+        def _is_model_cmd_str(s: str) -> bool:
+            _l = s.lower()
+            return _l in ("/model", "/models") or parse_model_switch(s)[0] is not None or parse_models_command(s)[0]
+
+        _model_cmd_str = next((s for s in (_raw_chk, _no_edit, _stripped_chk) if _is_model_cmd_str(s)), None)
+        _is_model_cmd = _model_cmd_str is not None
+        _model_switch_on = bool(_ctx.get("group_model_switch"))
         _blocked = False
-        if _lower in ("/model", "/models"): _blocked = True
-        elif parse_model_switch(_raw_chk)[0] is not None: _blocked = True
-        elif parse_models_command(_raw_chk)[0]: _blocked = True
+        if _is_model_cmd and not _model_switch_on: _blocked = True
         elif _lower in ("/schedules", "/aufgaben", "/jobs"): _blocked = True
         elif _lower.startswith("/schedule ") or _lower.startswith("/aufgabe ") or _lower.startswith("/job "): _blocked = True
         if _blocked:
+            _cmd_word = (_model_cmd_str or _raw_chk).split()[0]
             return (
-                f"Befehl `{_raw_chk.split()[0]}` ist in Gruppenräumen deaktiviert. "
+                f"Befehl `{_cmd_word}` ist in Gruppenräumen deaktiviert. "
                 "Konfigurations- und Modell-Befehle laufen nur über Owner-DM oder Web-UI.",
                 session, None, None, None, None,
             )
+        if _is_model_cmd and _model_switch_on:
+            return _handle_group_model_command(session, config, _ctx, _model_cmd_str)
 
     # /model ohne Argument → aktuelles Modell anzeigen
     if user_input.strip().lower() == "/model":

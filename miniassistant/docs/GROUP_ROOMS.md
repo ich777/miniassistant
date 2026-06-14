@@ -21,6 +21,9 @@ WebUI: `/rooms` → gear button next to "Verlassen" → detail row.
 | `auto_context_max_chars` | 20–500 | 200 |
 | `docs_in_sandbox` | bool | false |
 | `search_chat_history_max` | 10–500 | 200 |
+| `model_switch` | bool | false |
+| `models_allow` | list of model names/aliases | `[]` (= all configured) |
+| `model` | model name | `""` (= global default) |
 
 Storage (`config.yaml`):
 ```yaml
@@ -43,6 +46,20 @@ chat_clients:
 ```
 
 PATCH endpoint: `/api/rooms/settings` (deep-merges; form-save preserves untouched fields).
+
+## Model switching (per room)
+
+`model_switch: false` (default): `/model` & `/models` are hard-blocked in group rooms; the room always runs on the global default model. Existing behavior.
+
+`model_switch: true`: room members can use `/models` (lists ONLY allowed models — no provider names/base_urls leaked, provider filter `/models NAME` is ignored) and `/model NAME` (switches the **room-wide** model — group sessions are stateless+shared, so the switch applies to everyone). The chosen model is persisted as `model` in `room_settings`/`channel_settings` via `save_config_atomic` (no-clobber pattern) AND set in-memory (nested `chat_clients` dict is shared with the bot's base config → next turn sees it immediately).
+
+`models_allow`: which models are listable/selectable. Empty = all configured models (`_configured_model_names`: defaults + `list` + aliases of all providers). Matching resolves aliases both ways (`/model fast` works if `llama3.2` is listed and vice versa). If the owner later shrinks the allowlist below the persisted room model, the room silently falls back to the default model (validated in `create_session`).
+
+Availability at the provider is checked like the owner path (`_ollama_available_models`); unavailable models abort the switch. No warmup, no history clear (group sessions have no persistent history).
+
+Does NOT affect: `invoke_model` image-gen/vision/subagent models (separate whitelists `image_generation:`/`vision:`/`subagents:`), owner DMs, web/API chat.
+
+Implementation: `group_rooms.build_group_chat_context` (ctx keys `group_model_switch`/`group_models_allow`/`group_model`), `chat_loop._handle_group_model_command` + `_group_model_allowed` + `create_session` override, WebUI `/rooms` detail row.
 
 ## Auto-Defaults on first contact
 

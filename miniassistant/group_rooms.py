@@ -99,6 +99,16 @@ def build_group_chat_context(
     if not isinstance(raw_allow, (list, tuple, set)):
         raw_allow = []
     ctx["tools_allow"] = sorted({str(t).strip() for t in raw_allow if isinstance(t, str)} & GROUP_ALLOWED_TOOLS)
+    # Modell-Switching (Owner-Schalter pro Raum): aus (default) → /model & /models bleiben
+    # geblockt, Raum läuft auf Default-Modell. An → models_allow = wählbare Modelle
+    # (leer = alle konfigurierten), model = persistiertes Raum-Modell (von /model gesetzt).
+    # Validierung gegen allowlist passiert in chat_loop (braucht config).
+    ctx["group_model_switch"] = bool(room_settings.get("model_switch"))
+    raw_models = room_settings.get("models_allow") or []
+    if not isinstance(raw_models, (list, tuple)):
+        raw_models = []
+    ctx["group_models_allow"] = [str(m).strip() for m in raw_models if isinstance(m, str) and str(m).strip()]
+    ctx["group_model"] = (str(room_settings.get("model") or "").strip()) if ctx["group_model_switch"] else ""
     # Sprache: 'auto' (None) | 'de' | 'en' | ...
     lang = (room_settings.get("language") or "auto").strip().lower()
     ctx["language_override"] = lang if lang and lang != "auto" else None

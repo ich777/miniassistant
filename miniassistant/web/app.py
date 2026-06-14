@@ -6779,6 +6779,9 @@ def _collect_rooms_and_channels(config: dict) -> dict:
             "auto_context_max_chars": int(s.get("auto_context_max_chars")) if s.get("auto_context_max_chars") is not None else 200,
             "docs_in_sandbox": bool(s.get("docs_in_sandbox")),
             "search_chat_history_max": int(s.get("search_chat_history_max")) if s.get("search_chat_history_max") is not None else 200,
+            "model_switch": bool(s.get("model_switch")),
+            "models_allow": [m for m in (s.get("models_allow") or []) if isinstance(m, str) and m.strip()],
+            "model": (s.get("model") or "").strip() if isinstance(s.get("model"), str) else "",
             "is_default_settings": rid not in rs,
         }
 
@@ -6979,6 +6982,22 @@ async def api_rooms_settings_patch(request: Request):
                 out["search_chat_history_max"] = max(10, min(int(entry.get("search_chat_history_max") or 200), 500))
             except (TypeError, ValueError):
                 pass
+        # Modell-Switching im Group-Raum: Schalter + Allowlist + aktives Raum-Modell.
+        # models_allow leer ⇒ Key weglassen (Semantik: alle konfigurierten Modelle).
+        # Freiform-Strings: Modelle kommen/gehen bei Ollama, Validierung passiert beim Anwenden.
+        if "model_switch" in entry:
+            out["model_switch"] = bool(entry.get("model_switch"))
+        raw_ma = entry.get("models_allow")
+        if isinstance(raw_ma, list):
+            ma = []
+            for m in raw_ma:
+                if isinstance(m, str) and m.strip() and len(m.strip()) <= 120 and m.strip() not in ma:
+                    ma.append(m.strip())
+            if ma:
+                out["models_allow"] = ma
+        mdl = entry.get("model")
+        if isinstance(mdl, str) and mdl.strip() and len(mdl.strip()) <= 120:
+            out["model"] = mdl.strip()
         return out
 
     counts = {"m": 0, "d": 0}
@@ -7040,6 +7059,12 @@ async def rooms_page(request: Request):
 
     _GROUP_TOOLS_ALL = ("web_search", "read_url", "check_url", "send_image", "send_audio", "exec", "read_recent_messages", "search_chat_history", "invoke_model")
 
+    from miniassistant.chat_loop import _configured_model_names
+    try:
+        _model_names = _configured_model_names(config)
+    except Exception:
+        _model_names = []
+
     def _settings_row(prefix: str, target_id: str, s: dict, colspan: int) -> str:
         """Ausklappbare Detailzeile für Group-Mode-Settings (context/language/tools/workspace)."""
         if not s:
@@ -7052,6 +7077,9 @@ async def rooms_page(request: Request):
         ac_max = int(s.get("auto_context_max_chars", 200))
         sch_max = int(s.get("search_chat_history_max", 200))
         docs_mount = bool(s.get("docs_in_sandbox"))
+        model_switch = bool(s.get("model_switch"))
+        models_allow = [m for m in (s.get("models_allow") or []) if isinstance(m, str) and m.strip()]
+        room_model = (s.get("model") or "").strip()
         is_def = s.get("is_default_settings")
         ctx_opts = "".join(
             f'<option value="{v}"{" selected" if v == ctx_m else ""}>{lbl}</option>'
@@ -7072,6 +7100,27 @@ async def rooms_page(request: Request):
                 f'<input type="checkbox" class="grp-tool" data-tool="{t}"{checked}> <code>{t}</code><span style="font-size:0.78em;color:var(--muted);">{" sandboxed" if t == "exec" else ""}</span></label>'
             )
         hint = " <em>(Standardwerte — noch nicht explizit gespeichert)</em>" if is_def else ""
+        # Modell-Allowlist-Checkboxen: konfigurierte Modelle + evtl. gespeicherte Einträge
+        # die nicht (mehr) konfiguriert sind (nicht still verlieren beim nächsten Save).
+        _all_model_choices = list(_model_names) + [m for m in models_allow if m not in _model_names]
+        model_checks = ""
+        for mn in _all_model_choices:
+            checked = " checked" if mn in models_allow else ""
+            model_checks += (
+                f'<label style="display:inline-flex;align-items:center;gap:0.3em;margin-right:0.9em;font-weight:normal;">'
+                f'<input type="checkbox" class="grp-model-cb" data-model="{_escape(mn)}"{checked}> <code>{_escape(mn)}</code></label>'
+            )
+        if not _all_model_choices:
+            model_checks = '<span style="font-size:0.82em;color:var(--muted);">keine Modelle konfiguriert</span>'
+        # Raum-Modell-Dropdown: leer = Standard-Modell; gespeichertes Modell behalten auch
+        # wenn nicht (mehr) in der konfigurierten Liste.
+        _model_opt_choices = list(_model_names)
+        if room_model and room_model not in _model_opt_choices:
+            _model_opt_choices.append(room_model)
+        model_opts = f'<option value=""{"" if room_model else " selected"}>(Standard-Modell)</option>' + "".join(
+            f'<option value="{_escape(mn)}"{" selected" if mn == room_model else ""}>{_escape(mn)}</option>'
+            for mn in _model_opt_choices
+        )
         return (
             f'<tr class="grp-settings-row" data-kind="{prefix}" data-id="{_escape(target_id)}" style="display:none;background:rgba(0,0,0,0.02);">'
             f'<td colspan="{colspan}" style="padding:0.7em 1em;">'
@@ -7092,6 +7141,12 @@ async def rooms_page(request: Request):
             f'<div style="display:flex;align-items:center;gap:0.6em;"><span style="font-size:0.82em;color:var(--muted);flex:1;">obergrenze für <code>search_chat_history</code> (default 200)</span><input type="number" class="grp-sch-max" value="{sch_max}" min="10" max="500" step="10" style="padding:0.25em 0.4em;font-size:0.9em;width:6em;" title="10–500"></div>'
             f'<label>Docs in Sandbox</label>'
             f'<label style="display:inline-flex;align-items:center;gap:0.4em;font-weight:normal;"><input type="checkbox" class="grp-docs"{" checked" if docs_mount else ""}> <span style="font-size:0.82em;color:var(--muted);">mountet <code>/docs/</code> read-only (Bot kann via <code>exec cat /docs/FILE</code> Doku lesen)</span></label>'
+            f'<label>Modell-Wechsel</label>'
+            f'<label style="display:inline-flex;align-items:center;gap:0.4em;font-weight:normal;"><input type="checkbox" class="grp-model-switch"{" checked" if model_switch else ""}> <span style="font-size:0.82em;color:var(--muted);">erlaubt <code>/model</code> &amp; <code>/models</code> im Raum (gilt raumweit) — aus = nur Standard-Modell, Befehle geblockt</span></label>'
+            f'<label>Erlaubte Modelle</label>'
+            f'<div class="grp-models">{model_checks}<span style="font-size:0.78em;color:var(--muted);display:block;margin-top:0.2em;">keine Auswahl = alle konfigurierten Modelle wählbar</span></div>'
+            f'<label>Raum-Modell</label>'
+            f'<select class="grp-model">{model_opts}</select>'
             f'</div>'
             f'<div style="margin-top:0.6em;font-size:0.82em;color:var(--muted);">'
             f'Group-Mode lädt slimen System-Prompt (keine SOUL/USER/Memory/Palace). '
@@ -7413,12 +7468,19 @@ async def rooms_page(request: Request):
       var ac_max = parseInt((row.querySelector(".grp-ac-max") || {{value: "200"}}).value, 10);
       var sch_max = parseInt((row.querySelector(".grp-sch-max") || {{value: "200"}}).value, 10);
       var docs_mount = !!(row.querySelector(".grp-docs") || {{checked: false}}).checked;
+      var model_switch = !!(row.querySelector(".grp-model-switch") || {{checked: false}}).checked;
+      var models_allow = [];
+      row.querySelectorAll(".grp-model-cb:checked").forEach(function(cb){{ models_allow.push(cb.getAttribute("data-model")); }});
+      var room_model = ((row.querySelector(".grp-model") || {{value: ""}}).value || "").trim();
       var out = {{context: ctx, language: lang, tools_allow: tools,
                   auto_context_count: isNaN(ac_count) ? 3 : ac_count,
                   auto_context_max_chars: isNaN(ac_max) ? 200 : ac_max,
                   search_chat_history_max: isNaN(sch_max) ? 200 : sch_max,
-                  docs_in_sandbox: docs_mount}};
+                  docs_in_sandbox: docs_mount,
+                  model_switch: model_switch,
+                  models_allow: models_allow}};
       if (sub) out.workspace_subdir = sub;
+      if (room_model) out.model = room_model;
       return out;
     }}
     function _flushSettings() {{
@@ -7442,7 +7504,7 @@ async def rooms_page(request: Request):
       _updateDirtyUi();
     }}
     document.querySelectorAll("tr.grp-settings-row").forEach(function(row) {{
-      row.querySelectorAll(".grp-ctx, .grp-lang, .grp-sub, .grp-tool, .grp-ac-count, .grp-ac-max, .grp-sch-max, .grp-docs").forEach(function(el){{
+      row.querySelectorAll(".grp-ctx, .grp-lang, .grp-sub, .grp-tool, .grp-ac-count, .grp-ac-max, .grp-sch-max, .grp-docs, .grp-model-switch, .grp-model-cb, .grp-model").forEach(function(el){{
         var evt = (el.tagName === "INPUT" && (el.type === "text" || el.type === "number")) ? "input" : "change";
         el.addEventListener(evt, function(){{ _queueSettingsFromRow(row); }});
       }});
