@@ -537,11 +537,32 @@ _CLAIM_KEYWORDS_DEFAULT = (
     "verfügbar", "verfuegbar", "lieferbar", "auf dem markt", "wo kann ich", "wo gibt es",
     "was kostet", "wie viel kostet", "wieviel kostet", "wie teuer",
 )
-# Klar nicht-faktische Anfragen → Gate NICHT auslösen (Kreatives, Sprache, Code).
+# Klar nicht-faktische Anfragen → Gate NICHT auslösen (Kreatives, Sprache, Code,
+# Textbearbeitung). Edit-/Schreib-Aufgaben enthalten oft zufällig Kosten-/Spec-Wörter
+# (z.B. eine E-Mail über Preise umformulieren) — die sollen KEINE Recherche auslösen.
 _NONCLAIM_KEYWORDS = (
+    # Kreativ / Sprache / Code
     "schreib", "gedicht", "witz", "erzähl", "erzaehl", "übersetze", "uebersetze",
     "fasse zusammen", "zusammenfassung", "programmier", "code", "debug", "erkläre mir wie",
     "erklär mir wie", "wie funktioniert", "rezept", "korrigier", "formulier",
+    # Textbearbeitung / Umschreiben (nur EINDEUTIGE Edit-Verben — Ton-Adjektive wie
+    # "professioneller"/"höflicher"/"verbesser"/"kürzer" bewusst NICHT, die kollidieren mit
+    # echten Produktfragen "welcher monitor ist professioneller, was kostet er").
+    "umformulier", "umschreib", "überarbeite", "ueberarbeite", "lektorier", "redigier",
+    "rechtschreib", "grammatik", "korrektur", "glätte", "glaette",
+    "ausformulier", "feinschliff", "verfasse", "verfass", "entwirf",
+    "mach das besser", "mach es besser", "mach das schöner", "mach es schöner",
+    # Bezug auf mitgelieferten Text
+    "diesen text", "dieser text", "den text", "folgenden text", "obigen text", "diesen absatz",
+    "den absatz", "diese mail", "diese e-mail", "diese email", "diese nachricht", "die nachricht",
+)
+# Struktur-Marker für MITGELIEFERTEN Text (E-Mail/Brief, den der User bearbeiten lässt).
+# Werden VOR den Claim-Keywords geprüft → ein Kosten-/Preis-Wort IM zitierten Text triggert
+# kein STOP, auch wenn die Anweisung selbst kein Edit-Verb enthält ("mach das besser").
+_TEXT_WORK_MARKERS = (
+    "betreff:", "sehr geehrte", "sehr geehrter", "mit freundlichen grüßen",
+    "mit freundlichen gruessen", "liebe grüße", "liebe gruesse", "beste grüße", "beste gruesse",
+    "viele grüße", "viele gruesse", "hallo zusammen", "anbei", "im anhang", "hiermit ",
 )
 
 
@@ -555,6 +576,10 @@ def _is_claim_question(text: str, keywords: tuple[str, ...] = _CLAIM_KEYWORDS_DE
     if len(t) < 8:
         return False
     if any(nk in t for nk in _NONCLAIM_KEYWORDS):
+        return False
+    # Mitgelieferter E-Mail-/Brieftext → Bearbeitung, keine Faktenfrage (auch wenn Kosten-/
+    # Preis-Wörter im zitierten Text stehen). Vor den Claim-Keywords prüfen.
+    if any(m in t for m in _TEXT_WORK_MARKERS):
         return False
     if any(k in t for k in keywords):
         return True
@@ -2203,20 +2228,33 @@ _IMG_DELIVER_LOCK = threading.Lock()
 # Multi-Bild-Absicht: nur explizite Formulierungen heben das 1-Bild-Default an.
 _MULTI_NUM_WORDS = {
     "zwei": 2, "drei": 3, "vier": 4, "fünf": 5, "fuenf": 5, "sechs": 6,
-    "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "sieben": 7, "acht": 8,
+    "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
 }
+_NUM_ALT = r'\d{1,2}|zwei|drei|vier|f(?:ü|ue)nf|sechs|sieben|acht|two|three|four|five|six|seven|eight'
 _MULTI_IMAGE_HINTS = (
     "mehrere bilder", "mehrere varianten", "mehrere versionen", "mehrere motive",
-    "mehrere davon", "verschiedene bilder", "verschiedene varianten", "ein paar bilder",
-    "ein paar davon", "einige bilder", "noch mehr davon",
+    "mehrere davon", "mehrere logos", "verschiedene bilder", "verschiedene varianten",
+    "verschiedene logos", "ein paar bilder", "ein paar davon", "ein paar logos",
+    "einige bilder", "noch mehr davon", "noch ein paar", "mehr davon",
     "multiple images", "several images", "a few images", "variations", "varianten",
     "versionen davon",
 )
-# Zahl (Ziffer/Wort) direkt vor einem Bild-Nomen: "3 bilder", "vier varianten", "2 versionen".
+# Zahl (Ziffer/Wort) direkt vor einem Bild-Nomen: "3 bilder", "vier varianten", "4 logos".
 _MULTI_IMAGE_NUM_RE = _re.compile(
-    r'\b(\d{1,2}|zwei|drei|vier|f(?:ü|ue)nf|sechs|two|three|four|five|six)\s*'
-    r'(?:verschiedene\s+|unterschiedliche\s+)?'
-    r'(?:bilder|varianten|versionen|motive|images|pics?|pictures?|st(?:ü|ue)ck)\b',
+    r'\b(' + _NUM_ALT + r')\s*'
+    r'(?:verschiedene\s+|unterschiedliche\s+|weitere\s+)?'
+    r'(?:bilder|bildern|varianten|versionen|motive|logos?|icons?|designs?|grafiken|'
+    r'entw(?:ü|ue)rfe|images|pics?|pictures?|st(?:ü|ue)ck|davon)\b',
+    _re.IGNORECASE,
+)
+# Mengen-Imperativ OHNE Bild-Nomen: "mach noch 4", "noch 2 clawi", "gib mir 4", "weitere 3",
+# "mach mir 2", "nochmal 3", "generier 5". Greift nur im Bild-Kontext (nur _image_turn_cap nutzt das).
+_MULTI_QUANTITY_RE = _re.compile(
+    r'\b(?:noch|nochmal|nochmals|weitere?|mehr|zus(?:ä|ae)tzlich\w*|'
+    r'mach\w*|erstell\w*|generier\w*|zeichne?|gib|erzeug\w*|bau\w*|mal)'
+    r'(?:\s+(?:mir|uns|mal|noch|bitte|dann|gleich|davon))*\s+'
+    r'(' + _NUM_ALT + r')\b',
     _re.IGNORECASE,
 )
 
@@ -2240,15 +2278,17 @@ def _image_turn_cap(config: dict[str, Any]) -> int:
 
     Default **1 Bild pro Anfrage** — verhindert den Doom-Loop, bei dem das Modell den Bild-Prompt
     von sich aus jede Runde umformuliert und neu generiert (Auto-Deliver sendet jede Gen sofort).
-    Verlangt der User in DIESER Nachricht aber explizit mehrere Bilder ("3 bilder", "mehrere
-    varianten", …), wird bis `images_max_per_turn` (default 4, Sicherheits-Ceiling) erlaubt.
+    Verlangt der User in DIESER Nachricht aber explizit mehrere Bilder ("3 bilder", "mach noch 4",
+    "gib mir 2 logos", "mehrere varianten", …), wird bis `images_max_per_turn` (default 4,
+    Sicherheits-Ceiling) erlaubt.
     Counter resettet pro Nachricht (matrix_bot/discord_bot shallow-copyen config je Turn)."""
     try:
         ceiling = max(1, int(config.get("images_max_per_turn") or 4))
     except (TypeError, ValueError):
         ceiling = 4
     text = _current_user_message(config.get("_user_request_text") or "")
-    m = _MULTI_IMAGE_NUM_RE.search(text)
+    # Zahl vor Bild-Nomen ODER Mengen-Imperativ ("mach noch 4", "gib mir 2") → explizite Anzahl.
+    m = _MULTI_IMAGE_NUM_RE.search(text) or _MULTI_QUANTITY_RE.search(text)
     if m:
         g = m.group(1).lower()
         n = int(g) if g.isdigit() else _MULTI_NUM_WORDS.get(g, 2)
@@ -4790,12 +4830,14 @@ def _run_subagent_openai(
                 if _img_platform in ("matrix", "discord") and _img_ctx.get("group_mode"):
                     _st = _auto_deliver_group_image(config, str(fpath), _caption)
                     if _st == "sent":
+                        # Ruhig + erfolgs-gerahmt formulieren. Eine zu alarmierende Meldung
+                        # (STOP/ABGESCHLOSSEN/Doppel-Bilder in Caps) hat das Modell als FEHLER
+                        # missgedeutet und nach Doom-Loop-Recovery "technisches Problem" halluziniert
+                        # — obwohl das Bild erfolgreich im Raum war.
                         result = (
-                            f"Bild {_op_de} und wurde BEREITS in den Raum gesendet — der User SIEHT es "
-                            "jetzt. Aufgabe ABGESCHLOSSEN. Generiere KEIN weiteres Bild zum 'Verbessern' "
-                            "oder Umformulieren: JEDE Generierung wird sofort gesendet → der User bekäme "
-                            "Doppel-Bilder. Rufe NICHT send_image. Antworte dem User JETZT mit einer "
-                            "kurzen Bestätigung (keine weiteren Tool-Calls)."
+                            f"Erledigt: Bild {_op_de} und an den User gesendet — es ist sichtbar. "
+                            "Antworte dem User kurz und freundlich (1 Satz). Kein send_image, keine "
+                            "weitere Generierung nötig."
                         )
                     elif _st == "cap":
                         result = f"Bild {_op_de} und gespeichert: `{_display_fpath}` — Turn-Bildlimit erreicht, nicht gesendet."
@@ -6188,6 +6230,13 @@ def chat_round(
                             except Exception:
                                 pass
                     if name in ("send_image", "send_audio"):
+                        _img_platform = (config.get("_chat_context") or {}).get("platform")
+                        if _img_platform not in ("web", "api"):
+                            _sent_image = True
+                    # Auto-geliefertes Bild (Matrix/Discord) = die Antwort, wie send_image behandeln.
+                    # Unterdrückt einen evtl. degenerierten/falschen Bestätigungstext (Doom-Loop-
+                    # Recovery hat sonst "technisches Problem" gemeldet obwohl das Bild im Raum war).
+                    if name == "invoke_model" and (config.get("_auto_sent_image_paths") or None):
                         _img_platform = (config.get("_chat_context") or {}).get("platform")
                         if _img_platform not in ("web", "api"):
                             _sent_image = True
