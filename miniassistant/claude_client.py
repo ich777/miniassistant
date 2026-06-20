@@ -111,6 +111,7 @@ def cli_chat(
     max_turns: int | None = None,
     timeout: int = 300,
     allowed_tools: list[str] | None = None,
+    permission_mode: str | None = None,
 ) -> dict[str, Any]:
     """
     Claude Code CLI im nicht-interaktiven Modus (`claude --print`).
@@ -133,12 +134,17 @@ def cli_chat(
         cmd.extend(["--model", model])
     if allowed_tools:
         cmd.extend(["--allowedTools", ",".join(allowed_tools)])
+    # Headless --print has no one to approve tool prompts → without a permission mode
+    # every tool (WebSearch/WebFetch/Bash) is denied and the worker can do nothing.
+    if permission_mode:
+        cmd.extend(["--permission-mode", permission_mode])
 
-    cmd.append(message)
+    # Prompt via stdin, NOT as a trailing positional: variadic flags like --allowedTools
+    # (<tools...>) would otherwise greedily swallow the message arg → "Input must be provided".
     _log.debug("Claude Code CLI: %s", " ".join(cmd[:6]) + "...")
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=_subprocess_env())
+        result = subprocess.run(cmd, input=message, capture_output=True, text=True, timeout=timeout, env=_subprocess_env())
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"Claude Code CLI Timeout nach {timeout}s")
     except Exception as e:

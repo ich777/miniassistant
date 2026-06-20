@@ -34,6 +34,21 @@ from miniassistant.memory import append_exchange
 _log = logging.getLogger("miniassistant.openai_compat")
 
 
+# Image markdown with embedded base64 (![alt](data:image/...;base64,...)) plus bare
+# data: URIs. Worthless on replay (OpenWebUI history), but they blow up the context.
+_INBOUND_B64_IMG_MD_RE = _re.compile(r'!\[[^\]]*\]\(data:image/[^;]+;base64,[A-Za-z0-9+/=\s]+\)')
+_INBOUND_B64_NAKED_RE = _re.compile(r'data:image/[^;]+;base64,[A-Za-z0-9+/=\s]{100,}')
+
+
+def _strip_base64_images(content: str) -> str:
+    """Replace embedded base64 images with a placeholder (context-bloat guard)."""
+    if "base64," not in content:
+        return content
+    content = _INBOUND_B64_IMG_MD_RE.sub("[Bild]", content)
+    content = _INBOUND_B64_NAKED_RE.sub("[Bild]", content)
+    return content
+
+
 def _strip_tool_call_xml(content: str) -> str:
     """Entfernt Tool-Call-Tags aus Content für saubere Anzeige."""
     content = _re.sub(r'<tool_call>.*?</tool_call>', '', content, flags=_re.DOTALL)
@@ -188,7 +203,12 @@ def _openai_messages_to_internal(
                         except Exception:
                             pass
             content = "\n".join(text_parts)
-        out.append({"role": role, "content": content or ""})
+        # OpenWebUI echoes prior assistant replies (incl. images we sent back as
+        # data:image base64 markdown) into the history each turn. Left as text those
+        # base64 blobs (hundreds of KB) explode the token estimate → compaction fires
+        # EVERY turn. Strip them to a placeholder; the bytes carry no value on replay.
+        content = _strip_base64_images(content or "")
+        out.append({"role": role, "content": content})
     return out, images
 
 

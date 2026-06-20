@@ -590,6 +590,83 @@ def _is_claim_question(text: str, keywords: tuple[str, ...] = _CLAIM_KEYWORDS_DE
     return False
 
 
+# Output-based research-gate detector (language-agnostic). Instead of guessing from the
+# QUESTION (keyword list, German-only), check the ANSWER: does it assert a hard fact
+# (price / version) that is NOT in this round's tool output? Prices/versions are
+# language-neutral tokens → works in any language. Dates/years deliberately excluded
+# (too many false positives: "in 2026", date mentions).
+_FACT_PRICE_RE = _re.compile(
+    r'(?:€|\$|£|EUR|USD|GBP|CHF)\s?\d[\d.,]*'           # €1.499 / $1,344
+    r'|\d[\d.,]*\s?(?:€|\$|£|EUR|USD|GBP|CHF|euro|dollar|pound|franc)',  # 1.499 € / 1344 USD
+    _re.IGNORECASE,
+)
+_FACT_VERSION_RE = _re.compile(r'\bv?\d+\.\d+(?:\.\d+)+\b')  # v1.2.3 (3+ segments → not a price/date)
+
+
+def _answer_has_unsourced_facts(answer: str, sources: str) -> bool:
+    """True if the answer asserts a price/version whose digits do NOT appear in this
+    round's sources (tool results + user message). Conservative: min. 3 digits (shorter
+    ones match by chance too often). False positive only costs an extra search;
+    false negative = an unsourced number stays in."""
+    if not answer or not answer.strip():
+        return False
+    src_digits = _re.sub(r'\D', '', sources or "")
+    for rx in (_FACT_PRICE_RE, _FACT_VERSION_RE):
+        for tok in rx.findall(answer):
+            digits = _re.sub(r'\D', '', tok)
+            if len(digits) < 3:
+                continue
+            if digits not in src_digits:
+                return True
+    return False
+
+
+def _round_tool_sources(msgs: list[dict[str, Any]], user_content: str) -> str:
+    """Verifiable sources for this round: all tool results + the user message
+    (the user's own numbers count as sourced, see knowledge_verification.md)."""
+    parts = [user_content or ""]
+    for m in msgs:
+        if m.get("role") == "tool" and (m.get("content") or "").strip():
+            parts.append(m["content"])
+    return "\n".join(parts)
+
+
+def _research_gate_nudge(user_content: str) -> str:
+    """Search nudge, anchored to the CURRENT question (otherwise the model latches onto
+    the wrong/old topic in a long conversation)."""
+    q = (user_content or "").strip().replace("\n", " ")
+    if len(q) > 200:
+        q = q[:200] + "…"
+    return (
+        "STOP. Your answer contains a price/version that is NOT in this round's tool "
+        "output — i.e. from memory. That is not allowed.\n"
+        f"This is ONLY about this question: «{q}»\n"
+        "Call `web_search` NOW (at least once, then `read_url` for the relevant hits) "
+        "and only then answer — using only numbers/prices/versions that appear verbatim in "
+        "the tool output, plus the source links. Stay on the topic of the question above. "
+        "If you can't find it: say so, invent nothing."
+    )
+
+
+def _is_image_caption_only(text: str) -> bool:
+    """True if the text alongside a sent image is just a short filler/caption (e.g.
+    "Here is the image", "Done! 📷") → safe to drop, the image IS the answer.
+    Substantial answers (reports, comparisons, tables, multi-line) are KEPT so they
+    reach the user/scheduler — otherwise e.g. a weather comparison gets lost."""
+    t = (text or "").strip()
+    if not t:
+        return True
+    # When in doubt, KEEP — losing text is the worse failure. Only very short,
+    # single-line fillers without structure count as a pure caption.
+    if len(t) > 60:         # longer text → real answer
+        return False
+    if "\n" in t:           # multi-line → real content
+        return False
+    if "|" in t:            # table row
+        return False
+    return True
+
+
 # ── Tool-Lazy-Load ───────────────────────────────────────────────────────
 # Alle 22 Tool-Schemas immer mitzuschicken kostet ~6.4k Tokens fix. Selten genutzte
 # Tools (email/schedule/webhook/...) nur laden wenn die User-Nachricht sie andeutet.
@@ -3114,7 +3191,21 @@ def _run_tool(
             except Exception as _e:
                 return f"send_image path resolution failed: {_e}"
         if not _Path(image_path).exists():
-            return f"File not found: {image_path}"
+            # Loop-Guard: the model often hallucinates a filename and spams send_image on it
+            # without ever creating the file (curl/download/invoke_model). First failure →
+            # actionable message; from the 2nd identical attempt → hard block.
+            _miss = config.setdefault("_send_image_missing_paths", {})
+            _miss[image_path] = _miss.get(image_path, 0) + 1
+            if _miss[image_path] >= 2:
+                return (f"send_image BLOCKED: '{image_path}' still does not exist "
+                        f"(attempt {_miss[image_path]}). STOP sending this path. The file was never "
+                        "created. Create/fetch it FIRST (e.g. `exec` curl the source URL into the "
+                        "workspace, or invoke_model to generate it), verify with `ls`, THEN call "
+                        "send_image with the real path.")
+            return (f"File not found: {image_path}. This file does not exist — you never created it. "
+                    "Do NOT call send_image again with this path. Download/create the file FIRST "
+                    "(curl the URL into the workspace, or invoke_model to generate it), verify with `ls`, "
+                    "THEN call send_image with the real path.")
         # Dedup: im Group-Mode bereits auto-geliefertes Bild nicht erneut senden.
         if image_path in (config.get("_auto_sent_image_paths") or set()):
             return "send_image skipped: this image was already auto-delivered to the room. Do not resend."
@@ -4239,12 +4330,20 @@ def _run_subagent_claude_code(
     # model=None nutzt das Default-Modell von Claude Code, sonst den konfigurierten
     model_arg = api_model if api_model and api_model != resolved_name else None
     _sub_timeout = int(config.get("subagent_api_timeout") or config.get("api_timeout") or 900)
+    # Headless worker needs a permission mode + tool allowlist, else every tool prompt is
+    # denied (--print can't approve) and it returns "no network access". Read from provider config.
+    from miniassistant.ollama_client import get_provider_config as _gpc
+    _prov_cc, _ = _gpc(config, resolved_name)
+    _perm_mode = _prov_cc.get("permission_mode") or None
+    _allowed = _prov_cc.get("allowed_tools") or None
     r = claude_chat(
         user_msg,
         system=system,
         model=model_arg,
         max_turns=3,
         timeout=_sub_timeout,
+        permission_mode=_perm_mode,
+        allowed_tools=_allowed,
     )
     content = (r.get("message") or {}).get("content", "").strip()
     result = content or "(Keine Antwort)"
@@ -6060,25 +6159,20 @@ def chat_round(
                     _display_content = _strip_tool_call_tags(_msg_content)
 
                 if not tool_calls:
-                    # Research-Gate: Claim-Frage ohne Recherche → Antwort verwerfen, Such-Nudge, retry
+                    # Research gate (output-based, language-agnostic): the answer asserts a
+                    # price/version that is NOT in this round's tool output → discard the answer,
+                    # send a search nudge anchored to the current question, retry.
                     if (_research_gate_enabled
                             and _research_gate_attempts < _research_gate_max
                             and _has_search
-                            and _data_tool_count == 0
                             and (_msg_content or "").strip()
                             and rounds < max_tool_rounds - 1
-                            and _is_claim_question(user_content, _claim_kw)):
+                            and _answer_has_unsourced_facts(_msg_content, _round_tool_sources(msgs, user_content))):
                         _research_gate_attempts += 1
-                        _log.info("Research-Gate (chat_round): Claim-Frage ohne Recherche — erzwinge web_search (Versuch %d/%d, Runde %d)",
+                        _log.info("Research gate (chat_round): unsourced price/version in answer — forcing web_search (attempt %d/%d, round %d)",
                                   _research_gate_attempts, _research_gate_max, rounds)
                         msgs.append({"role": "assistant", "content": _msg_content or "", "thinking": msg.get("thinking") or ""})
-                        msgs.append({"role": "user", "content": (
-                            "STOP. Das ist eine Faktenfrage (Preise/Specs/Versionen/News/Verfügbarkeit/Kaufberatung). "
-                            "Du hast aus dem Gedächtnis geantwortet OHNE zu recherchieren. Das ist nicht erlaubt. "
-                            "Rufe JETZT `web_search` auf (min. 1×, dann `read_url` für die relevanten Treffer) und "
-                            "antworte erst dann — mit verifizierten Fakten und konkreten Quell-Links aus den Tool-Ergebnissen. "
-                            "Keine Zahlen/Preise/Versionen aus dem Gedächtnis."
-                        )})
+                        msgs.append({"role": "user", "content": _research_gate_nudge(user_content)})
                         rounds += 1
                         continue
                     # Halluziniertes Bild erkannt (base64 oder fake URL)? → strippen, Korrektur-Runde starten
@@ -6333,12 +6427,17 @@ def chat_round(
             if not _response_logged and total_content.strip():
                 _aal.log_response(config, total_content.strip(), tps=_aal.extract_tps(last_response, time.monotonic() - _t0, total_content.strip(), total_thinking))
 
-            # send_image war erfolgreich → Content unterdrücken (Bild IST die Antwort, kein Text nötig)
+            # send_image succeeded → only suppress a SHORT caption filler (the image IS the
+            # answer). KEEP substantial text (report/comparison/table) — otherwise it gets lost
+            # (scheduler: "0 chars → skipped", user only sees the image).
             if _sent_image:
-                config["_response_handled_via_side_effect"] = True
-                if total_content.strip():
-                    _log.info("send_image erfolgreich – unterdrücke Text-Content: %.60s", total_content.strip())
-                    total_content = ""
+                if _is_image_caption_only(total_content):
+                    config["_response_handled_via_side_effect"] = True
+                    if total_content.strip():
+                        _log.info("send_image succeeded – suppressing caption filler: %.60s", total_content.strip())
+                        total_content = ""
+                else:
+                    _log.info("send_image succeeded, but substantial text (%d chars) — keeping it", len(total_content.strip()))
 
             effective_model = try_model
             if try_model != model and last_error:
@@ -7023,31 +7122,24 @@ def chat_round_stream(
             _rc = round_content or full_msg.get("content") or ""
             _rt = round_thinking or full_msg.get("thinking") or ""
 
-            # Research-Gate: Claim-Frage (Preise/Specs/Versionen/News/Kaufberatung), aber das
-            # Modell will OHNE web_search aus dem Gedächtnis antworten → Antwort verwerfen,
-            # Such-Nudge, retry. Programmatisch erzwungen (kleine Modelle ignorieren die
-            # knowledge_verification-Regel sonst). Nur wenn Suche verfügbar + noch nicht erschöpft.
+            # Research gate (output-based, language-agnostic): the answer asserts a price/version
+            # that is NOT in this round's tool output → discard the answer, send a search nudge
+            # anchored to the current question, retry. Replaces the old input-keyword heuristic
+            # (German-only, false alarm on schedule/"aktuelle"/"vergleich").
             if (_research_gate_enabled
                     and _research_gate_attempts < _research_gate_max
                     and _has_search
-                    and _data_tool_count == 0
                     and _rc.strip()
                     and rounds < max_tool_rounds - 1
-                    and _is_claim_question(user_content, _claim_kw)):
+                    and _answer_has_unsourced_facts(_rc, _round_tool_sources(msgs, user_content))):
                 _research_gate_attempts += 1
-                _log.info("Research-Gate: Claim-Frage ohne web_search — erzwinge Recherche (Versuch %d/%d, Runde %d)",
+                _log.info("Research gate: unsourced price/version in answer — forcing research (attempt %d/%d, round %d)",
                           _research_gate_attempts, _research_gate_max, rounds)
-                yield {"type": "status", "message": "🔎 Faktenfrage erkannt — verifiziere erst per Websuche"}
+                yield {"type": "status", "message": "🔎 Unbelegte Zahl erkannt — verifiziere erst per Websuche"}
                 if _rc in total_content:
                     total_content = total_content.replace(_rc, "")
                 msgs.append({"role": "assistant", "content": _rc, "thinking": _rt})
-                msgs.append({"role": "user", "content": (
-                    "STOP. Das ist eine Faktenfrage (Preise/Specs/Versionen/News/Verfügbarkeit/Kaufberatung). "
-                    "Du hast aus dem Gedächtnis geantwortet OHNE zu recherchieren. Das ist nicht erlaubt. "
-                    "Rufe JETZT `web_search` auf (min. 1×, dann `read_url` für die relevanten Treffer) und "
-                    "antworte erst dann — mit verifizierten Fakten und konkreten Quell-Links aus den Tool-Ergebnissen. "
-                    "Keine Zahlen/Preise/Versionen aus dem Gedächtnis."
-                )})
+                msgs.append({"role": "user", "content": _research_gate_nudge(user_content)})
                 rounds += 1
                 continue
 
@@ -7173,9 +7265,11 @@ def chat_round_stream(
                     "response": last_response,
                     "message": full_msg,
                 }
-            # send_image war erfolgreich → Content unterdrücken (Bild IST die Antwort)
+            # send_image succeeded → only suppress a short caption filler; keep substantial
+            # text (see _is_image_caption_only).
+            _suppress_done = _sent_image and _is_image_caption_only(total_content)
             _done_content, _done_thinking = _clean_response(
-                "" if _sent_image else total_content.strip(), total_thinking.strip())
+                "" if _suppress_done else total_content.strip(), total_thinking.strip())
             # Pending Images injizieren
             # Discord/Matrix senden Bilder direkt via notify.py, nicht als Markdown
             _pending_imgs = config.pop("_pending_images", [])
@@ -7480,11 +7574,13 @@ def chat_round_stream(
         except Exception as nudge_err:
             _log.warning("Stream nudge (max rounds) failed: %s", nudge_err)
 
-    # send_image war erfolgreich → Content unterdrücken (Bild IST die Antwort)
-    if _sent_image:
+    # send_image succeeded → only suppress a short caption filler; keep substantial text
+    # (report/comparison/table), otherwise it gets lost (see _is_image_caption_only).
+    _suppress_for_image = _sent_image and _is_image_caption_only(total_content)
+    if _suppress_for_image:
         config["_response_handled_via_side_effect"] = True
     _final_content, _final_thinking = _clean_response(
-        "" if _sent_image else total_content.strip(), total_thinking.strip())
+        "" if _suppress_for_image else total_content.strip(), total_thinking.strip())
 
     # URL-Halluzinations-Guard: jede URL im finalen Content MUSS in einem
     # Tool-Ergebnis dieser Runde vorgekommen sein. Sicherheitsnetz: zusätzlich

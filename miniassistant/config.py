@@ -572,6 +572,9 @@ def _parse_provider(raw: dict[str, Any]) -> dict[str, Any]:
         "options": options,
         "model_options": model_options,
         "models": models,
+        # claude-code worker: headless tool access (else --print denies every tool prompt)
+        "permission_mode": raw.get("permission_mode") or None,
+        "allowed_tools": raw.get("allowed_tools") or None,
     }
 
 
@@ -782,6 +785,10 @@ def save_config(config: dict[str, Any], project_dir: str | None = None) -> Path:
             out_prov["think"] = prov_cfg["think"]
         if prov_cfg.get("no_api_tools"):
             out_prov["no_api_tools"] = prov_cfg["no_api_tools"]
+        if prov_cfg.get("permission_mode"):
+            out_prov["permission_mode"] = prov_cfg["permission_mode"]
+        if prov_cfg.get("allowed_tools"):
+            out_prov["allowed_tools"] = prov_cfg["allowed_tools"]
         if prov_cfg.get("options"):
             out_prov["options"] = prov_cfg["options"]
         if prov_cfg.get("model_options"):

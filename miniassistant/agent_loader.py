@@ -1301,12 +1301,21 @@ def _vision_section(config: dict[str, Any], current_model: str | None = None) ->
         lines.append(f"- **Vision models configured:** {models_str}.")
         if current_model:
             if current_is_vision:
+                _self_vm = current_model
                 lines.append(
                     f"- **You are `{current_model}` — you ARE vision-capable.** "
-                    "When the user uploads an image, the raw image bytes are attached to their message "
-                    "and you receive them directly. **Analyze the image in your own response.** "
-                    "Do NOT call `invoke_model` just to describe an image — that wastes a round-trip. "
-                    "Only delegate via `invoke_model` if the user explicitly asks for a different vision model."
+                    "When the user UPLOADS an image, the raw bytes are attached to their message "
+                    "and you receive them directly. **Analyze that image in your own response.** "
+                    "Do NOT call `invoke_model` just to describe a user-uploaded image — that wastes a round-trip."
+                )
+                lines.append(
+                    "- **CRITICAL — you only see images the user uploaded in THEIR message.** "
+                    "An image you fetched/downloaded yourself (curl, `download_file`, exec), generated, or that just "
+                    "sits in the workspace as a file is **NOT in your context — you literally cannot see it.** "
+                    f"To analyze such a file you MUST call `invoke_model(model='{_self_vm}', message='describe this image', image_path='/path/to/file.jpg')` "
+                    "and use the returned description. "
+                    "**NEVER describe a workspace/downloaded image from imagination** — guessing its contents is a hallucination and is forbidden. "
+                    "A path mentioned in a tool result is a file on disk, not something you can see."
                 )
             else:
                 other_vm = next((vm for vm in vision_models if _norm(vm) != _norm(current_model)), vision_models[0])

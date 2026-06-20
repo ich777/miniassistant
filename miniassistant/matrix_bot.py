@@ -1464,7 +1464,7 @@ async def run_matrix_bot(config: dict[str, Any]) -> None:
         # Pending Image speichern – nächste Textnachricht bekommt es
         _pending_images.setdefault(sender, []).append(img_data)
         if not _is_group_img:
-            await _send_room_message(client, room_id, "Bild empfangen. Was soll ich damit machen? (Schreib mir eine Nachricht dazu)")
+            await _send_room_message(client, room_id, "Bild empfangen 📷 Schreib mir, was ich damit machen soll — oder lade noch weitere Bilder hoch, dann schau ich sie mir zusammen an.")
         else:
             logger.info("Matrix: Bild von %s in Group-Raum %s pending — kein Confirm-Reply (silent mode, TTL %ds)", sender, room_id, _PENDING_GROUP_TTL)
 
