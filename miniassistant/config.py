@@ -43,6 +43,8 @@ _PASSTHROUGH_TUNING_KEYS = (
     # Image-Edit-Tuning: strength-Default (1.0 = voller Denoise, nötig damit qwen-image-edit
     # & Co. die Instruktion anwenden); max_edge cappt Quell-Auflösung.
     "image_edit_strength", "image_edit_max_edge",
+    # Advanced/AIO-Prompt: {enabled: bool, file: path} — ersetzt den ganzen System-Prompt.
+    "advanced_prompt", "knowledge_cutoff",
 )
 
 # ---------------------------------------------------------------------------

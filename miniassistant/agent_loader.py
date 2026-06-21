@@ -1389,6 +1389,130 @@ def _voice_section(config: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _extract_assistant_name(identity_md: str) -> str:
+    """Liest den Assistenten-Namen aus IDENTITY.md (Zeile 'Name: X' / '**Name**: X' / '- Name: X').
+    Fallback: 'MiniAssistant'."""
+    if identity_md:
+        m = re.search(r"(?im)\bname\*{0,2}\s*[:=]\s*\*{0,2}([^\n.,;(*]+)", identity_md)
+        if m:
+            name = m.group(1).strip().strip("*").strip()
+            if name:
+                return name
+    return "MiniAssistant"
+
+
+def _resolve_advanced_prompt(config: dict[str, Any], chat_ctx: dict[str, Any]) -> str | None:
+    """Globaler Advanced/AIO-Prompt-Schalter. Gilt NUR für Web-UI + DM/agent — NIE für Gruppenräume.
+
+    Global (config['advanced_prompt']): {enabled: bool, file: path|name}. Datei leer → Default
+    (aio_caveman.md). Dateiname ohne '/' wird gegen agent_dir/advanced_prompts/ aufgelöst.
+    Gruppenräume (chat_ctx['group_mode']) behalten immer ihren slimmen Group-Prompt.
+    """
+    if chat_ctx.get("group_mode"):
+        return None
+    from miniassistant.advanced_prompts.loader import resolve_prompt_path, DEFAULT_PROMPT_FILE
+    glob = config.get("advanced_prompt") or {}
+    if not (isinstance(glob, dict) and glob.get("enabled")):
+        return None
+    spec = (glob.get("file") or "").strip() or DEFAULT_PROMPT_FILE
+    return resolve_prompt_path(config, spec)
+
+
+def _render_advanced_prompt(
+    file_path: str,
+    config: dict[str, Any],
+    files: dict[str, str],
+    chat_ctx: dict[str, Any],
+    current_model: str | None,
+    is_root: bool,
+    project_dir: str | None,
+) -> str:
+    """Lädt die Advanced-Prompt-Datei und füllt die {{platzhalter}} aus Runtime/Config.
+    Überschreibt den kompletten zusammengesetzten Prompt (DM und Group)."""
+    import datetime as _dt
+    raw = Path(file_path).read_text(encoding="utf-8", errors="replace")
+
+    identity_md = files.get("IDENTITY.md", "") or ""
+    force_lang = chat_ctx.get("language_override")
+    if force_lang or config.get("respond_in_input_language"):
+        identity_md = _strip_language_from_identity(identity_md)
+
+    agent_dir = (config.get("agent_dir") or "").strip()
+    workspace = (config.get("workspace") or "").strip()
+    trash_dir = (config.get("trash_dir") or "").strip()
+    ws_resolved = str(Path(workspace).expanduser().resolve()) if workspace else ""
+    prefs_path = str((Path(agent_dir).expanduser().resolve() / "prefs")) if agent_dir else ""
+    trash_path = str(Path(trash_dir).expanduser().resolve()) if trash_dir else (f"{ws_resolved}/.trash" if ws_resolved else ".trash")
+
+    proxy_list = ""
+    proxy_default = ""
+    try:
+        from miniassistant.tools import get_read_url_proxy_names
+        ru = get_read_url_proxy_names(config)
+        if ru:
+            proxy_list = ", ".join(f"`{n}`" + ("" if not u else f" ({u})") for n, u in ru)
+            proxy_default = ((config.get("read_url") or {}).get("default_proxy") or ru[0][0]).strip()
+    except Exception:
+        pass
+
+    # room_context: Group → Speaker/Activity/Prefs/Boundary; DM → letzter Fire im Raum.
+    if chat_ctx.get("group_mode"):
+        room_parts = [
+            _group_speaker_section(chat_ctx),
+            _group_last_activity_section(config, chat_ctx),
+            _group_prefs_section(config, chat_ctx),
+            _group_communication_boundary_section(),
+        ]
+        room_context = "\n".join(p for p in room_parts if p)
+    else:
+        room_context = (_room_last_fire_section(config) or "")
+
+    now = _dt.datetime.now()
+    cutoff = (config.get("knowledge_cutoff") or "").strip() or "the end of 2023"
+
+    def _safe(fn, *a):
+        try:
+            return fn(*a) or ""
+        except Exception:
+            return ""
+
+    soul_md = (files.get("SOUL.md", "") or "").strip()
+    soul_block = (
+        "## SOUL (your personality)\n" + soul_md
+        + "\n\nDo not mention being an AI, the user knows. Be focused and factual."
+    ) if soul_md else ""
+    agents_md = (files.get("AGENTS.md", "") or "").strip()
+    agents_block = ("## AGENTS (top-level contract)\n" + agents_md) if agents_md else ""
+    tools_env_block = _safe(_tools_umgebung_section, files.get("TOOLS.md", ""), config)
+    docs_reference_block = _safe(_docs_reference_section, config)
+
+    values = {
+        "assistantname": _extract_assistant_name(files.get("IDENTITY.md", "")),
+        "knowledge_cutoff": cutoff,
+        "current_date": now.astimezone().strftime("%B %d, %Y"),
+        "current_year": str(now.year),
+        "soul_block": soul_block,
+        "agents_block": agents_block,
+        "tools_env_block": tools_env_block,
+        "identity_block": identity_md,
+        "user_block": (files.get("USER.md", "") or "") + "\n\n" + _safe(_user_session_section, config),
+        "system_runtime": _safe(_system_and_runtime_section, is_root),
+        "memory_block": _safe(_memory_section, project_dir, config),
+        "prefs_block": _safe(_prefs_section, config),
+        "vision_block": _safe(_vision_section, config, current_model),
+        "docs_reference_block": docs_reference_block,
+        "room_context": room_context,
+        "prefs_path": prefs_path,
+        "trash_path": trash_path,
+        "workspace": ws_resolved,
+        "proxy_list": proxy_list or "(none configured)",
+        "proxy_default": proxy_default or "direct",
+    }
+    for k, v in values.items():
+        raw = raw.replace("{{" + k + "}}", v)
+    return raw.strip()
+
+
 def build_system_prompt(
     config: dict[str, Any] | None = None,
     project_dir: str | None = None,
@@ -1412,6 +1536,19 @@ def build_system_prompt(
     is_root = _is_root()
 
     chat_ctx = config.get("_chat_context") or {}
+    # Advanced/AIO-Prompt: Defaults nach agent_dir/advanced_prompts/ kopieren (persistent, editierbar),
+    # dann auflösen. Überschreibt kompletten Prompt für DM/agent; Gruppenräume nur bei explizitem per-Raum-Wert.
+    try:
+        from miniassistant.advanced_prompts.loader import ensure_advanced_prompts
+        ensure_advanced_prompts(config)
+    except Exception:
+        pass
+    _adv_file = _resolve_advanced_prompt(config, chat_ctx)
+    if _adv_file:
+        try:
+            return _render_advanced_prompt(_adv_file, config, files, chat_ctx, current_model, is_root, project_dir)
+        except Exception:
+            pass  # Fallback auf normalen Prompt-Aufbau wenn Datei kaputt/unlesbar
     if chat_ctx.get("group_mode"):
         return _build_group_system_prompt(config, files, chat_ctx, current_model, is_root)
 

@@ -1034,6 +1034,11 @@ async def config_form_page(request: Request):
         {{ n:"context_quota", t:"float", l:"Context-Quota (0..1)" }},
     ]}},
 
+    {{ id: "advanced_prompt", title: "Advanced-Prompt (AIO / Caveman)", path: "advanced_prompt", fields: [
+        {{ n:"enabled", t:"bool", l:"Aktiv — ersetzt den System-Prompt für Web-UI + DMs (NICHT Gruppenräume)" }},
+        {{ n:"file", t:"text", l:"Datei (leer = aio_caveman.md · aio.md = volle Version · oder absoluter Pfad). Dateien liegen in agent_dir/advanced_prompts/" }},
+    ]}},
+
     {{ id: "scheduler", title: "Scheduler", path: "scheduler", type:"falsy_or_form",
        fields:[{{n:"enabled", t:"bool", l:"Aktiv"}}] }},
 
@@ -5106,6 +5111,7 @@ _AGENT_EDIT_ROOTS = [
     ("Basics", "", False, False),
     ("Docs", "docs", False, False),
     ("Regeln", "basic_rules", False, False),
+    ("Advanced-Prompt", "advanced_prompts", True, True),
     ("Prefs", "prefs", True, True),
     ("Directions", "directions", True, True),
 ]
