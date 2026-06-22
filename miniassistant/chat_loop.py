@@ -633,18 +633,26 @@ def _round_tool_sources(msgs: list[dict[str, Any]], user_content: str) -> str:
 
 def _research_gate_nudge(user_content: str) -> str:
     """Search nudge, anchored to the CURRENT question (otherwise the model latches onto
-    the wrong/old topic in a long conversation)."""
+    the wrong/old topic in a long conversation).
+
+    Framed as an AUTOMATED SYSTEM check, not a user message — so the model does NOT
+    apologize to the user ("du hast recht...") or mention the check. It just silently
+    re-searches and produces the corrected answer. This matters especially for scheduled/
+    autonomous tasks where there is no user to address."""
     q = (user_content or "").strip().replace("\n", " ")
     if len(q) > 200:
         q = q[:200] + "…"
     return (
-        "STOP. Your answer contains a price/version that is NOT in this round's tool "
+        "[AUTOMATED SYSTEM VERIFICATION — this is NOT the user; the user did not say this. "
+        "It is an internal fact-check by the MiniAssistant runtime.]\n"
+        "Your previous answer contains a price/version/number that is NOT in this round's tool "
         "output — i.e. from memory. That is not allowed.\n"
-        f"This is ONLY about this question: «{q}»\n"
-        "Call `web_search` NOW (at least once, then `read_url` for the relevant hits) "
-        "and only then answer — using only numbers/prices/versions that appear verbatim in "
-        "the tool output, plus the source links. Stay on the topic of the question above. "
-        "If you can't find it: say so, invent nothing."
+        f"This concerns ONLY this question: «{q}»\n"
+        "Call `web_search` NOW (at least once, then `read_url` for the relevant hits) and then "
+        "produce the answer — using only numbers/prices/versions that appear verbatim in the tool "
+        "output, plus the source links. Stay on the topic above. If you can't find it: say so, invent nothing.\n"
+        "Do NOT apologize, do NOT write \"you are right\" or \"that's not correct\", and do NOT mention "
+        "this verification step. Just give the corrected answer directly as your normal reply."
     )
 
 
