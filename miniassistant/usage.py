@@ -21,10 +21,24 @@ def _usage_path() -> str:
 
 def record(config: dict, model: str, call_type: str, duration_s: float) -> None:
     """Appended eine CSV-Zeile.  Noop wenn track_usage nicht aktiv.
-    scope wird auto-detected aus config['_chat_context']['group_mode'] → 'group' sonst 'owner'."""
+    scope auto-detected aus config['_chat_context']: raw_mode → 'raw',
+    group_mode → 'group', sonst 'owner'."""
     if not config.get("server", {}).get("track_usage"):
         return
-    scope = "group" if (config.get("_chat_context") or {}).get("group_mode") else "owner"
+    _cc = config.get("_chat_context") or {}
+    if _cc.get("raw_mode"):
+        scope = "raw"
+    elif _cc.get("group_mode"):
+        scope = "group"
+    else:
+        scope = "owner"
+    # Modellname kanonisieren ('provider/realmodel') damit derselbe Backend
+    # immer gleich erscheint — egal ob mit/ohne Prefix aufgerufen.
+    try:
+        from .ollama_client import canonical_model_name
+        model = canonical_model_name(config, model)
+    except Exception:
+        _log.debug("canonical_model_name failed", exc_info=True)
     path = _usage_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     write_header = not os.path.exists(path) or os.path.getsize(path) == 0
@@ -103,7 +117,8 @@ def aggregate(entries: list[dict], group_by: str = "day") -> dict:
     if not entries:
         return {
             "summary": {"total_seconds": 0, "total_requests": 0, "formatted": "0s",
-                         "group_seconds": 0, "group_requests": 0, "group_formatted": "0s"},
+                         "group_seconds": 0, "group_requests": 0, "group_formatted": "0s",
+                         "raw_seconds": 0, "raw_requests": 0, "raw_formatted": "0s"},
             "by_time": [],
             "by_model": [],
             "by_type": [],
@@ -112,8 +127,8 @@ def aggregate(entries: list[dict], group_by: str = "day") -> dict:
     total_s = sum(e["seconds"] for e in entries)
     total_n = len(entries)
 
-    # --- by_time (mit group-split) ---
-    time_buckets: dict[str, dict] = defaultdict(lambda: {"seconds": 0.0, "requests": 0, "group_seconds": 0.0, "group_requests": 0})
+    # --- by_time (mit group/raw-split) ---
+    time_buckets: dict[str, dict] = defaultdict(lambda: {"seconds": 0.0, "requests": 0, "group_seconds": 0.0, "group_requests": 0, "raw_seconds": 0.0, "raw_requests": 0})
     for e in entries:
         ts: datetime = e["ts"]
         if group_by == "hour":
@@ -129,11 +144,14 @@ def aggregate(entries: list[dict], group_by: str = "day") -> dict:
         if e.get("scope") == "group":
             tb["group_seconds"] += e["seconds"]
             tb["group_requests"] += 1
+        elif e.get("scope") == "raw":
+            tb["raw_seconds"] += e["seconds"]
+            tb["raw_requests"] += 1
 
     by_time = [{"label": k, **v} for k, v in sorted(time_buckets.items())]
 
-    # --- by_model (mit group-split) ---
-    model_buckets: dict[str, dict] = defaultdict(lambda: {"seconds": 0.0, "requests": 0, "group_seconds": 0.0, "group_requests": 0})
+    # --- by_model (mit group/raw-split) ---
+    model_buckets: dict[str, dict] = defaultdict(lambda: {"seconds": 0.0, "requests": 0, "group_seconds": 0.0, "group_requests": 0, "raw_seconds": 0.0, "raw_requests": 0})
     for e in entries:
         m = model_buckets[e["model"]]
         m["seconds"] += e["seconds"]
@@ -141,6 +159,9 @@ def aggregate(entries: list[dict], group_by: str = "day") -> dict:
         if e.get("scope") == "group":
             m["group_seconds"] += e["seconds"]
             m["group_requests"] += 1
+        elif e.get("scope") == "raw":
+            m["raw_seconds"] += e["seconds"]
+            m["raw_requests"] += 1
     by_model = sorted(
         [{"model": k, **v} for k, v in model_buckets.items()],
         key=lambda x: x["seconds"], reverse=True,
@@ -156,10 +177,13 @@ def aggregate(entries: list[dict], group_by: str = "day") -> dict:
         key=lambda x: x["seconds"], reverse=True,
     )
 
-    # --- group totals (für summary card — nur sichtbar wenn >0) ---
+    # --- group/raw totals (für summary cards — nur sichtbar wenn >0) ---
     group_entries = [e for e in entries if e.get("scope") == "group"]
     group_s = sum(e["seconds"] for e in group_entries)
     group_n = len(group_entries)
+    raw_entries = [e for e in entries if e.get("scope") == "raw"]
+    raw_s = sum(e["seconds"] for e in raw_entries)
+    raw_n = len(raw_entries)
 
     return {
         "summary": {
@@ -169,6 +193,9 @@ def aggregate(entries: list[dict], group_by: str = "day") -> dict:
             "group_seconds": round(group_s, 2),
             "group_requests": group_n,
             "group_formatted": _fmt_seconds(group_s),
+            "raw_seconds": round(raw_s, 2),
+            "raw_requests": raw_n,
+            "raw_formatted": _fmt_seconds(raw_s),
         },
         "by_time": by_time,
         "by_model": by_model,

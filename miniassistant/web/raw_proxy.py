@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -22,6 +23,17 @@ from miniassistant.config import load_config
 _log = logging.getLogger("miniassistant.raw_proxy")
 
 router = APIRouter(prefix="/raw/v1", tags=["Raw OpenAI Proxy"])
+
+
+def _record_usage(config: dict[str, Any], model: str, call_type: str, t0: float) -> None:
+    """Schreibt Usage-Eintrag mit scope 'raw' (noop wenn track_usage aus)."""
+    try:
+        from miniassistant.usage import record as _usage_record
+        # Shallow-Copy: _chat_context setzen ohne geteilte config zu mutieren.
+        _cfg = {**config, "_chat_context": {"raw_mode": True}}
+        _usage_record(_cfg, model, call_type, time.monotonic() - t0)
+    except Exception:
+        _log.debug("raw usage record failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +253,8 @@ async def chat_completions(request: Request):
 
     from miniassistant.web.app import _chat_executor
 
+    _t0 = time.monotonic()
+
     try:
         if stream:
             from miniassistant.chat_loop import _iter_with_keepalive
@@ -266,11 +280,14 @@ async def chat_completions(request: Request):
                 _loop = asyncio.get_event_loop()
                 gen = _stream_with_keepalive()
                 _sentinel = object()
-                while True:
-                    chunk = await _loop.run_in_executor(_chat_executor, lambda: next(gen, _sentinel))
-                    if chunk is _sentinel:
-                        break
-                    yield chunk
+                try:
+                    while True:
+                        chunk = await _loop.run_in_executor(_chat_executor, lambda: next(gen, _sentinel))
+                        if chunk is _sentinel:
+                            break
+                        yield chunk
+                finally:
+                    _record_usage(config, resolved_model, "raw", _t0)
 
             return StreamingResponse(
                 _async_stream(),
@@ -288,6 +305,7 @@ async def chat_completions(request: Request):
                 lambda: httpx.post(url, headers=headers, json=body, timeout=_timeout),
             )
             r.raise_for_status()
+            _record_usage(config, resolved_model, "raw", _t0)
             return JSONResponse(r.json())
 
     except httpx.HTTPStatusError as e:
@@ -334,7 +352,14 @@ async def completions(request: Request):
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     
+    # Modell-Name für Usage auflösen (Alias → echt)
+    aliases = (prov_cfg.get("models") or {}).get("aliases") or {}
+    resolved_model = aliases.get(model, model)
+    if "/" in resolved_model:
+        resolved_model = resolved_model.split("/", 1)[-1]
+
     from miniassistant.web.app import _chat_executor
+    _t0 = time.monotonic()
     try:
         loop = asyncio.get_event_loop()
         r = await loop.run_in_executor(
@@ -342,6 +367,7 @@ async def completions(request: Request):
             lambda: httpx.post(url, headers=headers, json=body, timeout=120),
         )
         r.raise_for_status()
+        _record_usage(config, resolved_model, "raw", _t0)
         return JSONResponse(r.json())
     except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=e.response.status_code, detail=e.response.text)

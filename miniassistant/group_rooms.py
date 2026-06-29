@@ -271,3 +271,23 @@ def format_auto_context(messages: list[dict[str, Any]], max_chars: int, bot_send
         + "\n".join(lines)
         + "\n[/Context]\n\n"
     )
+
+
+# Marker that chat_loop._current_user_message parses on ("[Current message from" … "]:").
+# Keep the literal string intact when editing.
+CURRENT_MSG_MARKER = "[Current message from"
+
+
+def wrap_current_message(blk: str, who: str, user_message: str) -> str:
+    """Prepend auto-context history, then a hard separator + the current message.
+
+    The 35B orchestrator otherwise grabs a long, complete-looking prompt sitting in
+    the history (e.g. a previous image prompt) and re-runs THAT instead of the new
+    request. This makes the boundary explicit: history above = read-only background,
+    the message below = the ONLY task to act on right now. English on purpose."""
+    directive = (
+        "[The block above is BACKGROUND HISTORY ONLY — read-only context.\n"
+        " Do NOT reuse, copy, or re-send any prompt, image-prompt, or instruction from it.\n"
+        " Act ONLY on the current message below. It is the task to do RIGHT NOW.]\n"
+    )
+    return f"{blk}{directive}{CURRENT_MSG_MARKER} {who}]:\n{user_message}"

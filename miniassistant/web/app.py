@@ -4172,6 +4172,7 @@ async def nutzung_page(request: Request):
         <div class="summary-card"><div class="label">Anfragen</div><div class="value" id="sum-requests">—</div></div>
         <div class="summary-card"><div class="label">Modelle</div><div class="value" id="sum-models">—</div></div>
         <div class="summary-card" id="sum-group-card" style="display:none;background:rgba(168,85,247,0.08);border-color:rgba(168,85,247,0.3);"><div class="label">Davon Gruppen</div><div class="value" id="sum-group-time">—</div><div style="font-size:0.75em;color:var(--muted);margin-top:0.2em;" id="sum-group-req"></div></div>
+        <div class="summary-card" id="sum-raw-card" style="display:none;background:rgba(34,197,94,0.08);border-color:rgba(34,197,94,0.3);"><div class="label">Davon Raw-Proxy</div><div class="value" id="sum-raw-time">—</div><div style="font-size:0.75em;color:var(--muted);margin-top:0.2em;" id="sum-raw-req"></div></div>
       </div>
       <div class="chart-container"><canvas id="usage-chart"></canvas></div>
       <div class="tables-row">
@@ -4253,6 +4254,17 @@ async def nutzung_page(request: Request):
             }} else {{
               grpCard.style.display = "none";
             }}
+            // Raw-Card nur wenn raw_seconds > 0 (nur sichtbar bei tatsächlicher Raw-Nutzung)
+            var rawCard = document.getElementById("sum-raw-card");
+            var rawSec = data.summary.raw_seconds || 0;
+            if (rawSec > 0) {{
+              rawCard.style.display = "";
+              document.getElementById("sum-raw-time").textContent = data.summary.raw_formatted || "0s";
+              var rpct = data.summary.total_seconds > 0 ? Math.round(rawSec / data.summary.total_seconds * 100) : 0;
+              document.getElementById("sum-raw-req").textContent = (data.summary.raw_requests || 0) + " Anfragen · " + rpct + "% Gesamt";
+            }} else {{
+              rawCard.style.display = "none";
+            }}
 
             // Chart
             var labels = (data.by_time || []).map(function(d) {{
@@ -4262,9 +4274,12 @@ async def nutzung_page(request: Request):
             }});
             var totalsArr = (data.by_time || []).map(function(d) {{ return d.seconds; }});
             var groupArr = (data.by_time || []).map(function(d) {{ return d.group_seconds || 0; }});
-            var ownerArr = (data.by_time || []).map(function(d, i) {{ return Math.max(0, totalsArr[i] - groupArr[i]); }});
+            var rawArr = (data.by_time || []).map(function(d) {{ return d.raw_seconds || 0; }});
+            var ownerArr = (data.by_time || []).map(function(d, i) {{ return Math.max(0, totalsArr[i] - groupArr[i] - rawArr[i]); }});
             var counts = (data.by_time || []).map(function(d) {{ return d.requests; }});
             var anyGroupTime = groupArr.some(function(v) {{ return v > 0; }});
+            var anyRawTime = rawArr.some(function(v) {{ return v > 0; }});
+            var anySplit = anyGroupTime || anyRawTime;
 
             if (chart) chart.destroy();
             var isDark = document.documentElement.getAttribute("data-theme") === "dark"
@@ -4272,10 +4287,10 @@ async def nutzung_page(request: Request):
             var gridColor = isDark ? "rgba(255,255,255,0.1)" : "rgba(0,0,0,0.08)";
             var textColor = isDark ? "#aaa" : "#666";
 
-            // Wenn Group-Daten vorhanden: stacked bar (Owner unten blau + Group oben lila).
+            // Wenn Group/Raw-Daten vorhanden: stacked bar (Owner blau + Gruppe lila + Raw grün).
             // Sonst: single blue bar wie vorher.
             var barDatasets;
-            if (anyGroupTime) {{
+            if (anySplit) {{
               barDatasets = [{{
                 label: "Owner",
                 data: ownerArr,
@@ -4285,16 +4300,31 @@ async def nutzung_page(request: Request):
                 borderRadius: 4,
                 stack: "time",
                 yAxisID: "y"
-              }}, {{
-                label: "Gruppe",
-                data: groupArr,
-                backgroundColor: "rgba(168, 85, 247, 0.7)",
-                borderColor: "rgba(168, 85, 247, 1)",
-                borderWidth: 1,
-                borderRadius: 4,
-                stack: "time",
-                yAxisID: "y"
               }}];
+              if (anyGroupTime) {{
+                barDatasets.push({{
+                  label: "Gruppe",
+                  data: groupArr,
+                  backgroundColor: "rgba(168, 85, 247, 0.7)",
+                  borderColor: "rgba(168, 85, 247, 1)",
+                  borderWidth: 1,
+                  borderRadius: 4,
+                  stack: "time",
+                  yAxisID: "y"
+                }});
+              }}
+              if (anyRawTime) {{
+                barDatasets.push({{
+                  label: "Raw-Proxy",
+                  data: rawArr,
+                  backgroundColor: "rgba(34, 197, 94, 0.7)",
+                  borderColor: "rgba(34, 197, 94, 1)",
+                  borderWidth: 1,
+                  borderRadius: 4,
+                  stack: "time",
+                  yAxisID: "y"
+                }});
+              }}
             }} else {{
               barDatasets = [{{
                 label: "Sekunden",
@@ -4339,13 +4369,13 @@ async def nutzung_page(request: Request):
                   }}
                 }},
                 scales: {{
-                  x: {{ ticks: {{ color: textColor, font: {{ size: 11 }} }}, grid: {{ color: gridColor }}, stacked: anyGroupTime }},
+                  x: {{ ticks: {{ color: textColor, font: {{ size: 11 }} }}, grid: {{ color: gridColor }}, stacked: anySplit }},
                   y: {{
                     type: "linear", position: "left",
                     title: {{ display: true, text: "Sekunden", color: textColor }},
                     ticks: {{ color: textColor }}, grid: {{ color: gridColor }},
                     beginAtZero: true,
-                    stacked: anyGroupTime
+                    stacked: anySplit
                   }},
                   y1: {{
                     type: "linear", position: "right",
@@ -4359,10 +4389,15 @@ async def nutzung_page(request: Request):
 
             // Tables — by_model: Gruppen-Spalte nur wenn irgendein Modell Group-Usage hat
             var hasGroup = (data.by_model || []).some(function(r) {{ return (r.group_seconds || 0) > 0; }});
+            var hasRaw = (data.by_model || []).some(function(r) {{ return (r.raw_seconds || 0) > 0; }});
             var modelCols = [{{key: "model", label: "Modell"}}, {{key: "seconds", label: "Zeit", fmt: "sec"}}, {{key: "requests", label: "Anfragen"}}];
             if (hasGroup) {{
               modelCols.push({{key: "group_seconds", label: "Gruppen-Zeit", fmt: "sec"}});
               modelCols.push({{key: "group_requests", label: "Gruppen-Anfragen"}});
+            }}
+            if (hasRaw) {{
+              modelCols.push({{key: "raw_seconds", label: "Raw-Zeit", fmt: "sec"}});
+              modelCols.push({{key: "raw_requests", label: "Raw-Anfragen"}});
             }}
             document.getElementById("table-model").innerHTML = buildTable(data.by_model, modelCols);
             document.getElementById("table-type").innerHTML = buildTable(

@@ -223,6 +223,41 @@ def resolve_model(config: dict[str, Any], model: str | None, _depth: int = 0) ->
     return model
 
 
+def canonical_model_name(config: dict[str, Any], model: str | None) -> str:
+    """Kanonische 'provider/realmodel'-Form für Usage-Tracking.
+
+    Damit derselbe Backend-Modell immer GLEICH erscheint — egal ob mit Prefix
+    (Subagent/Vision: 'llama-swap/x') oder ohne (Default-Provider-Alias: 'x')
+    aufgerufen. Alias wird aufgelöst, dann Besitzer-Provider vorangestellt.
+    Pseudo-Modelle die zu keinem Provider gehören (z.B. TTS 'wyoming') bleiben
+    unverändert."""
+    if not model:
+        return model or ""
+    resolved = resolve_model(config, model) or model
+    providers = config.get("providers") or {}
+    prefix, clean = _split_provider_prefix(resolved)
+    if prefix:
+        real = _find_provider(providers, prefix)
+        return f"{real}/{clean}" if real else resolved
+
+    def _owns(prov_cfg: dict[str, Any], name: str) -> bool:
+        pm = prov_cfg.get("models") or {}
+        names: set[str] = set()
+        if pm.get("default"):
+            names.add(pm["default"])
+        al = pm.get("aliases") or {}
+        names.update(al.keys())
+        names.update(al.values())
+        names.update(pm.get("list") or [])
+        return name in names
+
+    # Besitzer-Provider suchen (Default zuerst, da Insertion-Order)
+    for pname, pcfg in providers.items():
+        if isinstance(pcfg, dict) and _owns(pcfg, clean):
+            return f"{pname}/{clean}"
+    return resolved  # unbekannt (z.B. TTS-Stimme) → unverändert
+
+
 def get_provider_type(config: dict[str, Any], model_name: str) -> str:
     """Provider-Typ für ein Modell: 'ollama' (default), 'claude-code', etc."""
     prov, _ = get_provider_config(config, model_name)

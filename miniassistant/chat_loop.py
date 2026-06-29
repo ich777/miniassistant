@@ -5911,6 +5911,11 @@ def chat_round(
     # invoke_model bekommt nur die agent-konstruierte Edit-Prompt, nicht den Rohtext.
     # So greift der Regex-Fallback auf "mach mit 20 steps" auch wenn Agent den Param weglässt.
     config["_user_request_text"] = user_content or ""
+    # Per-Turn Image-State HIER resetten: config lebt in session["config"] und überlebt
+    # Turns (handle_user_input liest session["config"]). Ohne Reset bleibt der Counter nach
+    # dem 1. Bild >= cap → jeder weitere invoke_model-Image-Call STOPpt sofort (0.0s).
+    config["_send_image_count_this_turn"] = 0
+    config["_send_image_missing_paths"] = {}
     # Slot-Cache: Restore versuchen wenn conv_id im Context gesetzt
     _ctx = config.get("_chat_context") or {}
     _conv_id = _ctx.get("conv_id")
@@ -6661,6 +6666,9 @@ def chat_round_stream(
     system_prompt = refresh_datetime_in_prompt(system_prompt)
     # Original-User-Request für Image-Param-Extraktion (steps/cfg/size) merken (siehe chat_round).
     config["_user_request_text"] = user_content or ""
+    # Per-Turn Image-State resetten (siehe chat_round) — config überlebt Turns via session.
+    config["_send_image_count_this_turn"] = 0
+    config["_send_image_missing_paths"] = {}
     # Slot-Cache: Restore versuchen wenn conv_id im Context gesetzt
     _ctx_s = config.get("_chat_context") or {}
     _conv_id_s = _ctx_s.get("conv_id")

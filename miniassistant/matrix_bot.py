@@ -871,6 +871,7 @@ def _get_chat_response(
     from miniassistant.group_rooms import (
         get_room_settings, build_group_chat_context, session_key as _sess_key,
         ensure_default_group_settings, get_auto_context_settings, format_auto_context,
+        wrap_current_message,
     )
     if room_id and member_count > 2:
         ensure_default_group_settings(config, "matrix", room_id, is_group=True)
@@ -912,7 +913,7 @@ def _get_chat_response(
                     # Aktuelle Message explizit mit Sender-Marker wrappen — verhindert dass Bot
                     # den Request einem User aus dem Auto-Context zuschreibt (z.B. dem der zuerst @clawi mention'te).
                     _who_now = base_ctx.get("user_display") or matrix_user_id
-                    user_message = blk + f"[Current message from {_who_now}]:\n" + user_message
+                    user_message = wrap_current_message(blk, _who_now, user_message)
             except Exception as _ac_err:
                 logger.debug("Matrix auto-context fetch failed: %s", _ac_err)
     session_key = _sess_key(room_id, matrix_user_id, bool(ctx.get("group_mode")))
