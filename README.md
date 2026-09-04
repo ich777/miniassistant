@@ -22,7 +22,7 @@ source venv/bin/activate
 sudo ln -s /pfad/zum/projekt/venv/bin/miniassistant /usr/local/bin/miniassistant
 ```
 
-Optional: Init-Skript (sysvinit) oder systemd installieren:
+Optional: Autostart einrichten:
 
 ```bash
 # sysvinit (z. B. Debian ohne systemd)
@@ -33,7 +33,27 @@ sudo service miniassistant start
 ./install.sh --systemd
 sudo systemctl daemon-reload
 sudo systemctl enable --now miniassistant
+
+# macOS: launchd
+./install.sh --launchd                # LaunchAgent, startet beim Login
+sudo ./install.sh --launchd-system    # LaunchDaemon, startet beim Boot
 ```
+
+### macOS (Intel und Apple Silicon)
+
+Läuft auf beiden Architekturen. `./install.sh` erkennt macOS und bietet an, fehlendes
+Homebrew zu installieren; danach holt es `python@3.13`, `libolm`, `cmake` und `ffmpeg`.
+Das mitgelieferte System-Python (3.9) ist zu alt — MiniAssistant braucht 3.10+.
+
+Unterschiede zu Linux:
+
+| Thema | macOS |
+|---|---|
+| Autostart | launchd (`launchctl`), Vorlage in `launchd/com.miniassistant.plist`. Label `com.miniassistant` — darauf greift auch der Restart-Button der WebUI zu. |
+| Logs | `~/.config/miniassistant/logs/miniassistant.log` (launchd schreibt stdout nicht von selbst) |
+| Group-Room-`exec` | Sandbox über `sandbox-exec` (Seatbelt) statt bubblewrap — im System enthalten, nichts zu installieren |
+| Matrix-E2EE | `libolm` aus Homebrew; `install.sh` setzt `CFLAGS`/`LDFLAGS` auf den Brew-Prefix (`/opt/homebrew` auf ARM, `/usr/local` auf Intel) |
+| Voice | `ffmpeg` aus Homebrew |
 
 ## Ersteinrichtung
 
@@ -224,7 +244,7 @@ Wird MiniAssistant nur via Reverse-Proxy ins Internet gestellt (empfohlen), bind
 
 ## System-Erkennung
 
-Die LLM erfährt automatisch, auf welchem System sie läuft (OS, Distribution, Paketmanager, Init-System), damit sie die passenden Befehle nutzt (z. B. apt vs dnf, systemctl vs service). Erkannt werden u. a. Debian/Ubuntu, Fedora/RHEL, Arch, Alpine, openSUSE, macOS.
+Die LLM erfährt automatisch, auf welchem System sie läuft (OS, Distribution, Paketmanager, Init-System), damit sie die passenden Befehle nutzt (z. B. apt vs dnf, systemctl vs service vs launchctl). Erkannt werden u. a. Debian/Ubuntu, Fedora/RHEL, Arch, Alpine, openSUSE, macOS. Auf macOS bekommt die LLM zusätzlich eine kompakte launchd-Anleitung (plist-Pfade, `bootstrap`/`bootout`/`kickstart`) in den System-Prompt, damit sie Autostart korrekt einrichtet.
 
 ## Coding via OpenCode (Orchestrator-Modell)
 

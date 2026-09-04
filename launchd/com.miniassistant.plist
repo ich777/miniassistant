@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  MiniAssistant – launchd job (macOS, Intel + Apple Silicon).
+
+  %INSTALL_DIR% und %HOME% vor dem Installieren ersetzen:
+    sed -e "s|%INSTALL_DIR%|$PWD|g" -e "s|%HOME%|$HOME|g" \
+        launchd/com.miniassistant.plist > ~/Library/LaunchAgents/com.miniassistant.plist
+    mkdir -p "$HOME/.config/miniassistant/logs"
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.miniassistant.plist
+
+  Nach Aenderungen am plist: bootout, dann erneut bootstrap.
+  Systemweit (Start beim Boot, ohne Login) stattdessen nach
+  /Library/LaunchDaemons/, chown root:wheel, chmod 644, Domain "system".
+
+  Der Label-Name com.miniassistant wird von /api/restart erwartet.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.miniassistant</string>
+
+    <!-- Absolute Pfade: launchd hat einen minimalen PATH -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>%INSTALL_DIR%/venv/bin/python</string>
+        <string>-m</string>
+        <string>miniassistant.cli</string>
+        <string>serve</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>%INSTALL_DIR%</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Neustart bei Absturz; auch der SIGTERM-Fallback von /api/restart braucht das -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <!-- launchd loggt stdout/stderr nicht von selbst. Pfad = config_dir/logs, dort sucht die WebUI. -->
+    <key>StandardOutPath</key>
+    <string>%HOME%/.config/miniassistant/logs/miniassistant.log</string>
+    <key>StandardErrorPath</key>
+    <string>%HOME%/.config/miniassistant/logs/miniassistant.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- Optional: abweichendes Config-Verzeichnis
+        <key>MINIASSISTANT_CONFIG_DIR</key>
+        <string>/etc/miniassistant</string>
+        -->
+    </dict>
+</dict>
+</plist>

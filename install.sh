@@ -5,17 +5,22 @@
 # - Erstellt venv (falls nicht vorhanden), installiert Abhängigkeiten
 # - Installiert bei Bedarf System-Pakete (python3, venv, pip, libolm für Matrix-E2EE)
 # - Optional: Init-Skript nach /etc/init.d/miniassistant installieren (mit --init)
+# - Optional: launchd-Job auf macOS installieren (mit --launchd)
 
 set -e
 
 INSTALL_DIR="."
 INIT_INSTALL=""
 SYSTEMD_INSTALL=""
+LAUNCHD_INSTALL=""
+LAUNCHD_SYSTEM=""
 MIGRATE_MEMPALACE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --init)               INIT_INSTALL=1 ;;
     --systemd)            SYSTEMD_INSTALL=1 ;;
+    --launchd)            LAUNCHD_INSTALL=1 ;;
+    --launchd-system)     LAUNCHD_INSTALL=1; LAUNCHD_SYSTEM=1 ;;
     --migrate-mempalace)  MIGRATE_MEMPALACE=1 ;;
     *)                    INSTALL_DIR="$1" ;;
   esac
@@ -35,7 +40,37 @@ fi
 # --- System-Pakete installieren (vor der Python-Prüfung); bei Fehler (z. B. ohne sudo) weitermachen ---
 # Für Matrix-E2EE: libolm-dev, cmake, make, python3-dev (Header für C-Erweiterungen wie python-olm)
 echo "System-Pakete (python3, venv, pip; für Matrix-E2EE: libolm-dev, cmake, make, python3-dev; für Voice: ffmpeg; Emoji-Schrift: fonts-noto-color-emoji; für Group-Room-Sandbox: bubblewrap)..."
-if command -v apt-get >/dev/null 2>&1; then
+if [ "$(uname -s)" = "Darwin" ]; then
+  if ! command -v brew >/dev/null 2>&1; then
+    echo "  Homebrew nicht gefunden - liefert python3 >=3.10, ffmpeg (Voice) und libolm (Matrix-E2EE)."
+    printf "  Homebrew jetzt installieren? [J/n] "
+    read -r BREW_ANSWER </dev/tty 2>/dev/null || BREW_ANSWER=""
+    case "$BREW_ANSWER" in
+      n|N|nein|no)
+        echo "  Uebersprungen. Ohne brew fehlen python3 >=3.10, ffmpeg (Voice) und libolm (Matrix-E2EE)."
+        ;;
+      *)
+        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
+          || echo "  Homebrew-Installation fehlgeschlagen - weiter ohne."
+        # Frisch installiertes brew in PATH holen (ARM: /opt/homebrew, Intel: /usr/local)
+        for BREW_BIN in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+          if [ -x "$BREW_BIN" ]; then eval "$("$BREW_BIN" shellenv)"; break; fi
+        done
+        ;;
+    esac
+  fi
+  if command -v brew >/dev/null 2>&1; then
+    ( brew install python@3.13 libolm cmake ffmpeg ) 2>/dev/null || \
+    ( brew install python3 libolm cmake ffmpeg ) 2>/dev/null || \
+    ( brew install python3 ) 2>/dev/null || true
+  fi
+  # bubblewrap gibt es auf macOS nicht; die Group-Room-Sandbox nutzt dort sandbox-exec (Seatbelt).
+  if [ -x /usr/bin/sandbox-exec ]; then
+    echo "  Group-Room-Sandbox: sandbox-exec (Seatbelt) vorhanden - kein Extra-Paket noetig."
+  else
+    echo "  Warnung: /usr/bin/sandbox-exec fehlt - exec in Group-Rooms bleibt deaktiviert." >&2
+  fi
+elif command -v apt-get >/dev/null 2>&1; then
   ( $SUDO apt-get update -qq && $SUDO apt-get install -y python3 python3-venv python3-pip python3-dev python3-yaml libolm-dev cmake build-essential ffmpeg fonts-noto-color-emoji bubblewrap ) 2>/dev/null || {
     ( $SUDO apt-get update -qq && $SUDO apt-get install -y python3 python3-venv python3-pip python3-dev python3-yaml libolm-dev cmake make ffmpeg fonts-noto-color-emoji bubblewrap ) 2>/dev/null || \
     ( $SUDO apt-get update -qq && $SUDO apt-get install -y python3 python3-venv python3-pip python3-yaml ffmpeg fonts-noto-color-emoji bubblewrap ) 2>/dev/null || \
@@ -59,30 +94,50 @@ echo ""
 # --- Prüfung: Python und erforderliche Tools ---
 echo "Prüfe Voraussetzungen..."
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "Fehler: python3 nicht gefunden." >&2
-  echo "  Bitte Python 3.10 oder neuer installieren (z.B. ${SUDO}apt install python3 python3-venv python3-pip)." >&2
-  echo "  Das Install-Skript versucht zuvor, System-Pakete zu installieren (mit sudo)." >&2
+# Interpreter suchen statt blind `python3` zu nehmen: auf macOS ist /usr/bin/python3
+# die System-3.9 (zu alt), waehrend brew python3.13 danebenliegt. Gleiches Muster
+# hilft auf LTS-Distros, wo python3 alt ist und python3.11 parallel existiert.
+PY_BIN=""
+for PY_CAND in python3.14 python3.13 python3.12 python3.11 python3.10 python3; do
+  if command -v "$PY_CAND" >/dev/null 2>&1; then
+    if "$PY_CAND" -c 'import sys; sys.exit(0 if sys.version_info[:2] >= (3, 10) else 1)' 2>/dev/null; then
+      PY_BIN="$(command -v "$PY_CAND")"
+      break
+    fi
+  fi
+done
+
+if [ -z "$PY_BIN" ]; then
+  if command -v python3 >/dev/null 2>&1; then
+    PY_FOUND=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "?")
+    echo "Fehler: MiniAssistant benötigt Python 3.10 oder neuer. Gefunden: $PY_FOUND." >&2
+    if [ "$(uname -s)" = "Darwin" ]; then
+      echo "  macOS liefert nur Python 3.9 mit. Installieren: brew install python@3.13" >&2
+    else
+      echo "  Bitte eine neuere Python-Version installieren." >&2
+    fi
+  else
+    echo "Fehler: python3 nicht gefunden." >&2
+    if [ "$(uname -s)" = "Darwin" ]; then
+      echo "  Installieren: brew install python@3.13" >&2
+    else
+      echo "  Bitte Python 3.10 oder neuer installieren (z.B. ${SUDO}apt install python3 python3-venv python3-pip)." >&2
+      echo "  Das Install-Skript versucht zuvor, System-Pakete zu installieren (mit sudo)." >&2
+    fi
+  fi
   exit 1
 fi
 
-PY_VERSION=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null) || true
+PY_VERSION=$("$PY_BIN" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null) || true
 if [ -z "$PY_VERSION" ]; then
   echo "Fehler: python3-Version konnte nicht ermittelt werden." >&2
   exit 1
 fi
-# Mindestversion 3.10 (einfacher Check: 3.9 < 3.10)
-PY_MAJOR=$(echo "$PY_VERSION" | cut -d. -f1)
-PY_MINOR=$(echo "$PY_VERSION" | cut -d. -f2)
-if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" = 3 ] && [ "$PY_MINOR" -lt 10 ]; }; then
-  echo "Fehler: MiniAssistant benötigt Python 3.10 oder neuer. Gefunden: $PY_VERSION." >&2
-  echo "  Bitte eine neuere Python-Version installieren." >&2
-  exit 1
-fi
-echo "  Python $PY_VERSION gefunden."
+echo "  Python $PY_VERSION gefunden ($PY_BIN)."
 
-if ! python3 -c "import venv" 2>/dev/null; then
+if ! "$PY_BIN" -c "import venv" 2>/dev/null; then
   echo "Fehler: Python-Modul 'venv' nicht verfügbar." >&2
+  echo "  macOS: brew install python@3.13 (bringt venv mit)" >&2
   echo "  Debian/Ubuntu: ${SUDO}apt install python3-venv" >&2
   echo "  Fedora: ${SUDO}dnf install python3-virtualenv" >&2
   echo "  Alpine: ${SUDO}apk add python3 py3-pip" >&2
@@ -90,7 +145,7 @@ if ! python3 -c "import venv" 2>/dev/null; then
 fi
 echo "  Modul venv verfügbar."
 
-if python3 -m pip --version >/dev/null 2>&1; then
+if "$PY_BIN" -m pip --version >/dev/null 2>&1; then
   echo "  pip verfügbar."
 else
   echo "  Hinweis: System-pip nicht gefunden. Venv verwendet ggf. ensurepip."
@@ -110,7 +165,7 @@ fi
 
 if [ ! -d "$VENV_DIR" ]; then
   echo "Erstelle venv: $VENV_DIR"
-  if ! python3 -m venv "$VENV_DIR"; then
+  if ! "$PY_BIN" -m venv "$VENV_DIR"; then
     echo "Fehler: venv-Erstellung fehlgeschlagen." >&2
     echo "  Debian/Ubuntu: ${SUDO}apt install python3-venv" >&2
     exit 1
@@ -162,6 +217,15 @@ else
   echo "  Falls ChromaDB Probleme macht: $VENV_DIR/bin/python3 -m pip install 'chromadb>=0.5,<0.7'"
 fi
 # Matrix-E2EE (Entschlüsselung): pip install matrix-nio[e2e] – braucht libolm, cmake, make (s. o. System-Pakete)
+# macOS: python-olm findet brew-libolm nicht von allein — Header/Lib-Pfade explizit setzen.
+if [ "$(uname -s)" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
+  OLM_PREFIX="$(brew --prefix libolm 2>/dev/null || true)"
+  if [ -n "$OLM_PREFIX" ] && [ -d "$OLM_PREFIX" ]; then
+    CFLAGS="-I$OLM_PREFIX/include ${CFLAGS:-}"
+    LDFLAGS="-L$OLM_PREFIX/lib ${LDFLAGS:-}"
+    export CFLAGS LDFLAGS
+  fi
+fi
 E2EE_OK=0
 if "$VENV_DIR/bin/python3" -c "import nio" 2>/dev/null; then
   echo "Installiere Matrix-E2EE (matrix-nio[e2e])..."
@@ -248,10 +312,14 @@ echo "  Palace wird automatisch beim Service-Start erstellt."
 echo "  Bestehende Memory-Dateien importieren: ./install.sh --migrate-mempalace"
 echo "  Spart ~3500 Tokens im System-Prompt (L0+L1 statt raw dump)."
 echo ""
-echo "Hinweis Emoji im CLI-Chat: fonts-noto-color-emoji wurde installiert."
-echo "  Für korrekte Darstellung wird ein modernes Terminal empfohlen"
-echo "  (GNOME Terminal, kitty, WezTerm, Windows Terminal)."
-echo "  Bei Bedarf: fc-cache -f  (Font-Cache aktualisieren)"
+if [ "$(uname -s)" = "Darwin" ]; then
+  echo "Hinweis Emoji im CLI-Chat: macOS bringt Apple Color Emoji mit — nichts zu tun."
+else
+  echo "Hinweis Emoji im CLI-Chat: fonts-noto-color-emoji wurde installiert."
+  echo "  Für korrekte Darstellung wird ein modernes Terminal empfohlen"
+  echo "  (GNOME Terminal, kitty, WezTerm, Windows Terminal)."
+  echo "  Bei Bedarf: fc-cache -f  (Font-Cache aktualisieren)"
+fi
 if [ "$E2EE_OK" = "0" ] && "$VENV_DIR/bin/python3" -c "import nio" 2>/dev/null; then
   echo ""
   echo "Hinweis: Matrix-E2EE ist nicht aktiv. Für verschlüsselte Räume zuerst Build-Pakete installieren (s. o.), dann install.sh erneut ausführen oder: pip install matrix-nio[e2e]"
@@ -290,4 +358,64 @@ if [ -n "$SYSTEMD_INSTALL" ]; then
     echo "  ${SUDO}systemctl daemon-reload"
     echo "  ${SUDO}systemctl enable --now miniassistant"
   fi
+fi
+
+# macOS-Autostart. --launchd = LaunchAgent (startet beim Login, kein root),
+# --launchd-system = LaunchDaemon (startet beim Boot, braucht root).
+if [ -n "$LAUNCHD_INSTALL" ]; then
+  if [ "$(uname -s)" != "Darwin" ]; then
+    echo "Hinweis: --launchd gilt nur fuer macOS. Auf diesem System: --init (sysvinit) oder --systemd." >&2
+  else
+    PLIST_LABEL="com.miniassistant"
+    PLIST_SRC="$SCRIPT_DIR/launchd/$PLIST_LABEL.plist"
+    if [ ! -f "$PLIST_SRC" ]; then
+      echo "launchd-Vorlage nicht gefunden: $PLIST_SRC" >&2
+    else
+      if [ -n "$LAUNCHD_SYSTEM" ]; then
+        PLIST_DEST="/Library/LaunchDaemons/$PLIST_LABEL.plist"
+        PLIST_DOMAIN="system"
+      else
+        if [ "$(id -u)" = "0" ]; then
+          echo "  Warnung: --launchd als root legt den LaunchAgent in $HOME an (root, nicht dein User)." >&2
+          echo "  Ohne sudo ausfuehren, oder --launchd-system fuer einen systemweiten Daemon nutzen." >&2
+        fi
+        PLIST_DEST="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
+        PLIST_DOMAIN="gui/$(id -u)"
+      fi
+      # Logverzeichnis muss existieren — launchd legt es nicht an und der Job startet sonst nicht.
+      mkdir -p "$HOME/.config/miniassistant/logs" 2>/dev/null || true
+      mkdir -p "$(dirname "$PLIST_DEST")" 2>/dev/null || true
+      if sed -e "s|%INSTALL_DIR%|$SCRIPT_DIR|g" -e "s|%HOME%|$HOME|g" "$PLIST_SRC" > "$PLIST_DEST" 2>/dev/null; then
+        if [ -n "$LAUNCHD_SYSTEM" ]; then
+          chown root:wheel "$PLIST_DEST" 2>/dev/null || true
+          chmod 644 "$PLIST_DEST" 2>/dev/null || true
+        fi
+        echo "launchd-Job installiert: $PLIST_DEST"
+        # Bestehenden Job vorher rauswerfen, sonst schlaegt bootstrap mit 'service already loaded' fehl.
+        launchctl bootout "$PLIST_DOMAIN/$PLIST_LABEL" 2>/dev/null || true
+        if launchctl bootstrap "$PLIST_DOMAIN" "$PLIST_DEST" 2>/dev/null; then
+          echo "  Gestartet und beim ${LAUNCHD_SYSTEM:+Boot}${LAUNCHD_SYSTEM:-Login} aktiv."
+          echo "  Status:   launchctl print $PLIST_DOMAIN/$PLIST_LABEL"
+          echo "  Neustart: launchctl kickstart -k $PLIST_DOMAIN/$PLIST_LABEL"
+          echo "  Stoppen:  launchctl bootout $PLIST_DOMAIN/$PLIST_LABEL"
+        else
+          echo "  bootstrap fehlgeschlagen. Manuell:"
+          echo "  ${SUDO}launchctl bootstrap $PLIST_DOMAIN $PLIST_DEST"
+        fi
+      else
+        echo "launchd-Job manuell installieren:" >&2
+        echo "  ${SUDO}sed -e 's|%INSTALL_DIR%|$SCRIPT_DIR|g' -e \"s|%HOME%|\$HOME|g\" $PLIST_SRC > $PLIST_DEST" >&2
+        echo "  ${SUDO}launchctl bootstrap $PLIST_DOMAIN $PLIST_DEST" >&2
+      fi
+    fi
+  fi
+elif [ "$(uname -s)" = "Darwin" ] && [ -z "$INIT_INSTALL" ] && [ -z "$SYSTEMD_INSTALL" ]; then
+  echo ""
+  echo "Autostart auf macOS: ./install.sh --launchd          (LaunchAgent, startet beim Login)"
+  echo "                     ./install.sh --launchd-system   (LaunchDaemon, startet beim Boot, als root)"
+fi
+
+# --init/--systemd auf macOS: gibt es dort nicht.
+if [ "$(uname -s)" = "Darwin" ] && { [ -n "$INIT_INSTALL" ] || [ -n "$SYSTEMD_INSTALL" ]; }; then
+  echo "Hinweis: --init/--systemd gibt es auf macOS nicht. Autostart dort mit --launchd." >&2
 fi

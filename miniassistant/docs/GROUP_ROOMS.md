@@ -5,7 +5,7 @@ Per-room/-channel context mode for Matrix rooms, Discord channels and Telegram g
 ## Modes
 
 - **agent** (default for DMs / direct channels) — full personal context: SOUL, USER.md, Memory, Palace, Prefs, all tools, full identity. Behaves like everywhere else.
-- **group** (default for rooms with >2 members) — slim context: NO SOUL/USER/Memory/Palace/Owner-Prefs/Room-Last-Fire. Only AGENTS + IDENTITY (with optional language override) + Environment + slim tool list + Safety + Communication-Boundary + Runtime + per-room prefs (`/workspace/prefs/`) + speaker info + last-activity hints. Hard tool whitelist. `exec` runs in bwrap sandbox.
+- **group** (default for rooms with >2 members) — slim context: NO SOUL/USER/Memory/Palace/Owner-Prefs/Room-Last-Fire. Only AGENTS + IDENTITY (with optional language override) + Environment + slim tool list + Safety + Communication-Boundary + Runtime + per-room prefs (`/workspace/prefs/`) + speaker info + last-activity hints. Hard tool whitelist. `exec` runs in an OS-level sandbox.
 
 ## Response modes (`room_modes` / `channel_modes`)
 
@@ -94,7 +94,7 @@ Hard whitelist (`group_rooms.GROUP_ALLOWED_TOOLS`):
 - `check_url`
 - `send_image`
 - `send_audio` (opt-in)
-- `exec` (bwrap-sandboxed, opt-in)
+- `exec` (OS-sandboxed, opt-in)
 - `read_recent_messages` — fetch last N messages of THIS room
 - `search_chat_history` — keyword/regex scan of room history
 - `get_user_profile` — fetch display name + avatar for a user IN this room (matrix: `@user:server`, discord/telegram: numeric ID). Returns sandbox-path `/workspace/avatars/<id>.<ext>` ready for `invoke_model(image_path=…)` img2img
@@ -138,11 +138,14 @@ In group rooms the bot is **NOT a mouthpiece**. The system enforces a strict pro
 3. `exec` pattern-block (`chat_loop._run_tool`) — rejects commands matching `sendmail|mailutils|msmtp|mutt|swaks|smtplib|smtp://|curl -X POST|curl -d|wget --post-data|apt(-get)? install|pip install|\bmail\b\s`. Returns a refusal string instead of executing.
 4. Outgoing matrix-bot reply filter — `[…](matrix.to/#/@user:server)` to non-room users is degraded to plain text; bare `@user:server` becomes `(external user: user:server)`.
 
-## exec sandbox (bwrap)
+## exec sandbox (bwrap on Linux, Seatbelt on macOS)
 
-On first invocation: availability check `bwrap_available()` (cached). Smoke-test with minimal unprivileged-userns invocation.
+Backend is picked by platform: `bwrap` on Linux, `sandbox-exec` (Seatbelt) on macOS. `run_sandboxed_exec()` dispatches; `sandbox_available()` is the backend-neutral check.
 
-Sandbox setup (`sandbox.build_bwrap_cmd`):
+On first invocation: availability check (cached). Smoke-test with a minimal invocation.
+
+### Linux backend (`sandbox.build_bwrap_cmd`)
+
 - Namespaces: `--unshare-user/pid/ipc/uts`, `--new-session`, `--die-with-parent`.
 - Read-only mounts: `/usr`, `/bin`, `/lib`, `/lib64`, `/etc/resolv.conf`, `/etc/ssl`, `/etc/ca-certificates`, `/etc/alternatives`, `/etc/nsswitch.conf`, `/etc/hosts`.
 - Optional read-only: `/docs/` (host docs dir) when `docs_in_sandbox: true` per room.
@@ -152,7 +155,17 @@ Sandbox setup (`sandbox.build_bwrap_cmd`):
 - ulimit prefix: `ulimit -t 60 -v 1048576 -f 102400` (60s CPU, 1 GB virt, 100 MB max file).
 - Network: always on (for `curl`/`wget`/`pip`). Disable later via setting if needed.
 
-When bwrap is missing or smoke-test fails: exec returns `"exec disabled in this group room: bwrap not installed (apt install bubblewrap)"`. Never unsandboxed.
+When the backend is missing or the smoke-test fails: exec returns `"exec disabled in this group room: <reason>"`. Never unsandboxed.
+
+### macOS backend (`sandbox.build_seatbelt_cmd`)
+
+Seatbelt cannot mount, so the setup differs — the prompt-visible paths stay the same:
+- Profile is `(deny default)` plus explicit allows: read `/usr`, `/bin`, `/sbin`, `/System`, `/opt/homebrew`, `/usr/local`, timezone DB, resolv.conf/hosts/ssl, `/dev/{null,zero,random,urandom,tty,...}`; read+write the group workspace, `/private/tmp`, `/private/var/tmp`.
+- `/workspace` does not exist as a real path. It is rewritten to the real workspace path on the way in (path tokens only) and back to `/workspace` in stdout/stderr on the way out — so the owner's home path never surfaces in the room. Same for `/docs`.
+- Env cleared with `env -i` (no `--clearenv`); `cwd` is the real workspace.
+- ulimit prefix is `ulimit -t <cpu> -f 102400` — macOS has no `ulimit -v`.
+- No `--die-with-parent`: the child runs in its own process group and is `killpg`'d on timeout.
+- `file-read-metadata` and `mach-lookup` are allowed broadly (dyld, `stat`, `ls -l`, `id` need them). Consequence: a path's *existence* outside the workspace is detectable on macOS, its content is not. bwrap hides both.
 
 What the sandbox does NOT see: `/root`, `/home`, `agent_dir`, `config_dir`, other group workspaces. `tree /root` → "No such file or directory". `cat /etc/shadow` → ditto.
 
@@ -259,7 +272,7 @@ In group mode:
 ## Relevant modules
 
 - `miniassistant/group_rooms.py` — settings lookup, context build, default init, session key, whitelist constants, auto-context formatter (incl. bot-self marker), workspace path helper.
-- `miniassistant/sandbox.py` — bwrap availability check + command builder + `run_sandboxed_exec`.
+- `miniassistant/sandbox.py` — availability checks (bwrap/Seatbelt) + command builders + `run_sandboxed_exec`.
 - `miniassistant/agent_loader.py` — `_build_group_system_prompt` + per-section helpers (`_group_speaker_section`, `_group_tools_section`, `_group_invoke_model_section`, `_group_persistence_section`, `_group_communication_boundary_section`, `_group_last_activity_section`, `_group_docs_reference_section`, `_group_planning_section`).
 - `miniassistant/chat_loop.py` — exec branch with group-mode sandbox + pattern-block, tool whitelist filter, hard-reject in `_run_tool`, `get_user_profile` dispatch, `read_recent_messages` / `search_chat_history` dispatch, `invoke_model` with VL/edit/gen routing + path translation, per-turn config copy.
 - `miniassistant/matrix_bot.py` — routing + `_get_chat_response` (group_mode detection, room-trust auth bypass for text/image/file/audio, outgoing reply filter that degrades non-member matrix.to-links), `get_user_profile`, `fetch_recent_messages`, `search_chat_history`.

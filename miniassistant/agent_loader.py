@@ -42,8 +42,10 @@ def _detect_system() -> dict[str, str]:
         "package_manager": "",
         "init_system": "",
     }
-    # Init: systemd vs sysvinit
-    if Path("/run/systemd/system").exists():
+    # Init: launchd (macOS) vs systemd vs sysvinit
+    if out["os"] == "Darwin":
+        out["init_system"] = "launchd"
+    elif Path("/run/systemd/system").exists():
         out["init_system"] = "systemd"
     else:
         out["init_system"] = "sysvinit"
@@ -116,6 +118,25 @@ def load_agent_files(agent_dir: str, max_chars_per_file: int = 500) -> dict[str,
     return result
 
 
+# Autostart auf macOS ist fehleranfaellig (plist-Pfade, Domains) — deshalb explizit im Prompt.
+# Nur bei launchd angehaengt, damit der Linux-Prompt (KV-Cache) unveraendert bleibt.
+_LAUNCHD_AUTOSTART_HINT = """
+**Autostart on macOS = launchd. There is no systemctl, no `service`, no /etc/init.d, no update-rc.d.**
+- plist location: `~/Library/LaunchAgents/<label>.plist` (per-user, starts at login, no root) or
+  `/Library/LaunchDaemons/<label>.plist` (system-wide, starts at boot, needs root and `chown root:wheel` + `chmod 644`).
+- Label convention: reverse-DNS, e.g. `com.miniassistant`, and the filename MUST equal the label.
+- Required keys: `Label`, `ProgramArguments` (array, absolute paths — launchd has a minimal PATH),
+  `RunAtLoad` (bool, start immediately). Common: `KeepAlive` (restart on exit), `WorkingDirectory`,
+  `StandardOutPath`/`StandardErrorPath` (launchd does not log stdout on its own), `EnvironmentVariables`.
+- Domain target: `gui/$(id -u)` for LaunchAgents, `system` for LaunchDaemons.
+- Load: `launchctl bootstrap <domain> <plist>` — Unload: `launchctl bootout <domain>/<label>`
+  Restart: `launchctl kickstart -k <domain>/<label>` — Status: `launchctl print <domain>/<label>`
+  (`launchctl load/unload` is the deprecated legacy form; use bootstrap/bootout.)
+- After editing a plist: bootout, then bootstrap again — launchd does not reload it on its own.
+- For recurring tasks prefer the `schedule` tool over launchd `StartCalendarInterval` or cron.
+"""
+
+
 def _system_and_runtime_section(is_root: bool) -> str:
     """Host system + runtime info (OS, distro, package manager, init, root status) for the LLM."""
     import datetime as _dt
@@ -132,6 +153,8 @@ def _system_and_runtime_section(is_root: bool) -> str:
     if s["init_system"]:
         if s["init_system"] == "systemd":
             parts.append("Init: **systemd** (systemctl)")
+        elif s["init_system"] == "launchd":
+            parts.append("Init: **launchd** (launchctl)")
         else:
             parts.append("Init: **sysvinit** (service NAME start/stop)")
     if is_root:
@@ -140,7 +163,10 @@ def _system_and_runtime_section(is_root: bool) -> str:
         parts.append("Not root – use **sudo** when needed")
     import sys as _sys
     parts.append(f"Python: **{_sys.executable}**")
-    return f"## System\n**Heute:** {date_str}\n\n" + ". ".join(parts) + ".\n\n"
+    body = ". ".join(parts) + ".\n"
+    if s["init_system"] == "launchd":
+        body += _LAUNCHD_AUTOSTART_HINT
+    return f"## System\n**Heute:** {date_str}\n\n" + body + "\n"
 
 
 def _safety_section() -> str:
@@ -355,7 +381,7 @@ def _group_tools_section(config: dict[str, Any], chat_ctx: dict[str, Any]) -> st
         )
     if "exec" in tools_allow:
         lines.append(
-            "- `exec`: runs in a bwrap sandbox. Only `/workspace` is writable. "
+            "- `exec`: runs in an OS-level sandbox. Only `/workspace` is writable. "
             "Host filesystem and owner config are NOT visible. Stay inside `/workspace` for files."
         )
     if "send_image" in tools_allow:

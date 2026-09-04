@@ -4315,16 +4315,37 @@ async def logout(request: Request):
     return resp
 
 
+def _launchd_restart_argv(service_name: str) -> list[str] | None:
+    """macOS: sucht die installierte launchd-Job-Definition und baut das kickstart-argv.
+    LaunchDaemon (system-Domain) schlaegt LaunchAgent (gui/<uid>). None = kein Job gefunden."""
+    import os
+    labels = (f"com.{service_name}", f"local.{service_name}", service_name)
+    for label in labels:
+        if Path(f"/Library/LaunchDaemons/{label}.plist").exists():
+            return ["launchctl", "kickstart", "-k", f"system/{label}"]
+    agent_dirs = [Path(os.path.expanduser("~")) / "Library" / "LaunchAgents", Path("/Library/LaunchAgents")]
+    for label in labels:
+        for base in agent_dirs:
+            if (base / f"{label}.plist").exists():
+                return ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"]
+    return None
+
+
 @app.post("/api/restart")
 async def api_restart(request: Request):
-    """Startet den MiniAssistant-Service neu (systemd oder init.d, in Subshell)."""
+    """Startet den MiniAssistant-Service neu (launchd, systemd oder init.d, in Subshell)."""
     _require_token(request)
     import subprocess
     import shutil
+    import sys
     # Detect init system and service name
     service_name = "miniassistant"
-    if shutil.which("systemctl"):
-        argv: list[str] = ["systemctl", "restart", service_name]
+    launchd_argv = _launchd_restart_argv(service_name) if sys.platform == "darwin" else None
+    if launchd_argv:
+        argv: list[str] = launchd_argv
+        method = "launchd"
+    elif shutil.which("systemctl"):
+        argv = ["systemctl", "restart", service_name]
         method = "systemd"
     elif Path(f"/etc/init.d/{service_name}").exists():
         argv = [f"/etc/init.d/{service_name}", "restart"]

@@ -17,6 +17,8 @@ Alle Einstellungen sind **optional**. Was nicht gesetzt ist, nutzt sinnvolle Def
 
 **Umgebungsvariable:** `MINIASSISTANT_CONFIG_DIR` überschreibt das Verzeichnis für die Nutzer-Config (nicht den Dateinamen).
 
+**macOS:** identische Pfade wie auf Linux — `~/.config/miniassistant/`, **nicht** `~/Library/Application Support/`. Logs liegen unter `~/.config/miniassistant/logs/miniassistant.log`, weil launchd stdout nicht von selbst schreibt (der Pfad steht in `launchd/com.miniassistant.plist`).
+
 ---
 
 ## 2. Übersicht der Bereiche
@@ -481,7 +483,7 @@ Chat-Clients werden unter `chat_clients:` konfiguriert. Momentan unterstuetzt: *
 
 ### Matrix
 
-**Abhaengigkeit:** `pip install miniassistant[matrix]` (matrix-nio + mistune fuer HTML-Formatierung). Fuer E2EE: `pip install miniassistant[matrix-e2e]` + `apt install libolm-dev`.
+**Abhaengigkeit:** `pip install miniassistant[matrix]` (matrix-nio + mistune fuer HTML-Formatierung). Fuer E2EE: `pip install miniassistant[matrix-e2e]` + `apt install libolm-dev` (macOS: `brew install libolm`; `install.sh` setzt dort `CFLAGS`/`LDFLAGS` auf den Brew-Prefix, sonst findet python-olm die Header nicht).
 
 **Config:**
 
@@ -566,7 +568,7 @@ Am einfachsten ueber die **Web-UI unter `/rooms`** konfigurierbar (Zahnrad-Butto
 
 | Schluessel | Typ | Default | Beschreibung |
 |-----------|-----|---------|--------------|
-| `context` | `agent` \| `group` | `group` ab 3 Mitgliedern | `group` = schlanker Kontext ohne persoenliche Daten, `exec` sandboxed (bwrap). |
+| `context` | `agent` \| `group` | `group` ab 3 Mitgliedern | `group` = schlanker Kontext ohne persoenliche Daten, `exec` sandboxed (bwrap auf Linux, `sandbox-exec`/Seatbelt auf macOS). |
 | `language` | `auto`, `de`, `en`, ... | `auto` | Antwortsprache erzwingen. |
 | `tools_allow` | Liste | Auto-Default | Tool-Whitelist (nur Group-Mode-Tools erlaubt). |
 | `workspace_subdir` | string | aus Raum-ID | Workspace-Ordner unter `<workspace>/groups/`. |
@@ -943,6 +945,44 @@ export MINIASSISTANT_CONFIG_DIR=/etc/miniassistant-instance2
 ```
 
 Für Dienste mit Start/Stop nutzt du üblicherweise einen Wrapper (z. B. `start-stop-daemon` oder ein kleines Script, das die PID speichert und beim Stop killt). Oder du betreibst beide Instanzen per systemd (empfohlen).
+
+### launchd (macOS, Beispiel zweite Instanz)
+
+Kopie der Vorlage `launchd/com.miniassistant.plist` mit **eigenem Label** — Label und Dateiname muessen uebereinstimmen, sonst laedt launchd den Job nicht. Datei etwa `~/Library/LaunchAgents/com.miniassistant.instance2.plist`:
+
+```xml
+<key>Label</key>
+<string>com.miniassistant.instance2</string>
+<key>ProgramArguments</key>
+<array>
+    <string>/pfad/zu/miniassistant/venv/bin/miniassistant</string>
+    <string>serve</string>
+</array>
+<key>WorkingDirectory</key>
+<string>/pfad/zu/miniassistant</string>
+<key>EnvironmentVariables</key>
+<dict>
+    <key>MINIASSISTANT_CONFIG_DIR</key>
+    <string>/Users/DEIN_USER/.config/miniassistant2</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+</dict>
+<key>RunAtLoad</key>
+<true/>
+```
+
+Absolute Pfade sind Pflicht — launchd startet mit minimalem `PATH`. Laden und steuern:
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.miniassistant.instance2.plist
+launchctl print     gui/$(id -u)/com.miniassistant.instance2    # Status
+launchctl kickstart -k gui/$(id -u)/com.miniassistant.instance2 # Neustart
+launchctl bootout   gui/$(id -u)/com.miniassistant.instance2    # Stoppen
+```
+
+Nach jeder Aenderung am plist: erst `bootout`, dann wieder `bootstrap` — launchd liest die Datei nicht von selbst neu.
+
+**Restart-Button der Web-UI:** `/api/restart` sucht auf macOS die Labels `com.miniassistant`, `local.miniassistant`, `miniassistant` — zuerst unter `/Library/LaunchDaemons/`, dann `~/Library/LaunchAgents/` und `/Library/LaunchAgents/`. Eine Instanz mit abweichendem Label (wie `com.miniassistant.instance2`) wird nicht gefunden; dort faellt der Button auf SIGTERM zurueck, was nur mit `KeepAlive` im plist einen Neustart ergibt.
 
 ---
 

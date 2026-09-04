@@ -2772,6 +2772,7 @@ def _run_tool(
                 "sendmail", "mailutils", "msmtp", " mutt ", "mutt ", " swaks", "swaks ",
                 "smtplib", "smtp://", "curl -x post", "curl --request post", "curl -d ",
                 "wget --post-data", "apt-get install", "apt install", "pip install",
+                "brew install", "port install",
             )
             # "mail " als word boundary check (false-positive bei "email" etc. vermeiden)
             import re as _re_cmd
@@ -2780,7 +2781,7 @@ def _run_tool(
                 _log.warning("Group exec BLOCKED (communication-boundary): %s", cmd[:200])
                 return (
                     "exec REJECTED in group room: this command pattern matches sending/installing "
-                    "external-communication tools (mail/sendmail/smtp/curl-POST/apt-install). "
+                    "external-communication tools (mail/sendmail/smtp/curl-POST/package installs). "
                     "In group rooms you may DRAFT messages inline in your reply — never send them. "
                     "The user copies and sends themselves."
                 )

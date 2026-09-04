@@ -50,7 +50,7 @@ curl -s https://api.github.com/repos/OWNER/REPO/contents/PATH | jq -r '.content'
 
 ## Parsing JSON
 
-Use `jq` (install with `apt install jq` if missing):
+Use `jq` (install with the host's package manager if missing — see the package manager named in the System section of your prompt):
 
 ```sh
 # Extract field

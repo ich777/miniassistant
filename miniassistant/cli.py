@@ -576,12 +576,20 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     display_hosts: list[str] = []
     if h in ("0.0.0.0", "::"):
         display_hosts.append("127.0.0.1")
-        # hostname -I liefert zuverlaessig alle non-loopback IPs (Linux)
+        # hostname -I liefert zuverlaessig alle non-loopback IPs (Linux).
+        # macOS/BSD kennen -I nicht → ipconfig getifaddr pro aktivem Interface.
         try:
             import subprocess
-            _ip_out = subprocess.run(
-                ["hostname", "-I"], capture_output=True, text=True, timeout=2,
-            )
+            import sys as _sys
+            if _sys.platform == "darwin":
+                _ip_out = subprocess.run(
+                    ["sh", "-c", "for i in $(ifconfig -lu); do ipconfig getifaddr $i 2>/dev/null; done"],
+                    capture_output=True, text=True, timeout=2,
+                )
+            else:
+                _ip_out = subprocess.run(
+                    ["hostname", "-I"], capture_output=True, text=True, timeout=2,
+                )
             if _ip_out.returncode == 0:
                 for _ip in _ip_out.stdout.strip().split():
                     if ":" not in _ip and _ip not in display_hosts:  # nur IPv4

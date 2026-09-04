@@ -11,7 +11,7 @@ These rules apply ONLY when triggered via HTTP webhook. They override the task p
 ### Forbidden tools/commands
 
 **Package managers:** apt, apt-get, dpkg, yum, dnf, pacman, pip install, pipx, npm install, yarn, brew, cargo install
-**Service control:** systemctl, service, /etc/init.d/*, init, telinit, reboot, shutdown, halt, poweroff
+**Service control:** systemctl, service, /etc/init.d/*, launchctl, init, telinit, reboot, shutdown, halt, poweroff
 **User/perm mgmt:** useradd, userdel, usermod, groupadd, passwd, sudo, su, doas, chown outside workspace, chmod 777, chmod -R outside workspace
 **Network/firewall:** iptables, nftables, ufw, firewall-cmd, ip route, ip link, edits to /etc/hosts /etc/resolv.conf /etc/network/*
 **File writes outside workspace:** never write/edit/delete outside `<workspace>/` and `<workspace>/webhooks/<name>/`

@@ -120,12 +120,21 @@ def _pgid_alive(pgid: int) -> bool:
 def _pgid_safe_to_kill(pgid: int, job_id: str) -> bool:
     """Guard against recycled PIDs after a MiniAssistant restart: the spawned sh
     wrapper's cmdline contains the job's log path (job_id). If the group leader is
-    gone but the group still exists, Linux won't recycle that PID while it remains
+    gone but the group still exists, the kernel won't recycle that PID while it remains
     a live pgid → orphaned children, safe to kill."""
+    cmd = ""
     try:
         with open(f"/proc/{pgid}/cmdline", "rb") as f:
             cmd = f.read().replace(b"\0", b" ").decode("utf-8", "replace")
     except OSError:
+        # macOS/BSD haben kein /proc — ps liefert dieselbe Info.
+        try:
+            r = subprocess.run(["ps", "-o", "command=", "-p", str(pgid)],
+                               capture_output=True, text=True, timeout=5)
+            cmd = r.stdout or ""
+        except Exception:
+            return True
+    if not cmd.strip():
         return True
     return job_id in cmd or "opencode" in cmd
 
