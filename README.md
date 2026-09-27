@@ -276,10 +276,6 @@ Ausführlich und strukturiert: **[CONFIGURATION.md](CONFIGURATION.md)** (wo die 
 - **Smart Compacting:** Wenn der Chatverlauf den Kontext füllt, werden ältere Messages automatisch zusammengefasst. Steuerbar via `chat.context_quota` (Default: 0.85 = 85% von `num_ctx`). Skaliert automatisch mit der Modellgröße.
 - **Slot Cache (llama.cpp):** Optional persistiert KV-Cache pro Conversation am LLM-Server für schnelle Resumes (10-30s gespart bei langen Conversations). Default OFF, opt-in via `slot_cache.enabled: true` in der Config. Funktioniert nicht mit `--mmproj`-Modellen. Details: [CONFIGURATION.md §22](CONFIGURATION.md#22-slot-cache-performance).
 
-## Plan
-
-Siehe [MINIASSISTANT_PLAN.md](MINIASSISTANT_PLAN.md) für Features: mehrere Modelle + Aliase, Memory bei Modellwechsel, Bootup-Assistent, SOUL selbst schreiben, Matrix optional.
-
 ## Lizenz
 
 LGPL 2.1 (GNU Lesser General Public License, Version 2.1)
