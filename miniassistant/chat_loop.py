@@ -1365,6 +1365,21 @@ def _group_display_model(config: dict[str, Any], models_allow: list[str], model:
     return model
 
 
+def _bot_self_names(config: dict[str, Any]) -> set[str]:
+    """Namen unter denen der Bot angesprochen wird (Matrix-Pill fügt den Display-Namen
+    als Plaintext ein). Dürfen nicht als Modellname durchgehen: '/model clawi'."""
+    names: set[str] = set()
+    m = (config.get("chat_clients") or {}).get("matrix") or {}
+    bn = str(m.get("bot_name") or "").strip().lower()
+    if bn:
+        names.add(bn)
+    uid = str(m.get("user_id") or "").strip().lower()
+    if uid:
+        names.add(uid)
+        names.add(uid.split(":", 1)[0].lstrip("@"))
+    return {n for n in names if n}
+
+
 def _group_model_allowed(config: dict[str, Any], models_allow: list[str], model: str) -> bool:
     """True wenn model (roh oder via Alias aufgelöst) in der Raum-Auswahl liegt.
     Matcht sowohl den rohen Namen als auch die resolve_model-Form, damit Alias
@@ -7030,6 +7045,7 @@ def chat_round_stream(
     _web_search_count = 0          # web_search-Aufrufe in dieser Runde (für Research-Gate)
     _has_search = bool(config.get("search_engines"))
     _model_idx = 0                 # index into models_to_try; advances on persistent API failure
+    _load_status_sent = False      # "Modell wird geladen…" max. 1x pro Request (nur vor dem ersten Chunk)
 
     while rounds < max_tool_rounds:
         # Per-round smart compaction: after round 0, check if tool results grew context past budget.
@@ -7144,7 +7160,11 @@ def chat_round_stream(
                                 yield {"type": "status", "message": f"⏳ Modell reagiert seit {int(_elapsed_no_chunk)}s nicht…"}
                                 _stall_warned = True
                             elif not _stall_warned:
-                                yield {"type": "status", "message": "⏳ Modell wird geladen…"}
+                                if not _load_status_sent and rounds == 0 and not _has_any_content and not round_thinking:
+                                    _load_status_sent = True
+                                    yield {"type": "status", "message": "⏳ Modell wird geladen…"}
+                                else:
+                                    yield {"type": "status", "message": ""}
                             continue
                         _last_any_chunk_at = time.monotonic()
                         _stall_warned = False
@@ -8119,7 +8139,15 @@ def _handle_group_model_command(
         )
     # Modellnamen/Aliase enthalten keine Leerzeichen — erstes Token nehmen. Fängt
     # Trailing-Mentions ab ("/model gemma clawi" in mention-Mode-Räumen).
-    requested = requested.split()[0].lstrip("@")
+    _self = _bot_self_names(config)
+    _toks = [t for t in requested.split() if t.lstrip("@").lower() not in _self]
+    if not _toks:
+        # Nur der Bot-Name als Argument ("/model clawi" in mention-Räumen) → Anzeige, kein Wechsel
+        return (
+            f"Aktuelles Raum-Modell: `{current}`\n\n*Wechseln: `/model NAME` · Liste: `/models`*",
+            session, None, None, None, None,
+        )
+    requested = _toks[0].lstrip("@")
     if not _group_model_allowed(config, allow, requested):
         names = _group_allowed_model_names(config, allow)
         avail = ", ".join(f"`{n}`" for n in names) if names else "(keine)"

@@ -489,10 +489,12 @@ def chat(ctx: click.Context, model: str | None, show_thinking: bool) -> None:
                             _content_started = True
                             console.print()  # Zeilenumbruch nach Denktext
                     elif _etype == "status":
-                        if _spinner_active:
-                            _st.stop()
-                            _spinner_active = False
-                        console.print(f"[dim][{_ev.get('message', '')}][/dim]")
+                        _smsg = (_ev.get("message") or "").strip()
+                        if _smsg:
+                            if _spinner_active:
+                                _st.stop()
+                                _spinner_active = False
+                            console.print(f"[dim][{_smsg}][/dim]")
                     elif _etype == "tool_call":
                         if _spinner_active:
                             _st.stop()
